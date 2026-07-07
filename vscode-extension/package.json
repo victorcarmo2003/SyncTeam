@@ -1,0 +1,53 @@
+{
+  "name": "syncteam",
+  "displayName": "SyncTeam",
+  "description": "Sincroniza scripts Luau entre VS Code e Roblox Studio via Team Create, sem servidor externo.",
+  "version": "0.1.0",
+  "publisher": "syncteam",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["workspaceContains:**/default.project.json"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "SyncTeam",
+      "properties": {
+        "syncteam.port": {
+          "type": "number",
+          "default": 34980,
+          "description": "Porta local (127.0.0.1) onde a extensão hospeda o servidor WebSocket para o plugin Studio conectar."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "syncteam.restart",
+        "title": "SyncTeam: Reiniciar servidor"
+      },
+      {
+        "command": "syncteam.showOutput",
+        "title": "SyncTeam: Mostrar log"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.0"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

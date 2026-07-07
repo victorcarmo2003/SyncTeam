@@ -1,0 +1,4 @@
+# Artefatos de build (rojo build), nunca versionados
+/SyncTeam.rbxm
+/SyncTeam.rbxmx
+sourcemap.json
