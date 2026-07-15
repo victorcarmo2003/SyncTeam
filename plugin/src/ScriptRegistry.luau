@@ -27,6 +27,7 @@
 
 local HttpService = game:GetService("HttpService")
 
+local Logger = require(script.Parent.Logger)
 local TeamCreateSchema = require(script.Parent.TeamCreateSchema)
 
 local ScriptRegistry = {}
@@ -39,9 +40,7 @@ local scriptsFolder = nil -- TestService.SyncTeam.Scripts
 local uuidByInstance = {} -- Instance -> uuid
 local recordByUuid = {} -- uuid -> { folder, instanceRef, canonicalPath (StringValue), instance }
 
-local function log(...)
-	print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), ...)
-end
+local log = Logger.log
 
 -- Container raiz (TestService.SyncTeam) extraído para TeamCreateSchema.luau
 -- nesta fatia (M3.1) porque TeamCreateElection.luau também precisa dele

@@ -94,15 +94,14 @@
 local HttpService = game:GetService("HttpService")
 
 local Config = require(script.Parent.Config)
+local Logger = require(script.Parent.Logger)
 local TeamCreateSchema = require(script.Parent.TeamCreateSchema)
 local TeamCreateElection = require(script.Parent.TeamCreateElection)
 local ScriptRegistry = require(script.Parent.ScriptRegistry)
 
 local TeamCreateLease = {}
 
-local function log(...)
-	print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), ...)
-end
+local log = Logger.log
 
 -- M3.3: callback(message: table) injetado por TeamCreateLease.init, mesmo
 -- padrão de SourceWatcher.init — usado só para emitir `leaseChanged`

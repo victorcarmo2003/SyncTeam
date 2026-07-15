@@ -93,6 +93,9 @@ export class SyncTeamService {
       case "leaseChanged":
         this.handleLeaseChanged(message);
         break;
+      case "log":
+        this.handleLog(message);
+        break;
       default:
         this.logger.info(`mensagem espontânea de kind desconhecido ignorada: ${message.kind}`);
     }
@@ -134,6 +137,25 @@ export class SyncTeamService {
     if (this.onLeaseChanged) {
       this.onLeaseChanged({ uuid, ownerClientId, ownerDisplayName });
     }
+  }
+
+  /**
+   * Mensagem espontânea `{kind: "log", text}`: encaminha para o próprio
+   * logger do serviço com o prefixo `[studio]` para diferenciar de longe de
+   * logs gerados pelo harness/extensão em si. `text` já vem com o prefixo
+   * `[SyncTeam HH:MM:SS]` de dentro do plugin (é a mesma string que apareceria
+   * no Output do Studio) — não reformatamos, só prefixamos a origem. Existe
+   * para permitir testar o projeto sem depender do usuário copiar/colar o
+   * Output do Studio (ver .claude/rules/typescript.md e a tarefa que criou
+   * `createFileLogger`/`createTeeLogger` em util/logger.ts).
+   */
+  private handleLog(message: RawMessage): void {
+    const text = message.text;
+    if (typeof text !== "string") {
+      this.logger.error("mensagem 'log' sem campo 'text' válido, ignorada");
+      return;
+    }
+    this.logger.info(`[studio] ${text}`);
   }
 
   start(): Promise<void> {

@@ -21,11 +21,19 @@
 -- Porta do padrão de spikes/m0_5-local-pipeline/plugin/SyncTeamLab.lua
 -- (checkSourceChanged polling+sinal) e spikes/m0-source-replication/
 -- SyncTeamM0.lua (token de geração para start/stop seguro).
+--
+-- 2026-07-07: auto-descoberta de porta em runConnection (ver comentário na
+-- própria função) — estopgap para o cenário de teste com 2 Studios na mesma
+-- máquina/mesma pasta de Plugins, que hoje colidem na mesma porta sem isso.
+-- O botão manual "Alternar porta" (toolbar, abaixo) continua funcionando
+-- como fallback: uma porta setada manualmente é sempre a única tentada,
+-- nunca cicla pelas candidatas (ver Config.resolveCandidatePorts).
 
 local HttpService = game:GetService("HttpService")
 local StudioService = game:GetService("StudioService")
 
 local Config = require(script.Config)
+local Logger = require(script.Logger)
 local SourceWatcher = require(script.SourceWatcher)
 local TeamCreateElection = require(script.TeamCreateElection)
 local TeamCreateLease = require(script.TeamCreateLease)
@@ -34,20 +42,25 @@ local enabled = false
 local currentToken = 0
 local client = nil -- WebStreamClient conectado no momento (nil se desconectado)
 
-local function log(...)
-	print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), ...)
-end
+local log = Logger.log
 
+-- sendMessage é a própria função que o Logger usa para encaminhar logs pela
+-- conexão WS (injetada em Logger.init(sendMessage) dentro de start()) — os
+-- dois logs internos abaixo usam `print` PURO, nunca `log`/`Logger.log`.
+-- Motivo (evitar recursão, ver Logger.luau): se usassem `log`, uma falha de
+-- envio disparia Logger.log -> sendMessage -> (falha de novo) -> log da
+-- falha via Logger.log -> sendMessage de novo, sem saída natural do ciclo.
+-- Formato do print mantido idêntico ao de antes desta tarefa.
 local function sendMessage(message)
 	if client == nil then
-		log("descartado (sem conexão):", tostring(message.kind))
+		print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), "descartado (sem conexão):", tostring(message.kind))
 		return
 	end
 	local ok, err = pcall(function()
 		client:Send(HttpService:JSONEncode(message))
 	end)
 	if not ok then
-		log("falha ao enviar:", tostring(err))
+		print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), "falha ao enviar:", tostring(err))
 	end
 end
 
@@ -222,8 +235,33 @@ end
 -- ver .claude/rules/luau.md). Loop de reconexão guardado pelo token de
 -- geração: stop()/start() repetidos não deixam loops antigos sobrepostos
 -- (pegadinha real do M0, ver .claude/agent-memory/luau-dev.md).
-local function runConnection(myToken, port)
+--
+-- Auto-descoberta de porta (2026-07-07, pedido do orquestrador): `ports` é
+-- ou uma lista de 1 item (porta já explicitamente setada — manual via botão
+-- "Alternar porta" ou persistida por uma descoberta automática anterior) ou
+-- `Config.CANDIDATE_PORTS` inteiro (sem nenhuma setting ainda). O harness
+-- (SyncServer.ts) rejeita uma 2ª conexão simultânea com
+-- `socket.close(1013, "SyncTeam: já existe um plugin conectado")` — mas NÃO
+-- há confirmação salva em .claude/research/ sobre o que
+-- CreateWebStreamClient expõe desse close code/motivo através dos
+-- parâmetros do evento Error, então o critério de "rejeição provável" abaixo
+-- deliberadamente NÃO tenta interpretar `code`/`errorMessage` (só loga eles,
+-- como antes) — usa só observação local: a conexão caiu SEM NUNCA ter
+-- recebido nenhuma mensagem do harness E dentro de uma janela curta
+-- (Config.PROBABLE_REJECTION_WINDOW_SECONDS) desde que foi aberta. Uma queda
+-- que ficou de pé mais que essa janela, ou que já recebeu qualquer mensagem,
+-- é tratada como queda normal (reconecta na MESMA porta, como antes desta
+-- mudança).
+local function runConnection(myToken, ports, explicitAtStart, pluginObject)
+	local index = 1
+	local attemptsInLap = 0
+	-- Já explícita = nunca persistir (item 4 da tarefa: nunca sobrescrever
+	-- uma porta que o usuário já escolheu, seja manual seja de uma sessão
+	-- anterior). Só descobertas automáticas desta sessão chegam a persistir.
+	local persistedAutoPort = explicitAtStart
+
 	while enabled and currentToken == myToken do
+		local port = ports[index]
 		local url = ("ws://127.0.0.1:%d"):format(port)
 		local ok, newClient = pcall(function()
 			return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = url })
@@ -238,8 +276,13 @@ local function runConnection(myToken, port)
 		end
 
 		local closed = false
+		local receivedAnyMessage = false
+		local connectedAt = os.clock()
 		local connections = {}
-		table.insert(connections, newClient.MessageReceived:Connect(handleMessage))
+		table.insert(connections, newClient.MessageReceived:Connect(function(raw)
+			receivedAnyMessage = true
+			handleMessage(raw)
+		end))
 		table.insert(connections, newClient.Closed:Connect(function()
 			closed = true
 		end))
@@ -254,8 +297,28 @@ local function runConnection(myToken, port)
 
 		while enabled and currentToken == myToken and not closed do
 			task.wait(0.5)
+			-- "Estabilizou" (item 4): recebeu qualquer mensagem do harness
+			-- depois do hello, OU já ficou conectada além da janela curta de
+			-- rejeição provável sem cair. Persistir assim que estabilizar (não
+			-- espera a conexão cair) para reloads futuros já reconectarem
+			-- direto nesta porta.
+			if
+				not persistedAutoPort
+				and (receivedAnyMessage or (os.clock() - connectedAt) >= Config.PROBABLE_REJECTION_WINDOW_SECONDS)
+			then
+				local okSet, errSet = pcall(function()
+					pluginObject:SetSetting(Config.PORT_SETTING_KEY, port)
+				end)
+				if okSet then
+					log(("porta %d confirmada e salva"):format(port))
+				else
+					log(("falha ao salvar porta descoberta automaticamente (%d): %s"):format(port, tostring(errSet)))
+				end
+				persistedAutoPort = true
+			end
 		end
 
+		local aliveSeconds = os.clock() - connectedAt
 		client = nil
 		for _, connection in connections do
 			connection:Disconnect()
@@ -264,7 +327,36 @@ local function runConnection(myToken, port)
 			newClient:Close()
 		end)
 
-		if enabled and currentToken == myToken then
+		if not (enabled and currentToken == myToken) then
+			return
+		end
+
+		local probablyRejected = (not receivedAnyMessage)
+			and aliveSeconds < Config.PROBABLE_REJECTION_WINDOW_SECONDS
+			and #ports > 1
+
+		if probablyRejected then
+			attemptsInLap += 1
+			local nextIndex = (index % #ports) + 1
+			if attemptsInLap >= #ports then
+				-- Esgotou todas as candidatas nesta volta sem sucesso: volta
+				-- pro início da lista, mas com o RECONNECT_SECONDS normal (evita
+				-- busy-loop se nenhum harness estiver de pé em porta nenhuma).
+				log(("porta %d parece ocupada; todas as %d candidatas falharam, aguardando %ds antes de recomeçar"):format(
+					port,
+					#ports,
+					Config.RECONNECT_SECONDS
+				))
+				attemptsInLap = 0
+				index = nextIndex
+				task.wait(Config.RECONNECT_SECONDS)
+			else
+				log(("porta %d parece ocupada, tentando %d..."):format(port, ports[nextIndex]))
+				index = nextIndex
+				task.wait(Config.CANDIDATE_RETRY_DELAY_SECONDS)
+			end
+		else
+			attemptsInLap = 0
 			log(("desconectado; reconectando em %ds"):format(Config.RECONNECT_SECONDS))
 			task.wait(Config.RECONNECT_SECONDS)
 		end
@@ -315,10 +407,17 @@ local function start(pluginObject)
 	enabled = true
 	currentToken += 1
 	local myToken = currentToken
-	local port = Config.resolvePort(pluginObject)
+	local ports, explicitPort = Config.resolveCandidatePorts(pluginObject)
 	local okUserId, resolvedUserId = pcall(function()
 		return StudioService:GetUserId()
 	end)
+	-- Logger.init ANTES de SourceWatcher.start()/TeamCreateElection.start()/
+	-- TeamCreateLease.start(): esses três já podem logar (via `log`/Logger.log)
+	-- durante a própria inicialização (ex.: "observação iniciada", "sessão
+	-- criada"), então o encaminhamento por WS precisa estar disponível o quanto
+	-- antes — mesmo cuidado de ordem já seguido para SourceWatcher.init/
+	-- TeamCreateLease.init abaixo.
+	Logger.init(sendMessage)
 	SourceWatcher.init(sendMessage)
 	SourceWatcher.start()
 	TeamCreateElection.start(if okUserId then resolvedUserId else 0)
@@ -329,8 +428,12 @@ local function start(pluginObject)
 	-- checkLeaseDrift poder emitir `leaseChanged` espontâneo.
 	TeamCreateLease.init(sendMessage)
 	TeamCreateLease.start()
-	task.spawn(runConnection, myToken, port)
-	log(("iniciado. Conectando à porta %d..."):format(port))
+	task.spawn(runConnection, myToken, ports, explicitPort, pluginObject)
+	if explicitPort then
+		log(("iniciado. Conectando à porta %d..."):format(ports[1]))
+	else
+		log(("iniciado. Sem porta salva ainda; testando candidatas (%s)..."):format(table.concat(ports, ", ")))
+	end
 end
 
 -- ---------------------------------------------------------------- toolbar
@@ -345,13 +448,51 @@ local startButton = toolbar:CreateButton(
 )
 local stopButton = toolbar:CreateButton("syncteam-stop", "Desconecta e para a observação", "", "SyncTeam: Parar")
 
+-- Botão TEMPORÁRIO de teste (pedido do orquestrador, 2026-07-07): não há
+-- como chamar `plugin:SetSetting(...)` pelo Command Bar do Studio (a global
+-- `plugin` só existe dentro do script do próprio plugin, `attempt to index
+-- nil with 'SetSetting'` fora dele) — sem isso, não havia jeito de apontar
+-- os 2 Studios de um teste na mesma máquina/mesma pasta de Plugins para
+-- portas diferentes (34980/34981), 1 harness Node por Studio. Alterna só
+-- entre esses dois valores fixos (únicos usados nos testes atuais) e
+-- reconecta na hora (stop() + start()) — ferramenta de teste, não feature de
+-- produto; não precisa de UI além do próprio botão.
+local ALT_PORT_A = 34980
+local ALT_PORT_B = 34981
+local togglePortButton = toolbar:CreateButton(
+	"syncteam-toggle-port",
+	("Alterna a porta WS entre %d e %d e reconecta (só para teste com 2 Studios na mesma máquina)"):format(
+		ALT_PORT_A,
+		ALT_PORT_B
+	),
+	"",
+	"SyncTeam: Alternar porta (34980/34981)"
+)
+
 startButton.ClickableWhenViewportHidden = true
 stopButton.ClickableWhenViewportHidden = true
+togglePortButton.ClickableWhenViewportHidden = true
 
 startButton.Click:Connect(function()
 	task.spawn(start, plugin)
 end)
 stopButton.Click:Connect(stop)
+togglePortButton.Click:Connect(function()
+	task.spawn(function()
+		local currentPort = Config.resolvePort(plugin)
+		local nextPort = if currentPort == ALT_PORT_A then ALT_PORT_B else ALT_PORT_A
+		local ok, err = pcall(function()
+			plugin:SetSetting(Config.PORT_SETTING_KEY, nextPort)
+		end)
+		if not ok then
+			log("falha ao alternar porta:", tostring(err))
+			return
+		end
+		log(("porta alternada %d -> %d; reconectando..."):format(currentPort, nextPort))
+		stop()
+		start(plugin)
+	end)
+end)
 
 plugin.Unloading:Connect(stop)
 

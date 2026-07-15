@@ -304,12 +304,21 @@ promoção de líder só após 2 observações consecutivas do mesmo candidato.
 - [x] `[Implementado 2026-07-04, idem]` `stop()` remove a própria entrada de
       `Sessions/` de forma síncrona (mesmo cuidado do fix de
       `WebStreamClient` do M2) — não depende do loop de heartbeat.
-- [ ] Dois Studios reais: sessões convergem, mesmo líder nos dois lados,
-      failover forçado (fechar o Studio líder) promove o outro nos tempos
-      esperados (roteiro de teste do RojoCoop, PROJECT_STATUS.md do
-      RojoCoop tem os números reais de uma validação anterior). Roteiro
-      manual escrito em `docs/PROJECT_STATUS.md`, pendente do usuário
-      executar — não pode ser automatizado (regra do projeto).
+- [x] `[Verificado 2026-07-07]` Dois Studios reais: sessões convergem, mesmo
+      líder nos dois lados. Primeira tentativa expôs split-brain real (termos
+      divergentes, corrigido — ver docs/DECISIONS.md); reteste após o fix
+      confirmou convergência genuína (mesmo `LeaderClientId`/term nos dois
+      Studios, log de reconciliação de duplicata disparou de verdade).
+- [x] `[Verificado 2026-07-15]` Failover forçado (fechar o Studio líder)
+      promove o outro. Resultado real: ~3s (mais rápido que o esperado
+      pelo caminho de staleness/8s) — porque fechar a janela do Studio no
+      Windows disparou `plugin.Unloading` de verdade, chamando o `stop()`
+      síncrono de `TeamCreateElection` (remove a própria `Sessions/<clientId>`
+      na hora), então o outro lado reeegeu por sessão AUSENTE, não por
+      sessão OBSOLETA (>8s). Zero split-brain na promoção. **Nuance**: o
+      caminho de crash não-gracioso (processo morto sem `Unloading`, que
+      cairia no timeout de staleness de 8s + 2 observações) continua não
+      testado — só fechar a janela normalmente foi exercitado.
 - Resolve de vez a divergência de UUID entre Studios registrada no M2: uma
   vez que existe um líder combinado, a alocação de UUID pode passar a ser
   arbitrada por ele em vez de cada Studio decidir sozinho. **Ainda não
@@ -345,11 +354,17 @@ promoção de líder só após 2 observações consecutivas do mesmo candidato.
       permite otimisticamente quando o dono é o próprio clientId OU nenhuma
       lease foi arbitrada ainda (decisão explícita, ver
       `plugin/src/TeamCreateLease.luau`).
-- [ ] Dois Studios reais: um edita, outro é negado; ao primeiro parar
-      (intent expira), o segundo assume. Roteiro escrito em
-      `docs/PROJECT_STATUS.md` (seção "M3.2 — Leases por script..."),
-      pendente do usuário executar — não pode ser automatizado (regra do
-      projeto).
+- [x] `[Verificado 2026-07-15]` Dois Studios reais: dev A escreve (lease
+      concedida), dev B tenta escrever o MESMO script enquanto o intent de A
+      está fresco — plugin de B recusa com `writeAck ok=false,
+      error="lease negada — script sendo editado por dev_Hakor"` (log real:
+      `ERROR disco → Studio: FALHA aplicando ... lease negada`). Depois que o
+      intent de A expira (~8s sem novo write), líder reatribui o lease a B
+      (`lease concedida ... owner=<B> requestSequence=2`); B reenvia a
+      escrita e desta vez é aceita (`UpdateSourceAsync` sem erro). Ciclo
+      completo negar→liberar→conceder confirmado com timestamps reais nos
+      dois logs (`Tools/logs/studio-34980.log`/`studio-34981.log`,
+      03:45:39–03:46:10).
 
 ### M3.3 — UX de lease no VS Code (delegar a `ui-dev`)
 
@@ -388,14 +403,26 @@ Sonnet por um custo menor)**:
       assume um script que o dev local tem sincronizado. Bloqueio real de
       edição fica para uma fatia de polish futura, se o feedback visual
       não for suficiente na prática.
-- [ ] Dois devs editando arquivos DIFERENTES ao mesmo tempo: zero
-      interferência — não testado com Studio real ainda (deveria
-      funcionar por design, já que leases são por uuid independente).
+- [x] `[Verificado 2026-07-15]` Dois devs criando arquivos DIFERENTES ao
+      mesmo tempo (`NaoRegressaoA.server.luau` em A,
+      `NaoRegressaoB.server.luau` em B, criados na mesma rajada de shell):
+      zero interferência, cada um alocou seu próprio uuid e replicou para o
+      outro Studio corretamente (`resolveOrAllocate: reaproveitado uuid=...
+      já existente no registry compartilhado` — o eco do disco→Studio do
+      script do OUTRO dev foi corretamente reconhecido como já existente,
+      sem duplicar).
+- [ ] **Ainda não verificado**: o aviso VISÍVEL (`vscode.window.showWarningMessage`)
+      dentro de uma janela real do VS Code (Extension Development Host) — a
+      rejeição acima foi confirmada só até a camada de dados (harness Node,
+      `NodeDiskIO`, sem VS Code de verdade aberto). O callback que dispara
+      esse aviso (`onWriteRejected`) já é exercitado pelos mesmos logs
+      (`writeAck.ok=false` chega e é logado), então a lógica está
+      validada — falta só o "de-olho-na-tela" com uma janela de VS Code
+      real, que nenhuma sessão fez ainda.
 
-**Nenhuma parte desta fatia (M3.1/M3.2/M3.3) foi testada com Studio real
-ainda.** Roteiro combinado de teste (2 Studios, uma sessão só cobrindo as
-três) está em `docs/PROJECT_STATUS.md`, seção "Roteiro combinado M3 (2
-Studios reais)".
+**M3.1 e M3.2 fechados com 2 Studios reais em 2026-07-15** (ver
+`docs/PROJECT_STATUS.md`, nota de sessão do dia). M3.3 fechado na camada de
+dados/lógica; só a checagem visual do popup do VS Code segue pendente.
 
 Ferramenta de teste: mesma dupla de contas/Studios já usada no M0/M2 —
 `Add Account`, roteiro documentado em `.claude/research/2026-07-03-dois-studios-mesma-maquina.md`.

@@ -290,3 +290,45 @@ Implementada a reação a mudanças de lease e negação de escrita. Decisões e
 - **Testes** (57 testes, incluindo 11 novos): `test/leaseTracker.test.ts` (9 testes) cobre otimismo, mudanças de dono, liberação, fallback de clientId; `test/syncBridge.test.ts` (2 testes novos em "M3.3 — lease negado") cobre callback de `onWriteRejected` disparando corretamente em ambos os modos de `writeSource` (atualizar e criar).
 - **Verificação**: `npm run lint` (tsc), `npm test` (57/57), `npm run build` (esbuild) — todos limpos.
 - **Não testado em Studio real**: integração com o lado do plugin (M3.1/M3.2) que manda `hello.clientId` e `leaseChanged`; roteiro manual em `docs/PROJECT_STATUS.md`.
+
+## Harness Node grava log em arquivo, para o orquestrador ler sem depender do usuário (2026-07-07)
+
+Tarefa paralela ao `luau-dev` fazendo o plugin encaminhar todo `print()` do
+Output do Studio como mensagem espontânea `{kind: "log", text}`. Do lado da
+extensão:
+
+- `src/util/logger.ts` ganhou `createFileLogger(filePath, prefix = "[SyncTeam]")`
+  (append-only via `fs.appendFileSync`, sem stream — mais simples e à prova de
+  perda de linha em crash; cria o diretório do arquivo com `mkdirSync
+  recursive` se preciso) e `createTeeLogger(...loggers)` (despacha cada
+  chamada para todos). `warn`/`error` do file logger recebem tag textual
+  (`WARN `/`ERROR `) porque um arquivo texto não tem as cores que
+  `console.warn`/`console.error` dão de graça.
+- `tools/run-node-harness.ts` lê `process.env.SYNCTEAM_LOG_FILE` (path
+  absoluto ou relativo ao cwd — `fs.appendFileSync`/`mkdirSync` já resolvem
+  relativo ao `process.cwd()` de graça, não precisei de `path.resolve`
+  explícito). Se setada: `logger = createTeeLogger(createConsoleLogger(...),
+  createFileLogger(...))`; se ausente: comportamento idêntico ao anterior (só
+  console). Quem decide o path do arquivo é quem sobe o harness (orquestrador),
+  não a extensão.
+- `SyncTeamService.routeSpontaneous` ganhou `case "log"` (mesmo padrão do
+  `leaseChanged` já existente): valida `message.text` é string, senão loga
+  erro e descarta; se válido, `this.logger.info(\`[studio] ${text}\`)`. Não
+  criei callback público (`setOnLog`) tipo o `setOnLeaseChanged` — não havia
+  necessidade externa, o único consumidor é o próprio logger do serviço.
+  `text` já vem prefixado de dentro do plugin (`[SyncTeam HH:MM:SS] ...`), e o
+  file logger acrescenta seu próprio prefixo/timestamp por cima — resultado
+  tem timestamp duplicado (um da extensão, um do plugin) mas isso é aceitável
+  e até útil (mostra latência de replicação Team Create → plugin → extensão).
+- **Para testar `routeSpontaneous` sem abrir socket de verdade**: instanciar
+  `SyncServer` normalmente mas nunca chamar `.start()` (constructor não faz
+  bind, só campos) e chamar o método privado direto via
+  `(service as unknown as { routeSpontaneous(m: RawMessage): void
+  }).routeSpontaneous(message)` — bypassa a necessidade de simular
+  WebSocket real. Ver `test/syncTeamService.test.ts` (novo arquivo, 3 testes)
+  e `test/logger.test.ts` (novo, 5 testes cobrindo file logger + tee logger).
+  65/65 testes totais, `tsc --noEmit` limpo, `esbuild` gera os dois bundles
+  (`dist/extension.js` e `dist/run-node-harness.js`).
+- Validei manualmente rodando o harness de verdade contra
+  `spikes/m1-test-project` com `SYNCTEAM_LOG_FILE=./scratch-test.log`: as
+  mesmas linhas aparecem no console E no arquivo, idênticas.

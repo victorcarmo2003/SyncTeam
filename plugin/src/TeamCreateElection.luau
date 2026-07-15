@@ -35,10 +35,33 @@
 -- 3. Log claro de liderança ("sou o líder agora (term N)" / "líder atual: X
 --    (term N)") sugerido como opcional pela tarefa — implementado, ajuda a
 --    validar visualmente com 2 Studios reais depois.
+--
+-- CORREÇÃO (2026-07-07, docs/DECISIONS.md): primeiro teste real com 2
+-- Studios confirmou split-brain de liderança (termos divergentes, 6 vs 1,
+-- no mesmo tick). Causa raiz: `TeamCreateSchema.ensureRoot()`/
+-- `ensureFolder("Sessions")` eram chamados só 1x dentro de start() (`tick()`
+-- rodava sincronamente logo depois, ANTES de qualquer garantia de que a
+-- replicação do outro Studio já tinha assentado) e o RESULTADO era cacheado
+-- em `rootValues`/`sessionsFolder` para o resto da sessão — se duas
+-- Instances-singleton (Folder ou Value) chegassem a ser criadas em paralelo
+-- por dois Studios (clássica corrida "FindFirstChild nil -> Instance.new"),
+-- cada Studio ficava preso lendo/escrevendo pra sempre na SUA cópia local,
+-- mesmo depois da réplica do outro lado chegar como Instance irmã. Fix em
+-- duas partes: (a) `TeamCreateSchema.getOrCreate` agora reconcilia
+-- duplicatas sempre que é chamado, com desempate determinístico/replicado
+-- (atributo `SyncTeamOrigin`) e merge que nunca perde estado (reparent de
+-- filhos de Folder; máximo de contadores IntValue) — ver comentário de
+-- cabeçalho de TeamCreateSchema.luau; (b) `tick()` (não só start()) agora
+-- CHAMA DE NOVO `ensureRoot()`/`ensureFolder("Sessions")` a cada pulso e
+-- reatribui `rootValues`/`sessionsFolder`, para este Studio sempre convergir
+-- pra Instance canônica atual em vez de ficar preso na referência capturada
+-- 1x. Continua sendo best-effort (replicação assíncrona nunca dá garantia
+-- 100%), mas agora AUTOCORRIGE em vez de divergir permanentemente.
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 
+local Logger = require(script.Parent.Logger)
 local TeamCreateSchema = require(script.Parent.TeamCreateSchema)
 
 local TeamCreateElection = {}
@@ -51,9 +74,7 @@ TeamCreateElection.STALE_AFTER_SECONDS = 8
 TeamCreateElection.CLEANUP_AFTER_SECONDS = 20
 TeamCreateElection.PROMOTION_OBSERVATIONS = 2
 
-local function log(...)
-	print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), ...)
-end
+local log = Logger.log
 
 -- ------------------------------------------------- algoritmo de eleição
 -- Porte 1:1 de RojoCoop/rojo-7.7.0-rc.1/plugin/src/TeamCreateElection.lua —
@@ -302,6 +323,22 @@ local function tick()
 	if not enabled or sessionFolder == nil or sessionFolder.Parent == nil then
 		return
 	end
+
+	-- CORREÇÃO (2026-07-07, docs/DECISIONS.md — split-brain de liderança
+	-- confirmado em teste real com 2 Studios): `rootValues`/`sessionsFolder`
+	-- eram capturados 1x em start() e nunca mais reavaliados — se uma
+	-- duplicata (ver TeamCreateSchema.luau) só fosse reconciliada DEPOIS
+	-- desse instante (replicação do Team Create ainda assentando), este
+	-- Studio continuava lendo/escrevendo pra sempre numa cópia local que
+	-- podia já ter sido esvaziada/destruída pela reconciliação de outro
+	-- Studio. `TeamCreateSchema.ensureRoot()`/`ensureFolder()` já reconciliam
+	-- duplicatas sozinhos a cada chamada (idempotente e barato — poucos
+	-- filhos) — chamar de novo AQUI, a cada pulso, é o que garante que este
+	-- Studio sempre aponta pra Instance CANÔNICA mais recente antes de ler ou
+	-- escrever `LeaderTerm`/`LeaderClientId`/`NextJoinSequence`/Sessions.
+	local root = TeamCreateSchema.ensureRoot()
+	rootValues = root.values
+	sessionsFolder = TeamCreateSchema.ensureFolder("Sessions")
 
 	local now = os.clock()
 	sessionValues.Pulse.Value += 1

@@ -1,6 +1,280 @@
 # Status do projeto
 
-Última atualização: 2026-07-04 (M3.3)
+Última atualização: 2026-07-15 (M3 fechado com 2 Studios reais — convergência, failover, leases e não-regressão)
+
+## Nota de sessão (2026-07-15) — M3 fechado com 2 Studios reais
+
+Pedido do usuário: terminar o M3 hoje. Rodado o roteiro combinado completo
+(`Tools/`, sem colar Output) contra os 2 Studios reais (userId `9203551752` e
+`1402101248`), com o código atual (inclui auto-descoberta de porta e Logger
+centralizado, ambos usados de verdade pela primeira vez nesta sessão):
+
+- **Build+deploy+harnesses**: `Tools/build-and-deploy-plugin.sh` seguido de
+  `Tools/start-harness.sh` nas duas portas — os dois Studios reconectaram
+  sozinhos, auto-descoberta de porta confirmou "porta 34980 confirmada e
+  salva" no Studio A sem precisar clicar "Alternar porta" (setup já feito
+  em sessão anterior).
+- **M3.1 (eleição)**: convergência reconfirmada (mesmo `LeaderClientId` nos
+  dois lados). Failover forçado (fechar a janela do Studio líder) promoveu
+  o outro em **~3s** — mais rápido que o esperado porque fechar a janela no
+  Windows dispara `plugin.Unloading` de verdade (`stop()` síncrono remove a
+  sessão na hora, não precisa esperar os 8s de staleness). Detalhe completo
+  em `docs/DECISIONS.md` (entrada 2026-07-15).
+- **M3.2 (leases)**: rejeição confirmada com timestamps reais — dev A
+  segurando o lease, dev B tentando escrever o MESMO script
+  (`ServerScriptService/Server/Renamed`) foi recusado
+  (`writeAck ok=false`/"lease negada — script sendo editado por
+  dev_Hakor"); depois que o intent de A expirou, líder reatribuiu a B, que
+  reenviou e foi aceito. **Cuidado de timing**: a primeira tentativa via 2
+  chamadas de `Edit` (latência de modelo entre elas) ficou por acidente bem
+  em cima do limiar de 8s e não gerou rejeição nenhuma — refeito com
+  escrita direta via shell (gap curto e controlado) para garantir
+  sobreposição real. Ver DECISIONS.md para a lição de timing.
+- **Não-regressão**: dois scripts DIFERENTES criados por cada dev na mesma
+  janela — zero interferência, uuids corretos, replicação cruzada correta.
+- **M3.3**: camada de dados confirmada (mesmos logs de rejeição/leaseChanged
+  acima); o aviso VISÍVEL (`showWarningMessage`) numa janela real de VS Code
+  não foi reverificado nesta sessão (só harness Node) — único item de M3
+  ainda em aberto, não bloqueante (lógica já validada por teste unitário +
+  pelos logs de hoje).
+- **M3.1/M3.2 marcados `[Verificado 2026-07-15]` em `docs/MILESTONES.md`.**
+
+## Nota de sessão (2026-07-07, noite) — auto-descoberta de porta (resolve a colisão 34980/34981 citada logo abaixo)
+
+Seguimento direto do "Pendente de setup" da nota anterior (Studio2 colidindo
+na mesma porta do Studio1 depois de um redeploy, exigindo clique manual no
+botão "Alternar porta"). Pedido do usuário: fazer o PRÓPRIO plugin se
+autodescobrir em vez de depender desse clique.
+
+- **`Config.CANDIDATE_PORTS = {34980, 34981}`** (novo, `plugin/src/Config.luau`)
+  — só entra em jogo quando NÃO há nenhuma porta já persistida via
+  `plugin:SetSetting` (manual ou de descoberta automática anterior);
+  `Config.resolveCandidatePorts(pluginObject)` devolve `(lista, explicit)`.
+- **`runConnection` (`plugin/src/init.server.luau`) cicla candidatas ao
+  detectar "rejeição provável"**: conexão caiu sem NUNCA ter recebido
+  nenhuma mensagem do harness E dentro de `Config.PROBABLE_REJECTION_WINDOW_SECONDS`
+  (3s) desde que abriu. Critério deliberadamente NÃO depende de interpretar
+  `code`/`errorMessage` do evento `Error` do `WebStreamClient` (sem
+  confirmação salva em `.claude/research/` sobre como o close code 1013 do
+  harness — `socket.close(1013, ...)` em `SyncServer.ts` — aparece nesses
+  parâmetros) — só observação local (tempo + mensagens recebidas). Uma queda
+  que ficou de pé mais que a janela ou que já recebeu mensagem é queda
+  normal (reconecta na MESMA porta, comportamento de antes).
+- **Persistência da porta descoberta**: assim que a conexão "estabiliza"
+  (recebeu qualquer mensagem OU passou da janela curta sem cair) E a porta
+  não era explícita, `plugin:SetSetting(Config.PORT_SETTING_KEY, port)` é
+  chamado — reload futuro do mesmo Studio já reconecta direto, sem ciclar de
+  novo. Nunca sobrescreve uma porta setada manualmente (botão "Alternar
+  porta", mantido como fallback, inalterado).
+- **Validado só por `rojo build` + `lune run`** (`Config.luau`,
+  `init.server.luau`) — sem erro de sintaxe. **Nada testado em Studio real
+  nesta tarefa** — roteiro: derrubar os dois harnesses, remover a porta
+  persistida dos dois Studios (ou usar builds novos), subir só o harness A
+  (34980), confirmar nos logs (`Tools/logs/studio-*.log`) que o segundo
+  Studio loga "porta 34980 parece ocupada, tentando 34981..." seguido de
+  "porta 34981 confirmada e salva" ao conectar no harness B.
+
+## Nota de sessão (2026-07-07, fim de tarde) — `Tools/` fechada: teste autônomo sem intervenção do usuário
+
+Pedido do usuário: montar tudo que a IA precisa para testar o M3+ sozinha
+contra os 2 Studios reais que ele deixa abertos, sem precisar colar Output
+nem clicar em nada a cada rodada (exceto o setup inicial de porta). Ver
+[Tools/README.md](../Tools/README.md) para o fluxo completo — resumo aqui:
+
+- **MCP `Roblox_Studio`** adicionado (`claude mcp add --transport stdio
+  Roblox_Studio -- cmd.exe /c %LOCALAPPDATA%\Roblox\mcp.bat`) — **rodar
+  esse comando pelo Bash/git-bash mangla `/c` para `C:/` (MSYS path
+  conversion) e quebra a conexão; usar o PowerShell tool evita isso**.
+  Conecta (`claude mcp list` mostra "✔ Connected"), mas as tools
+  `mcp__Roblox_Studio__*` não populam na MESMA sessão em que foi
+  adicionado — parece exigir restart do Claude Code. Tratado como canal
+  complementar, não principal (o usuário já avisou que pode enxergar só 1
+  dos 2 Studios).
+- **Canal principal de observação, sem MCP**: `plugin/src/Logger.luau`
+  (novo, `luau-dev`) centraliza os 6 `log()` locais duplicados e encaminha
+  TODO log também como `{kind: "log", text: ...}` pela MESMA conexão WS já
+  existente com o harness — sem conexão nova, sem tocar no limite de 6
+  `WebStreamClient`. Do lado do harness (`extension-dev`):
+  `createFileLogger`/`createTeeLogger` novos em
+  `vscode-extension/src/util/logger.ts`, `SyncTeamService.routeSpontaneous`
+  ganhou o `case "log"`, `run-node-harness.ts` lê `SYNCTEAM_LOG_FILE` e
+  passa a gravar em arquivo (console continua funcionando igual quando a
+  env var não está setada). Formato de linha e detalhes completos em
+  `Tools/README.md`.
+- **Validado end-to-end nesta sessão, de verdade** (não só teoria): plugin
+  reconstruído (`Tools/build-and-deploy-plugin.sh`) e reimplantado; harnesses
+  antigos derrubados e subidos de novo via `Tools/start-harness.sh` com
+  `SYNCTEAM_LOG_FILE` setado; `Tools/logs/studio-34981.log` mostrou a linha
+  `[studio] [SyncTeam 13:31:55] conectado em ws://127.0.0.1:34981` —
+  confirma que um log gerado DENTRO do Studio chegou no arquivo em disco
+  sem nenhuma ação do usuário.
+- **Pendente de setup**: Studio2 (`1402101248`) não reconectou ao harness A
+  (34980) depois do redeploy — provavelmente ainda com a porta 34981
+  persistida (`plugin:SetSetting`) de um teste anterior, colidindo com
+  Studio1. Próxima vez que o usuário estiver por perto, pedir para conferir/
+  clicar "SyncTeam: Alternar porta" em um dos dois se os dois harnesses não
+  mostrarem exatamente 1 Studio conectado cada.
+- **Testes ainda não automatizáveis, mesmo com essa infra**: fechar a janela
+  do Studio líder (failover forçado do M3.1) e o setup inicial de porta
+  (primeira vez, ou depois de uma colisão) exigem ação física do usuário
+  dentro do Studio. Todo o resto do ciclo (build/deploy do plugin, disparar
+  edições via arquivo em disco, ler resultado) já é autônomo.
+
+## Nota de sessão (2026-07-07) — logger centralizado no plugin (observabilidade sem colar Output manualmente)
+
+Lado do plugin de uma tarefa maior (o outro lado, extensão/harness gravando
+em arquivo, é trabalho paralelo de `extension-dev`): `plugin/src/Logger.luau`
+(novo) centraliza o `local function log(...)` que antes existia duplicado em
+6 arquivos (`init.server.luau`, `TeamCreateElection.luau`,
+`TeamCreateSchema.luau`, `TeamCreateLease.luau`, `ScriptRegistry.luau`,
+`SourceWatcher.luau`). `Logger.log(...)` mantém o `print(prefix, ...)`
+IDÊNTICO ao de antes (Output do Studio inalterado) e, se houver um
+`sendMessage` injetado via `Logger.init` (mesmo padrão de
+`SourceWatcher.init`/`TeamCreateLease.init`), encaminha o texto pela mesma
+conexão WS já existente como `{kind = "log", text = ...}`. `Logger.init(sendMessage)`
+é chamado em `init.server.luau` `start()`, mesmo lugar que já chama
+`SourceWatcher.init`/`TeamCreateLease.init`. Cuidado de recursão: os dois
+logs internos da própria `sendMessage` (descarte sem conexão / falha ao
+enviar) usam `print` puro, não `Logger.log` — senão uma falha de envio
+dispararia log-sobre-a-falha via WS, que tentaria enviar de novo, sem saída
+natural do ciclo. Validado só por `rojo build` + `lune run` nos 8 arquivos
+tocados (7 existentes + `Logger.luau` novo) — sem erro de sintaxe, erro
+esperado só na primeira linha que toca `game`/`plugin` (`Logger.luau` não
+toca `game` nenhuma vez, então rodou sem nenhum erro). Nada testado em
+Studio real nesta tarefa (é infraestrutura de teste, não feature validável
+sem o lado da extensão também pronto). Detalhe completo em
+`.claude/agent-memory/luau-dev.md`.
+
+## Nota de sessão (2026-07-07, fim de tarde) — reteste real confirma o fix do split-brain
+
+Depois do fix de reconciliação determinística (seção abaixo), plugin
+reconstruído e reimplantado; Studio1 (`9203551752`) usou o novo botão
+"SyncTeam: Alternar porta" para migrar de 34980 para 34981 (harness B). No
+Output:
+
+- Studio1: `reconciliada(s) 1 duplicata(s) de Folder 'Sessions' sob
+  TestService.SyncTeam` — o merge determinístico disparou de verdade contra
+  o engine real, não é só teoria de código. Logo depois: `sou o líder agora
+  (term 6)`.
+- Studio2 (`1402101248`, harness A): `líder atual:
+  300e4572-34c8-47cc-8e1d-69241439ff99 (term 6)` — **mesmo clientId, mesmo
+  term** anunciado pelo Studio1. Convergência real confirmada, zero
+  divergência de termo desta vez (contraste direto com o split-brain
+  original: 6 vs 1).
+
+**Confirmado via log dos harnesses** (não só client-side, que é otimista —
+loga "conectado" antes de confirmar o handshake): harness B aceitou a
+conexão do Studio1 como único cliente; quando o Studio2 tentou entrar na
+mesma porta B logo depois (ao clicar "Alternar porta" também), foi
+genuinamente rejeitado pela regra de 1 cliente por servidor do M1
+(`segundo plugin tentou conectar... fechando a nova conexão` no log do
+harness) — essa rejeição só aparece no harness, não no Output do plugin.
+
+**Estado dos harnesses ao final desta nota**: harness A (34980) sem ninguém
+conectado; harness B (34981) com Studio1. Studio2 precisa clicar "Alternar
+porta" mais uma vez para voltar a 34980 antes de continuar o roteiro
+combinado do M3 (que precisa dos dois em servidores separados, simulando 2
+devs — não compartilhando 1 harness só).
+
+**M3.1 dado como fechado no critério de convergência** (`docs/MILESTONES.md`
+atualizado). **Ainda pendente**: failover forçado (fechar o Studio líder e
+confirmar que o outro promove sozinho nos tempos esperados) — não exercitado
+nesta rodada. Depois disso, seguir para o roteiro de M3.2 (rejeição/
+liberação de lease) com os dois harnesses já no ar.
+
+## Nota de sessão (2026-07-07, tarde) — split-brain de liderança: causa raiz + fix (código), reteste real PENDENTE
+
+Investigação de causa raiz do split-brain relatado na nota de sessão anterior
+(abaixo), feita só por leitura de código/logs (sem Studio real disponível
+nesta tarefa). Detalhe completo em [DECISIONS.md](DECISIONS.md) (entrada
+"2026-07-07 — M3.1: split-brain de liderança — causa raiz confirmada..."),
+resumo aqui:
+
+- **Mecanismo confirmado por leitura de código** (não só teorizado): o
+  padrão "singleton preguiçoso" (`FindFirstChild` → se nil, `Instance.new`)
+  usado tanto em `TeamCreateSchema.luau` (container raiz + valores de
+  coordenação) quanto no `getOrCreate` privado de `TeamCreateElection.luau`
+  permite que dois Studios criem Instances DUPLICADAS (Roblox não faz merge
+  de irmãos com mesmo Name) se chamado quase-simultaneamente antes da
+  réplica assentar — agravado por `tick()` rodar SINCRONAMENTE dentro de
+  `start()` sem nenhuma espera de assentamento, e por `rootValues`/
+  `sessionsFolder` serem cacheados 1x em `start()` e nunca reavaliados
+  depois (mesmo se a réplica do outro lado chegasse depois, o Studio
+  continuava preso na sua cópia local).
+- **Fix aplicado**: `plugin/src/TeamCreateSchema.luau` — `getOrCreate` agora
+  reconcilia duplicatas sempre que é chamado (não só na criação), com
+  desempate determinístico/replicado (atributo `SyncTeamOrigin`, GUID
+  gravado na criação; canônica = menor) e merge que nunca perde estado
+  (Folder: reparenta filhos antes de destruir a casca; IntValue: mantém o
+  MAIOR valor entre duplicatas — contadores deste projeto são
+  estritamente crescentes). `plugin/src/TeamCreateElection.luau` —
+  `tick()` agora chama `TeamCreateSchema.ensureRoot()`/
+  `ensureFolder("Sessions")` DE NOVO a cada pulso (2s), reatribuindo
+  `rootValues`/`sessionsFolder`, em vez de confiar na referência capturada
+  1x em `start()`. Constantes de tempo validadas (pulso/stale/cleanup/
+  observações) não foram alteradas.
+- **Adição pequena de escopo (pedido do orquestrador durante a tarefa)**:
+  botão de toolbar temporário "SyncTeam: Alternar porta (34980/34981)" em
+  `plugin/src/init.server.luau` — `plugin:SetSetting` não é chamável pelo
+  Command Bar do Studio (`plugin` global só existe dentro do script do
+  próprio plugin), então não havia UI para apontar 2 Studios na mesma
+  máquina/pasta de Plugins para portas diferentes. Ferramenta de teste, não
+  feature de produto.
+- **Validado só por `rojo build` + `lune run`** nos arquivos tocados e nos
+  dependentes (`TeamCreateLease.luau`/`ScriptRegistry.luau`/
+  `SourceWatcher.luau`, que consomem `TeamCreateSchema.ensureRoot/
+  ensureFolder` com a mesma assinatura) — sem erro de sintaxe, erro
+  esperado só na primeira linha que toca `game`.
+
+**PENDENTE — precisa de teste real, não pode ser automatizado**: repetir o
+CENÁRIO EXATO que expôs o bug (os mesmos 2 Studios, userId `9203551752` e
+`1402101248`, mesma place com Team Create, plugin reconstruído/reinstalado
+nos dois — reload/auto-refresh simultâneo do arquivo do plugin, igual da
+primeira vez) e confirmar no Output dos dois:
+
+1. Nenhum dos dois Studios se declara líder com um term MAIOR que 1 sem o
+   outro convergir para o MESMO `LeaderClientId`/`LeaderTerm` em poucos
+   ciclos de pulso (~4-6s) — critério de aceite do M3.1 ("mesmo líder nos
+   dois lados").
+2. Se aparecer o log `reconciliada(s) N duplicata(s) de ... sob ...` (novo,
+   `TeamCreateSchema.luau`) em qualquer um dos dois lados, isso confirma que
+   a corrida realmente aconteceu de novo E que a reconciliação rodou —
+   nesse caso, confirmar que AMBOS os Studios convergem para o mesmo líder
+   logo em seguida (não só que o log de reconciliação apareceu).
+3. Repetir o roteiro combinado do M3 (M3.1 failover forçado + M3.2 leases +
+   M3.3 UX), já escrito abaixo em "Roteiro combinado M3" — continua válido,
+   sem mudança.
+
+Sem esse reteste, o fix fica `[Hipótese]` — coerente com a leitura de código
+e com o design pedido (convergência determinística mesmo com duplicatas),
+mas nunca exercitado contra o engine/replicação real do Team Create.
+
+## Nota de sessão (2026-07-07) — primeiro teste real do M3 em 2 Studios, split-brain de líder encontrado
+
+Plugin buildado (`rojo build`) e implantado em
+`%LOCALAPPDATA%\Roblox\Plugins\SyncTeam.rbxm` pela primeira vez com o código
+de M3.1/M3.2/M3.3. Auto-refresh do Studio recarregou o plugin nos dois
+Studios reais (userId `9203551752` e `1402101248`) quase simultaneamente.
+
+**Resultado**: eleição de líder teve **split-brain confirmado** — os dois
+Studios se declararam líder ao mesmo tempo, com termos diferentes (6 vs 1).
+Detalhe completo, causa provável e próximos passos em
+[DECISIONS.md](DECISIONS.md) (entrada 2026-07-07). Não sabemos ainda se
+autocorrige depois de mais ciclos de pulso — logs capturados terminam pouco
+depois da divergência. **Próxima ação pedida ao usuário**: observar mais
+alguns segundos e colar logs atualizados dos dois Studios para confirmar se
+convergiu ou se o split-brain persiste (nesse caso é bug bloqueante do M3.1,
+candidato a fix antes de continuar o roteiro do M3.2/M3.3).
+
+**Achado separado, ambiental**: nenhum servidor WS estava escutando a porta
+34980 durante o teste (nem extensão VS Code nem
+`vscode-extension/tools/run-node-harness.ts`) — confirmado via `netstat`
+(conexões presas em `SYN_SENT`). Os dois plugins ficaram em loop de
+reconexão (`erro WS 400 HttpError: ConnectFail` a cada ~3s) o teste todo.
+Isso não invalida o teste de eleição (que roda inteiramente dentro de
+`TestService.SyncTeam`, sem depender da extensão), mas significa que
+**nada do fluxo de leases (M3.2) foi exercitado ainda** — precisa da
+extensão ou do harness rodando antes do próximo passo do roteiro combinado.
 
 ## Nota de sessão (2026-07-04, madrugada — trabalho autônomo)
 
@@ -84,19 +358,14 @@ Studio parece ser um soft-delete (não chama `Destroy()` de verdade
 imediatamente), então a checagem certa é só `Parent == nil`. Também corrigido
 um vazamento de `WebStreamClient` que mascarava os testes.
 
-**M3.1 implementado** (sessions + heartbeat + eleição de líder, só plugin,
-sem VS Code) — porte direto do algoritmo já validado em 2 Studios no
-RojoCoop, `rojo build`/`lune run` limpos, **não testado em Studio real
-ainda** (roteiro escrito, pendente do usuário).
-
-**M3.2 implementado** (leases autoritativas por script, só plugin) — porte
-do algoritmo de decisão já validado no RojoCoop (`TeamCreateShadowLease.lua`),
-com a diferença de serem autoritativas desde o início (não "shadow").
-`rojo build`/`lune run` limpos, **não testado em Studio real ainda** (roteiro
-escrito, pendente do usuário). Pendências antes de fechar de vez o M3 inteiro:
-os dois roteiros de 2 Studios reais (M3.1: convergência/failover de líder;
-M3.2: negação/liberação de lease); depois disso, M3.3 (UX de lease no VS
-Code, delegado a `ui-dev`) é o próximo passo. Ver docs/MILESTONES.md.
+**M3.1 e M3.2 fechados em 2026-07-15** com 2 Studios reais: convergência de
+líder, failover forçado, rejeição/liberação de lease e não-regressão
+(scripts diferentes simultâneos) todos confirmados — ver nota de sessão
+2026-07-15 acima e `docs/MILESTONES.md`. **Único item de M3 ainda em
+aberto**: aviso visível (`showWarningMessage`) numa janela real de VS Code
+(M3.3) — a camada de dados já está confirmada pelos mesmos logs de hoje, só
+falta o "olhar pra tela" com um VS Code Extension Development Host de
+verdade. Ver docs/MILESTONES.md.
 
 ## M1 — fechado (2026-07-04)
 

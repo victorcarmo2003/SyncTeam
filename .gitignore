@@ -5,3 +5,5 @@ node_modules/
 dist/
 out/
 *.log
+Tools/logs/*
+!Tools/logs/.gitkeep

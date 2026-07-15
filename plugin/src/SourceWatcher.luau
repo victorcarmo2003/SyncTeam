@@ -25,6 +25,7 @@
 local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local Config = require(script.Parent.Config)
+local Logger = require(script.Parent.Logger)
 local ScriptRegistry = require(script.Parent.ScriptRegistry)
 
 local SourceWatcher = {}
@@ -41,9 +42,7 @@ local lastSourceByInstance = {} -- LuaSourceContainer -> último Source visto (d
 local recentWrites = {} -- LuaSourceContainer -> os.clock() da última escrita local via writeSource
 local rootConnections = {} -- DescendantAdded/DescendantRemoving dos containers observados
 
-local function log(...)
-	print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), ...)
-end
+local log = Logger.log
 
 -- ------------------------------------------------------------------ caminho
 

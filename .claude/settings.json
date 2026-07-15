@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tasklist*)",
+      "Bash(npm test)",
+      "Bash(npm run lint)",
+      "mcp__Roblox_Studio__script_grep",
+      "mcp__Roblox_Studio__script_read",
+      "mcp__Roblox_Studio__search_game_tree",
+      "mcp__Roblox_Studio__script_search"
+    ]
+  }
+}

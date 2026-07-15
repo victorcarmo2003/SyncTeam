@@ -551,3 +551,215 @@ Atualize ao final de cada tarefa; mantenha curto e acionável.
   linha que toca `game`. **Nada testado em Studio real** — não há roteiro
   manual isolado desta fatia (o consumo de `clientId`/`leaseChanged` é
   trabalho paralelo de outro agente na extensão/UI).
+
+## M3.1 — fix de split-brain de liderança (`plugin/`), 2026-07-07
+
+- **Confirmado por leitura de código (não só suspeita)**: o padrão
+  "singleton preguiçoso" (`parent:FindFirstChild(name)` → se `nil`,
+  `Instance.new`+`.Parent`), usado em `TeamCreateSchema.luau` (container raiz
+  + valores de coordenação) e no `getOrCreate` privado de
+  `TeamCreateElection.luau`, é uma corrida real quando dois Studios chamam
+  quase-simultaneamente ANTES da réplica do Team Create assentar — Roblox
+  permite duas Instances IRMÃS com o mesmo `Name` (não faz merge), então cada
+  Studio pode criar sua própria cópia. Agravante que só a leitura do fluxo de
+  `start()` revelou: `tick()` roda SINCRONAMENTE logo depois de
+  `ensureOwnSession()`, sem NENHUMA espera de assentamento; e
+  `rootValues`/`sessionsFolder` eram cacheados 1x em `start()` e NUNCA
+  reavaliados depois — mesmo que a réplica do outro lado chegasse depois
+  como Instance irmã, o Studio ficava preso pra sempre na sua cópia local.
+  Bug real reproduzido em teste com 2 Studios: `LeaderTerm` divergente (6 vs
+  1) no mesmo momento, cada lado citando um clientId diferente como líder.
+- **Lição principal, generalizável**: "evitar a corrida" (ex.: delay
+  aleatório antes do primeiro tick) NUNCA é suficiente sozinho quando a
+  replicação é assíncrona — só reduz a chance, não elimina. Qualquer
+  singleton compartilhado entre Studios via Team Create (container Folder OU
+  Value simples tipo IntValue/StringValue) precisa de RECONCILIAÇÃO
+  determinística: um critério de desempate que seja (a) replicado (dado que
+  qualquer Studio, tendo visto ambas as duplicatas, calcula igual — nunca
+  "quem eu vi primeiro" local) e (b) nunca destrutivo (merge antes de
+  destruir, não escolher-e-descartar). Ordem de criação/timestamp não existe
+  como propriedade nativa do Roblox entre clientes — usei um atributo GUID
+  (`SetAttribute` gravado ANTES de `.Parent`) como o dado replicado de
+  desempate, comparado lexicograficamente (menor = canônica).
+- **Fix em `TeamCreateSchema.luau`**: `getOrCreate` agora escaneia TODOS os
+  filhos com o Name+ClassName pedidos (não só `FindFirstChild`, que só acha
+  o primeiro) a CADA chamada (não só na criação), e se houver >1: ordena por
+  atributo `SyncTeamOrigin` (GUID, gravado na criação — instâncias
+  pré-existentes sem o atributo recebem um na primeira reconciliação, com
+  fallback de desempate por conteúdo replicado — `.Value` para Values,
+  contagem de filhos para Folder — só no caso raríssimo de nenhum candidato
+  ainda ter o atributo, `[Hipótese]` não exercitada contra Studio real).
+  Merge ANTES de destruir a(s) duplicata(s): Folder → reparenta TODOS os
+  filhos pra dentro da canônica (nunca perde sessão/script/lease que nasceu
+  por azar sob a pasta "perdedora" — se isso deixar netos com nome repetido
+  sob a canônica, a PRÓXIMA chamada de `getOrCreate` para aquele nome
+  específico reconcilia de novo, mesmo princípio aplicado recursivamente).
+  IntValue → canônica fica com o MAIOR valor entre as duplicatas (contadores
+  deste projeto — `LeaderTerm`/`NextJoinSequence`/`NextLeaseRequestSequence`
+  — são estritamente crescentes, nunca é retrocesso). StringValue
+  (`LeaderClientId`) → sem merge de conteúdo, aceito porque o próprio ciclo
+  de eleição reavalia do zero no tick seguinte a partir de `Sessions/` já
+  mesclado (autocorrige; custo aceito: pode gerar +1 term "gasto" na
+  convergência, nunca viola exclusão mútua de líder).
+- **`ensureRoot()` perdeu o cache module-level** (`if rootFolder == nil
+  then...`) — esse cache-once era EXATAMENTE a mesma classe de bug (nunca
+  reavaliava se uma duplicata aparecia depois). Agora sempre reconsulta
+  `TestService:GetChildren()` via `getOrCreate` — barato (poucos filhos),
+  chamado a cada pulso (2s), não em hot loop.
+- **Fix em `TeamCreateElection.luau`**: `tick()` (não só `start()`) agora
+  chama `TeamCreateSchema.ensureRoot()`/`ensureFolder("Sessions")` DE NOVO a
+  cada pulso e REATRIBUI `rootValues`/`sessionsFolder` — reconciliar
+  duplicatas em `TeamCreateSchema` não adianta nada se quem consome nunca
+  atualiza a própria referência cacheada. Regra geral pro projeto: qualquer
+  módulo que chama `ensureRoot()`/`ensureFolder()` UMA VEZ em `start()` e
+  guarda o resultado numa variável de longa duração precisa reconsultar
+  periodicamente (ou a cada uso), não só na inicialização — o mesmo se aplica
+  a `TeamCreateLease.luau` (`leasesFolder`/`sessionsFolder`/`rootValues`
+  cacheados em `ensureContainers()` com o MESMO guard `if leasesFolder ~=
+  nil then return end`) e ao `getOrCreate`/`ensureContainers` PRÓPRIOS desse
+  arquivo (não tocados nesta tarefa — risco residual aceito porque, uma vez
+  a eleição de líder convergindo corretamente, só o líder ÚNICO escreve em
+  `Leases/<uuid>`, o que elimina a corrida cross-Studio nesse caso específico
+  — mas se `TeamCreateLease.luau` for revisitado, aplicar o mesmo padrão de
+  reconciliação/refresh por consistência).
+- **Sem alterar constantes de tempo validadas** (pulso 2s/stale 8s/cleanup
+  20s/2 observações) — não foi necessário pra este fix.
+- **Adição pequena pedida pelo orquestrador durante a tarefa**: botão de
+  toolbar temporário "SyncTeam: Alternar porta (34980/34981)" em
+  `plugin/src/init.server.luau`, porque `plugin:SetSetting(...)` não é
+  chamável pelo Command Bar do Studio (`plugin` global só existe dentro do
+  script do próprio plugin — `attempt to index nil with 'SetSetting'`).
+  Alterna entre os dois únicos valores usados nos testes atuais e reconecta
+  na hora (`stop()` + `start(plugin)`) — ferramenta de teste, não feature de
+  produto.
+- Validado só por `rojo build` (binário cacheado, layout ok) + `lune run` em
+  `TeamCreateSchema.luau`, `TeamCreateElection.luau`, `init.server.luau` e
+  nos dependentes que consomem `TeamCreateSchema` com a mesma assinatura
+  (`TeamCreateLease.luau`, `ScriptRegistry.luau`, `SourceWatcher.luau`) — sem
+  erro de sintaxe, erro esperado só na primeira linha que toca `game`. **Nada
+  testado em Studio real nesta tarefa** — o fix responde a um bug só
+  reproduzido em Studio real, mas o próprio fix continua `[Hipótese]` até
+  repetir o cenário exato (2 Studios, reload simultâneo) e confirmar
+  convergência — roteiro em `docs/PROJECT_STATUS.md`.
+
+## Logger centralizado + forwarding por WS (`plugin/`), 2026-07-07
+
+- **Motivação**: 6 arquivos tinham cada um sua PRÓPRIA `local function log(...)`
+  idêntica (`print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), ...)`) — sem
+  jeito de o orquestrador/IA ver o log sem o usuário colar o Output do Studio
+  manualmente. Novo módulo `plugin/src/Logger.luau` centraliza isso:
+  `Logger.log(...)` mantém a chamada `print(prefix, ...)` BYTE-IDÊNTICA à de
+  antes (Output do Studio não muda nada) e, se houver `sendMessage` injetado
+  via `Logger.init(onMessage)` (mesmo padrão exato de
+  `SourceWatcher.init`/`TeamCreateLease.init` — reaproveitado, não inventado),
+  encaminha o texto pela MESMA conexão WS já existente como
+  `{kind = "log", text = "<string>"}`. Sem fila/buffer: log perdido enquanto
+  desconectado é aceitável (objetivo é observabilidade em tempo real de
+  teste, não persistência garantida).
+- **Padrão de substituição nos 6 arquivos**: `local function log(...) ... end`
+  → `require(script.Parent.Logger)` (ou `script.Logger` em
+  `init.server.luau`, que é o script raiz) + `local log = Logger.log`. Zero
+  mudança de chamador (`log("x", y)` continua igual em todo o resto do
+  arquivo) — só a origem da função mudou.
+- **Pegadinha de recursão evitada por design (não descoberta por bug)**: em
+  `init.server.luau`, `sendMessage` (a função real de envio por WS, que
+  `Logger.init` recebe como `onMessage`) tem dois pontos onde loga sobre SI
+  MESMA (descartada por falta de conexão; falha ao `client:Send`). Se esses
+  dois pontos usassem `log`/`Logger.log` em vez de `print` puro, o ciclo
+  seria: `Logger.log` chama `sendMessage` → `sendMessage` falha/descarta →
+  loga a falha via `Logger.log` → que chama `sendMessage` de novo → sem saída
+  natural (cada tentativa gera uma nova mensagem de log sobre a tentativa
+  anterior). **Regra geral pro projeto**: qualquer módulo que seja ao mesmo
+  tempo (a) o transporte usado por `Logger.init` E (b) tenha logging interno
+  sobre falhas do próprio transporte, esse logging interno específico deve
+  usar `print` cru, nunca passar pelo `Logger` — só esse módulo (hoje só
+  `init.server.luau`) tem essa restrição; todos os outros `log(...)` do
+  projeto podem/devem usar `Logger.log` livremente.
+- **Grafo de dependência sem ciclo**: `Logger.luau` não `require`s nenhum
+  outro módulo do projeto (só `os.date`/`select`/`tostring`, sem `game`
+  nenhum) — por isso é seguro todo módulo (`ScriptRegistry`,
+  `TeamCreateSchema`, `TeamCreateElection`, `TeamCreateLease`,
+  `SourceWatcher`, `init.server.luau`) `require`-lo sem risco de dependência
+  circular.
+- **Reconstrução do `text` enviado por WS usa espaço como separador entre
+  argumentos** (`prefix .. " " .. tostring(arg1) .. " " .. tostring(arg2)...`,
+  via `select("#", ...)`/`select(index, ...)` para não perder argumentos
+  `nil` no meio) — é uma reconstrução best-effort do conteúdo, NÃO uma cópia
+  do separador exato que o Output do Studio usa internamente para múltiplos
+  argumentos de `print` (não verificado/pesquisado nesta tarefa, `[Hipótese]`,
+  mas irrelevante: o `print(...)` em si, que é o que aparece no Output, não
+  foi alterado nem reformatado — só passou a viver dentro de `Logger.log` em
+  vez de duplicado).
+- **Validado só por `rojo build` + `lune run` nos 8 arquivos** (7 tocados +
+  `Logger.luau` novo) — sem erro de sintaxe; erro esperado só na primeira
+  linha que toca `game`/`plugin`. `Logger.luau` roda até o fim SEM NENHUM
+  erro no `lune run` (não toca `game` em lugar nenhum) — diferente de todo
+  outro módulo do plugin, que sempre erra na primeira linha `game:GetService`.
+  **Nada testado em Studio real nesta tarefa** — é infraestrutura de teste
+  (o lado que grava em arquivo é tarefa paralela de `extension-dev`), não uma
+  feature com roteiro de validação próprio; fica implícito que só será
+  exercitada de fato quando os dois lados existirem juntos.
+
+## Auto-descoberta de porta WS (`plugin/`), 2026-07-07
+
+- **Motivação**: teste com 2 Studios na MESMA máquina/MESMA pasta de Plugins
+  (2 contas via "Add Account" carregam o mesmo arquivo de plugin) colidia na
+  mesma porta mais de uma vez, exigindo clique manual no botão "Alternar
+  porta" (M3.1). Pedido do orquestrador: plugin se autodescobre.
+- **Critério de "rejeição provável" escolhido — o ponto central da tarefa**:
+  NÃO tentei interpretar `code`/`errorMessage` que o evento `Error` do
+  `WebStreamClient` recebe para identificar o close code 1013/motivo que o
+  harness manda (`socket.close(1013, "SyncTeam: já existe um plugin
+  conectado")` em `SyncServer.ts`) — não existe nenhuma entrada em
+  `.claude/research/` confirmando o que `CreateWebStreamClient` expõe nesses
+  parâmetros para um close code custom do servidor, e a regra do projeto
+  proíbe pesquisar API nova direto (a tarefa em si já antecipava esse caso e
+  pedia fallback conservador). Critério usado, 100% observação local: a
+  conexão caiu (`Closed`/`Error`) **sem nunca ter recebido nenhuma mensagem
+  do harness** (nem `MessageReceived` nenhum, nem eco/ack de infra) **E**
+  dentro de `Config.PROBABLE_REJECTION_WINDOW_SECONDS` (3s, nova constante,
+  não é constante de eleição) desde que o `WebStreamClient` foi criado. Se
+  qualquer uma das duas condições falhar (ficou de pé mais que a janela, OU
+  recebeu qualquer mensagem antes de cair), é tratada como queda normal e
+  reconecta na MESMA porta — comportamento idêntico ao de antes desta
+  tarefa. `code`/`errorMessage` continuam só logados (nunca usados pra
+  decisão), exatamente como já era.
+- **Ciclo de candidatas com dois "atrasos" diferentes**: candidata rejeitada
+  → avança pra próxima (`(index % #ports) + 1`) com
+  `Config.CANDIDATE_RETRY_DELAY_SECONDS` (0.75s, curto, pra não fazer
+  sentido esperar `RECONNECT_SECONDS` inteiro antes de tentar a alternativa
+  quando a porta está claramente ocupada por outro Studio); depois de
+  `#ports` rejeições seguidas na mesma "volta" (contador `attemptsInLap`),
+  volta pro início da lista mas com `RECONNECT_SECONDS` normal (evita
+  busy-loop se nenhum harness estiver de pé em porta nenhuma). Uma porta
+  explícita (`explicitAtStart == true`, `#ports == 1`) nunca entra nesse
+  ramo (`probablyRejected` exige `#ports > 1`) — preserva 100% o
+  comportamento anterior (retry na mesma porta) pra quem já tem porta
+  setada manualmente.
+- **Persistência só de descobertas automáticas**: `persistedAutoPort`
+  inicializado como `explicitAtStart` — se a porta já era explícita, NUNCA
+  chama `SetSetting` de novo (evita sobrescrever escolha manual/anterior por
+  engano, mesmo que o fluxo passasse por ali, o que nem acontece já que
+  `#ports == 1` nesse caso). Grava assim que a conexão "estabiliza" (mensagem
+  recebida OU `PROBABLE_REJECTION_WINDOW_SECONDS` decorrido sem cair) —
+  IMEDIATAMENTE, não espera a conexão cair primeiro, verificado a cada
+  `task.wait(0.5)` do loop conectado.
+- **`Config.resolveCandidatePorts(pluginObject)`** (novo, ao lado do já
+  existente `Config.resolvePort`, que continua igual e é usado pelo botão
+  "Alternar porta" pra ler a porta atual): devolve `(lista, explicit)` — lista
+  de 1 item + `true` se já há setting válida, senão `Config.CANDIDATE_PORTS`
+  + `false`.
+- **Botão manual "Alternar porta" mantido sem nenhuma mudança de
+  comportamento** — só interage com a auto-descoberta indiretamente (ao
+  chamar `SetSetting`, a próxima `start()` vê a porta como explícita e nunca
+  mais cicla).
+- Validado só por `rojo build` + `lune run` em `Config.luau` e
+  `init.server.luau` — sem erro de sintaxe (erro esperado só na 1ª linha que
+  toca `game` em `init.server.luau`; `Config.luau` roda até o fim sem erro
+  porque o único uso de `game` fica dentro de uma função não invocada no
+  parse). **Nada testado em Studio real nesta tarefa** — o critério de
+  rejeição provável (3s sem nenhuma mensagem) é `[Hipótese]`: não há como
+  confirmar sem 2 Studios reais colidindo de propósito se o harness realmente
+  fecha rápido o suficiente (e sem nenhuma mensagem trafegada) pra essa
+  janela nunca dar falso-negativo/falso-positivo. Roteiro manual em
+  `docs/PROJECT_STATUS.md` (seção "auto-descoberta de porta").

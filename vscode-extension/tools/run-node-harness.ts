@@ -13,14 +13,23 @@ import { SyncServer } from "../src/sync/SyncServer.js";
 import { SyncTeamService } from "../src/sync/SyncTeamService.js";
 import { NodeDiskIO } from "../src/sync/NodeDiskIO.js";
 import { parseMountPoints } from "../src/mapping/projectMapping.js";
-import { createConsoleLogger } from "../src/util/logger.js";
+import { createConsoleLogger, createFileLogger, createTeeLogger } from "../src/util/logger.js";
 
 const DEFAULT_PORT = 34980;
+const HARNESS_LOG_PREFIX = "[SyncTeam harness]";
 
 async function main(): Promise<void> {
   const projectDir = path.resolve(process.argv[2] ?? ".");
   const projectFile = path.join(projectDir, "default.project.json");
-  const logger = createConsoleLogger("[SyncTeam harness]");
+  const consoleLogger = createConsoleLogger(HARNESS_LOG_PREFIX);
+  // SYNCTEAM_LOG_FILE (opcional, absoluto ou relativo ao cwd): quando
+  // presente, todo log do harness (incluindo mensagens espontâneas "log" do
+  // plugin, tratadas em SyncTeamService.routeSpontaneous) também vai para
+  // esse arquivo — permite o orquestrador ler o Output do Studio sem depender
+  // do usuário copiar/colar nem de nenhum MCP externo. Sem a env var, o
+  // comportamento é idêntico ao anterior (só console).
+  const logFile = process.env.SYNCTEAM_LOG_FILE;
+  const logger = logFile ? createTeeLogger(consoleLogger, createFileLogger(logFile, HARNESS_LOG_PREFIX)) : consoleLogger;
 
   const raw = await fs.readFile(projectFile, "utf8");
   const json = JSON.parse(raw);

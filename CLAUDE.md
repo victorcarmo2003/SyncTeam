@@ -55,6 +55,7 @@ O que o RojoCoop **não** validou (e é a hipótese central do SyncTeam): replic
 - `plugin/` — (a partir do M1) plugin Studio em Luau, buildado com Rojo (`rojo build`) apenas como ferramenta de build.
 - `vscode-extension/` — (a partir do M1) extensão em TypeScript.
 - `.claude/` — agentes, regras, memória de agentes e resultados de pesquisa (ver abaixo).
+- `Tools/` — scripts para eu (a IA) testar sozinha contra os 2 Studios reais que o usuário deixa abertos (build+deploy do plugin, subir harness Node, ler log do Studio sem copiar/colar). Ver [Tools/README.md](Tools/README.md) antes de pedir ao usuário para colar Output — pode já dar pra ler direto.
 
 ## Agentes e regras (.claude/) — pedido explícito do usuário
 
@@ -77,5 +78,5 @@ Cada agente mantém memória própria em `.claude/agent-memory/<nome>.md`. Antes
 
 - [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) é o handoff vivo: leia ao começar, atualize ao terminar trabalho significativo.
 - Marque afirmações como `[Verificado]` / `[Hipótese]` / `[Decisão pendente]` nos docs — só promova a `[Verificado]` após teste real (idealmente em dois Studios).
-- Validações que envolvem Team Create exigem dois Studios reais e não podem ser automatizadas — escreva o roteiro de teste e peça ao usuário para executar.
+- Validações que envolvem Team Create exigem dois Studios reais — mas desde 2026-07-07 boa parte do CICLO (build/deploy do plugin, disparar edições, ler o log do Studio) é automatizável sem o usuário via [Tools/README.md](Tools/README.md); só ações físicas dentro do Studio (fechar janela para failover, primeiro setup de porta) ainda exigem o usuário. Continue registrando resultado em docs/DECISIONS.md/PROJECT_STATUS.md como sempre.
 - APIs do Studio mudam: confirme disponibilidade de APIs (ex.: `WebStreamClient`, `ScriptEditorService`, `DraftsService`) contra a documentação oficial antes de depender delas.

@@ -1,50 +1,35 @@
-  01:30:20.678  [SyncTeam M0 01:30:20] DraftsService indisponível/erro: The current thread cannot call 'GetDrafts' (lacking capability RobloxScript)  -  Editar
-  01:30:20.678  [SyncTeam M0 01:30:20] Anote o estado real de Game Settings > Options > Enable Drafts Mode na tabela do README.  -  Editar
-  01:30:20.678  [SyncTeam M0 01:30:20] OBSERVADOR iniciado. counter atual na Source local: 13  -  Editar
-  01:30:20.679  [SyncTeam M0 01:30:20] Esperado (go): 'SOURCE ... via sinal' poucos segundos após cada 'METADADOS ...'.  -  Editar
-  01:30:20.679  [SyncTeam M0 01:30:20] Problema: SOURCE só via polling (sinal não dispara) ou SOURCE nunca chega (drafts retendo).  -  Editar
-  01:30:23.397  [SyncTeam M0 01:30:23] SOURCE counter=14 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:23.398  [SyncTeam 01:30:23] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:23.543  [SyncTeam M0 01:30:23] METADADOS counter=14 chegaram  -  Editar
-  01:30:26.558  [SyncTeam M0 01:30:26] SOURCE counter=15 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:26.558  [SyncTeam 01:30:26] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:26.708  [SyncTeam M0 01:30:26] METADADOS counter=15 chegaram  -  Editar
-  01:30:29.725  [SyncTeam M0 01:30:29] SOURCE counter=16 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:29.725  [SyncTeam 01:30:29] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:29.985  [SyncTeam M0 01:30:29] METADADOS counter=16 chegaram  -  Editar
-  01:30:32.242  [SyncTeam 01:30:32] scriptMoved uuid=5c221ad1-9f13-4659-9e45-2a5f3cd6ddf6 'ReplicatedStorage/Shared/ModuleScript' -> 'ReplicatedStorage/Shared/Teste'  -  Editar
-  01:30:32.891  [SyncTeam M0 01:30:32] SOURCE counter=17 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:32.891  [SyncTeam 01:30:32] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:33.041  [SyncTeam M0 01:30:33] METADADOS counter=17 chegaram  -  Editar
-  01:30:36.058  [SyncTeam M0 01:30:36] SOURCE counter=18 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:36.058  [SyncTeam 01:30:36] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:36.208  [SyncTeam M0 01:30:36] METADADOS counter=18 chegaram  -  Editar
-  01:30:39.225  [SyncTeam M0 01:30:39] SOURCE counter=19 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:39.225  [SyncTeam 01:30:39] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:39.374  [SyncTeam M0 01:30:39] METADADOS counter=19 chegaram  -  Editar
-  01:30:40.507  [SyncTeam 01:30:40] sourceChanged uuid=bfd6eed5-f795-49bd-9aa3-dbb69cf8fb57 'ReplicatedStorage/Shared/ModuleScript' via sinal (origin=studio)  -  Editar
-  01:30:41.174  [SyncTeam 01:30:41] sourceChanged uuid=bfd6eed5-f795-49bd-9aa3-dbb69cf8fb57 'ReplicatedStorage/Shared/ModuleScript' via sinal (origin=studio)  -  Editar
-  01:30:42.474  [SyncTeam M0 01:30:42] SOURCE counter=20 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:42.474  [SyncTeam 01:30:42] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:42.624  [SyncTeam M0 01:30:42] METADADOS counter=20 chegaram  -  Editar
-  01:30:45.141  [SyncTeam 01:30:45] scriptMoved uuid=bfd6eed5-f795-49bd-9aa3-dbb69cf8fb57 'ReplicatedStorage/Shared/ModuleScript' -> 'ReplicatedStorage/Shared/Teste no outro'  -  Editar
-  01:30:45.657  [SyncTeam M0 01:30:45] SOURCE counter=21 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:45.658  [SyncTeam 01:30:45] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:45.808  [SyncTeam M0 01:30:45] METADADOS counter=21 chegaram  -  Editar
-  01:30:48.792  [SyncTeam M0 01:30:48] SOURCE counter=22 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:48.792  [SyncTeam 01:30:48] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:48.958  [SyncTeam M0 01:30:48] METADADOS counter=22 chegaram  -  Editar
-  01:30:51.558  Kicked from Live Scripting Session: Script was deleted  -  Studio
-  01:30:51.957  [SyncTeam M0 01:30:51] SOURCE counter=23 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:51.957  [SyncTeam 01:30:51] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:52.108  [SyncTeam M0 01:30:52] METADADOS counter=23 chegaram  -  Editar
-  01:30:55.124  [SyncTeam M0 01:30:55] SOURCE counter=24 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:55.125  [SyncTeam 01:30:55] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:55.274  [SyncTeam M0 01:30:55] METADADOS counter=24 chegaram  -  Editar
-  01:30:58.290  [SyncTeam M0 01:30:58] SOURCE counter=25 chegou via sinal (antes dos metadados)  -  Editar
-  01:30:58.290  [SyncTeam 01:30:58] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:30:58.424  [SyncTeam M0 01:30:58] METADADOS counter=25 chegaram  -  Editar
-  01:31:01.424  [SyncTeam M0 01:31:01] SOURCE counter=26 chegou via sinal (antes dos metadados)  -  Editar
-  01:31:01.424  [SyncTeam 01:31:01] sourceChanged uuid=758d996d-0cb3-4a9e-a638-3cab640466b1 'ServerScriptService/SyncTeam_M0_Target' via sinal (origin=studio)  -  Editar
-  01:31:01.590  [SyncTeam M0 01:31:01] METADADOS counter=26 chegaram  -  Editar
-  01:31:02.178  [SyncTeam M0 01:31:02] Parado (papel anterior: observer)  -  Editar
+  12:39:33.696  dev_Hakor joined live editing session.  -  Studio
+  12:39:38.597  [SyncTeam M0 12:39:38] Spike M0 carregado. Botões na toolbar 'SyncTeam M0'.  -  Editar
+  12:39:40.438  Unable to load plugin icon: rbxassetid://125921838360800  -  Studio
+  12:39:45.662  llBossnightll joined live editing session.  -  Studio
+  12:40:54.466  Detected removal: user_LagSimulate.rbxmx; unloading the plugin now!  -  Studio
+  12:42:41.763  Detected add/change: user_SyncTeam.rbxm; loading/reloading the plugin now!  -  Studio
+  12:42:41.771  [SyncTeam 12:42:41] plugin carregado. Auto-start ao carregar; toolbar 'SyncTeam': Conectar (no-op se já ativo) / Parar.  -  Editar
+  12:42:41.773  [SyncTeam 12:42:41] registry reconciliado: 3 reaproveitados, 45 removidos (obsoletos).  -  Editar
+  12:42:41.774  [SyncTeam 12:42:41] observação iniciada (3 scripts encontrados nos containers observados).  -  Editar
+  12:42:41.775  [SyncTeam 12:42:41] sessão criada clientId=f1bd550a-87a3-410e-a1b5-e972e04a2f9c userId=9203551752  -  Editar
+  12:42:41.775  [SyncTeam 12:42:41] leases: ciclo iniciado.  -  Editar
+  12:42:41.776  [SyncTeam 12:42:41] conectado em ws://127.0.0.1:34980  -  Editar
+  12:42:41.776  [SyncTeam 12:42:41] iniciado. Conectando à porta 34980...  -  Editar
+  12:42:43.788  [SyncTeam 12:42:43] sou o líder agora (term 6)  -  Editar
+  12:42:43.788  [SyncTeam 12:42:43] joinSequence atribuído clientId=f1bd550a-87a3-410e-a1b5-e972e04a2f9c sequence=8  -  Editar
+  12:42:43.805  [SyncTeam 12:42:43] erro WS 400 HttpError: ConnectFail  -  Editar
+  12:42:43.838  [SyncTeam 12:42:43] desconectado; reconectando em 3s  -  Editar
+  12:42:46.856  [SyncTeam 12:42:46] conectado em ws://127.0.0.1:34980  -  Editar
+  12:42:48.889  [SyncTeam 12:42:48] erro WS 400 HttpError: ConnectFail  -  Editar
+  12:42:48.906  [SyncTeam 12:42:48] desconectado; reconectando em 3s  -  Editar
+  12:42:51.922  [SyncTeam 12:42:51] conectado em ws://127.0.0.1:34980  -  Editar
+  12:42:53.955  [SyncTeam 12:42:53] erro WS 400 HttpError: ConnectFail  -  Editar
+  12:42:53.971  [SyncTeam 12:42:53] desconectado; reconectando em 3s  -  Editar
+  12:42:56.989  [SyncTeam 12:42:56] conectado em ws://127.0.0.1:34980  -  Editar
+  12:42:59.038  [SyncTeam 12:42:59] erro WS 400 HttpError: ConnectFail  -  Editar
+  12:42:59.038  [SyncTeam 12:42:59] desconectado; reconectando em 3s  -  Editar
+  12:43:02.055  [SyncTeam 12:43:02] conectado em ws://127.0.0.1:34980  -  Editar
+  12:43:04.106  [SyncTeam 12:43:04] erro WS 400 HttpError: ConnectFail  -  Editar
+  12:43:04.588  [SyncTeam 12:43:04] desconectado; reconectando em 3s  -  Editar
+  12:43:07.605  [SyncTeam 12:43:07] conectado em ws://127.0.0.1:34980  -  Editar
+  12:43:09.654  [SyncTeam 12:43:09] erro WS 400 HttpError: ConnectFail  -  Editar
+  12:43:09.671  [SyncTeam 12:43:09] desconectado; reconectando em 3s  -  Editar
+  12:43:12.689  [SyncTeam 12:43:12] conectado em ws://127.0.0.1:34980  -  Editar
+  12:43:14.754  [SyncTeam 12:43:14] erro WS 400 HttpError: ConnectFail  -  Editar
+  12:43:15.238  [SyncTeam 12:43:15] desconectado; reconectando em 3s  -  Editar

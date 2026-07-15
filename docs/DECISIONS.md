@@ -1,5 +1,210 @@
 # Decisões registradas
 
+## 2026-07-15 — M3 fechado com 2 Studios reais: convergência, failover, leases e não-regressão confirmados
+
+Sessão de teste real completa contra os 2 Studios (`Tools/`, sem intervenção
+manual de build/deploy/log — só as ações físicas de fechar/reabrir janela).
+Plugin rebuildado com o código atual (auto-descoberta de porta + Logger
+centralizado, ambos ainda não testados em Studio real antes de hoje).
+
+- **M3.1 reconfirmado**: sessões convergem para o mesmo `LeaderClientId`
+  nos dois lados (novo par de clientIds, já que cada `start()` gera um
+  novo — sem regressão da auto-descoberta de porta/Logger sobre a eleição).
+- **M3.1 failover forçado — achado importante sobre o TEMPO real**: fechar a
+  janela do Studio líder no Windows dispara `plugin.Unloading` de forma
+  confiável, que chama `TeamCreateElection.stop()` — isso remove a própria
+  `Sessions/<clientId>` de forma SÍNCRONA antes do processo morrer de vez.
+  Resultado: o outro Studio promove em **~3s** (2 Studios reais,
+  `Tools/logs/studio-34981.log` 03:41:17→03:41:20), bem mais rápido que o
+  orçamento teórico de "sessão obsoleta após 8s + 2 observações" citado nos
+  docs anteriores — porque esse caminho nunca entra em jogo quando o
+  shutdown é gracioso (a sessão simplesmente desaparece, não fica "stale").
+  **Não testado**: crash não-gracioso (processo morto sem `Unloading`), que
+  aí sim dependeria do timeout de 8s+observações. Registrar se algum dia
+  precisarmos garantir esse caminho também (ex.: Studio travando/crashando
+  de verdade, não só fechando a janela).
+- **M3.2 fechado**: rejeição de lease confirmada com timestamps reais —
+  dev A escreve, ganha lease; dev B tenta escrever o MESMO script
+  (`ServerScriptService/Server/Renamed`, mesmo uuid, replicado via Team
+  Create) enquanto o intent de A ainda está fresco → plugin de B recusa
+  (`writeAck ok=false`, log `ERROR disco → Studio: FALHA aplicando ...
+  lease negada — script sendo editado por dev_Hakor`). **Nuance de teste**:
+  a primeira tentativa (edits via 2 chamadas de `Edit` na sessão, com
+  latência de modelo entre elas) acabou com ~9s de intervalo real —
+  quase exatamente o limiar de 8s de staleness — e as duas escritas foram
+  aceitas em sequência (sem rejeição), porque o intent de A já tinha
+  expirado quando B chegou. Repetido com escrita direta via shell
+  (`>>` + `sleep` curto, gap real ~5s) para garantir sobreposição e SÓ
+  ASSIM a rejeição apareceu. Lição: qualquer reteste futuro desse cenário
+  precisa garantir que o segundo escritor chegue **dentro** da janela de
+  8s do primeiro, não depois — timing de ferramentas/IA pode facilmente
+  estourar esse limiar sem perceber.
+- **M3.3, camada de dados**: `leaseChanged`/rejeição chegam corretos nos
+  logs; o aviso VISÍVEL (`vscode.window.showWarningMessage`) não foi
+  reverificado numa janela real de VS Code nesta sessão (só harness Node) —
+  fica como único item de M3 ainda não 100% fechado, ver MILESTONES.md.
+- **Não-regressão confirmada**: scripts DIFERENTES criados por cada dev na
+  mesma janela de tempo (`NaoRegressaoA`/`NaoRegressaoB.server.luau`) — zero
+  interferência, cada um com seu próprio uuid, replicação cruzada correta
+  (`resolveOrAllocate: reaproveitado uuid=... já existente no registry
+  compartilhado` quando o eco do script do outro dev chegou via disco).
+- **Curiosidade não investigada, não bloqueante**: no primeiro `hello` após
+  reabrir o Studio A, o campo `place` reportado foi `Place4`; na reconexão
+  seguinte (mesma conta, mesma place segundo o usuário), foi `Place1` —
+  mesmo valor que o Studio B sempre reportou. Não afetou nenhum teste
+  (identidade da place não é usada para nada no protocolo, só exibição/log);
+  registrar aqui caso apareça de novo e vire suspeito de bug real.
+
+## 2026-07-07 — M3.1: split-brain de liderança — causa raiz confirmada por leitura de código e CORRIGIDO (pendente reteste real)
+
+Investigação de causa raiz (só leitura de código + logs — sem Studio real
+disponível) da entrada anterior ("split-brain CONFIRMADO... não corrigido").
+
+**Hipótese de corrida confirmada como POSSÍVEL dado o fluxo atual do
+código** (não apenas plausível — o padrão de código está literalmente lá):
+`TeamCreateSchema.getOrCreate` (antigo) e o `getOrCreate` privado de
+`TeamCreateElection.luau` seguiam o padrão clássico "singleton preguiçoso"
+(`parent:FindFirstChild(name)`, se `nil` então `Instance.new`+`.Parent`).
+Roblox permite duas Instances irmãs com o mesmo `Name` — não faz merge. Se
+dois Studios chamam isso quase ao mesmo tempo ANTES da réplica do Team
+Create assentar, cada um cria sua PRÓPRIA Instance. **Agravante confirmado
+por leitura de `TeamCreateElection.start()`**: `tick()` roda SINCRONAMENTE
+logo depois de `ensureOwnSession()`, dentro do próprio `start()` — sem
+nenhuma espera/garantia de que o estado lido de `TestService.SyncTeam` já
+reflete a réplica do outro Studio. Pior ainda: `rootValues`/`sessionsFolder`
+eram capturados **1x** em `start()` e nunca reavaliados — mesmo que a
+réplica do outro Studio chegasse depois como Instance irmã, o Studio
+continuava lendo/escrevendo pra sempre na SUA cópia local cacheada. Isso
+explica termos divergentes (6 vs 1): plausivelmente cada Studio operava
+sobre uma Instance `LeaderTerm`/`Sessions` FISICAMENTE diferente, não havia
+conflito de escrita na mesma Instance — havia duplicação de identidade.
+`[Dedução direta do código]`: a mecânica é real e está presente no fluxo
+atual; `[Hipótese]`: se foi EXATAMENTE isso (vs. duas pastas "SyncTeam"
+duplicadas de sessões de teste anteriores nunca limpas) que produziu os
+números observados no log — não há como confirmar sem inspecionar o
+Explorer ao vivo, que não está disponível nesta investigação.
+
+**Decisão de fix — reconciliação determinística, não só "evitar a
+corrida"**: impossível garantir 100% contra corrida com replicação
+assíncrona (nem um delay aleatório resolveria de verdade, só reduziria a
+janela) — o fix precisa fazer TODOS os Studios convergirem pra MESMA escolha
+canônica mesmo que duplicatas cheguem a ser criadas. Implementado em
+`plugin/src/TeamCreateSchema.luau`:
+
+1. **Desempate determinístico e replicado**: cada Instance-singleton criada
+   por este módulo ganha um atributo `SyncTeamOrigin` (GUID aleatório,
+   gravado antes de `.Parent`). Se `getOrCreate` encontra >1 candidato com o
+   mesmo Name+ClassName sob o mesmo parent, a canônica é a de MENOR
+   `SyncTeamOrigin` — todo Studio que já tiver ambas as duplicatas
+   replicadas calcula a MESMA escolha, sem depender de ordem de observação
+   local. Diferente do critério cogitado no início ("nome de Instance mais
+   antigo" — Roblox não expõe timestamp de criação nem ordem estável
+   cross-cliente) e do "menor valor apurado" sozinho (não serve para
+   Folders, que não têm `.Value`).
+2. **Merge, nunca destrói dado**: Folder → reparenta TODOS os filhos da(s)
+   duplicata(s) pra dentro da canônica antes de destruir a casca vazia
+   (cobre Scripts/Sessions/Leases e o próprio SyncTeam — nunca perde
+   sessões/scripts/leases que nasceram por azar sob a pasta "perdedora").
+   IntValue (LeaderTerm/NextJoinSequence/NextLeaseRequestSequence) → a
+   canônica fica com o MAIOR valor entre as duplicatas (contadores deste
+   projeto são estritamente crescentes; "maior" nunca retrocede nem perde
+   progresso real). StringValue (LeaderClientId) → sem merge de conteúdo;
+   o ciclo de eleição já reavalia liderança do zero no tick seguinte a
+   partir de Sessions/ mesclado, autocorrigindo (custo aceito: pode gerar +1
+   incremento de term "desperdiçado" na convergência, nunca viola exclusão
+   mútua de líder).
+3. **Reconciliação contínua, não só na criação**: `getOrCreate` roda a
+   MESMA checagem de duplicata toda vez que é chamado (não só quando
+   `#candidates == 0`). Isso sozinho não bastava: `TeamCreateElection.tick()`
+   só chamava `ensureRoot()`/`ensureFolder("Sessions")` 1x dentro de
+   `start()` e cacheava o resultado (`rootValues`/`sessionsFolder`) pelo
+   resto da sessão — corrigido chamando de novo A CADA PULSO (2s) dentro de
+   `tick()`, reatribuindo essas variáveis. Reaproveita a mesma ideia já
+   usada em `ScriptRegistry` (reconciliar depois do fato via varredura do
+   registry compartilhado, M2 2026-07-04), adaptada para o caso aqui ser
+   duplicação de Values/Folders simples, não de identidade por
+   ObjectValue/Instance física.
+
+**Por que não corrigir só "evitando a corrida" (ex.: delay aleatório antes
+do primeiro tick)**: reduziria a chance, não eliminaria — a tarefa exigia
+convergência garantida mesmo se duplicatas chegarem a existir. O fix acima
+tolera duplicatas genuinamente acontecendo e ainda assim converge.
+
+**Constantes de tempo validadas (pulso 2s/stale 8s/cleanup 20s/2
+observações) não foram alteradas** — o fix não precisou tocar nelas.
+
+**Validado só por `rojo build` + `lune run`** (`TeamCreateSchema.luau`,
+`TeamCreateElection.luau`, e os dependentes `TeamCreateLease.luau`/
+`ScriptRegistry.luau`/`SourceWatcher.luau`, que consomem
+`TeamCreateSchema.ensureRoot/ensureFolder` com a mesma assinatura — sem erro
+de sintaxe, erro esperado só na primeira linha que toca `game`). **Nada
+testado em Studio real nesta tarefa** — este fix em si é a resposta à
+entrada anterior desta mesma seção, mas continua sendo código não
+exercitado contra o engine/replicação real. Roteiro de reteste (mesmos 2
+Studios/2 contas, repetindo o cenário de reload simultâneo) em
+`docs/PROJECT_STATUS.md`.
+
+**Adição pequena de escopo, mesma tarefa**: botão de toolbar temporário
+"SyncTeam: Alternar porta (34980/34981)" em `plugin/src/init.server.luau` —
+`plugin:SetSetting` não é chamável pelo Command Bar do Studio (`plugin`
+global só existe dentro do script do próprio plugin), então não havia como
+apontar 2 Studios na mesma máquina/pasta de Plugins para portas diferentes
+sem essa UI. Ferramenta de teste, não feature de produto.
+
+## 2026-07-07 — M3.1: split-brain de liderança CONFIRMADO em teste real com 2 Studios (não corrigido)
+
+Primeiro teste real do M3.1 em 2 Studios (userId `9203551752` e `1402101248`,
+mesma place, plugin recém-implantado via `rojo build` + cópia para
+`%LOCALAPPDATA%\Roblox\Plugins`, ambos recarregando pelo auto-refresh do
+Studio ao mesmo tempo, ~12:42:41). Resultado (`logs-livetest/studio1.txt`,
+`logs-livetest/studio2.txt`):
+
+- Estudio1 (clientId `f1bd550a...`): `sou o líder agora (term 6)`,
+  `joinSequence sequence=8`, às 12:42:43.788.
+- Estudio2 (clientId `f4d3cb03...`): `sou o líder agora (term 1)`,
+  `joinSequence sequence=0` (depois `sequence=1` de novo 2s depois, mesma
+  sessão), às 12:42:43.785.
+
+**Os dois Studios se declararam líder ao mesmo tempo, com termos DIFERENTES
+(6 vs 1)** — viola o critério de aceite do M3.1 ("mesmo líder nos dois
+lados", `docs/MILESTONES.md`). Confirma em Studio real o achado nº4 da
+revisão de código de 2026-07-04 (`docs/PROJECT_STATUS.md`, seção "code
+review do M3"): "incremento não-atômico de `LeaderTerm` no cenário de
+split-brain". Causa provável: os dois plugins recarregaram
+quase-simultaneamente (reload disparado pelo mesmo `cp` do arquivo do
+plugin) e cada um leu `LeaderTerm`/`NextJoinSequence` localmente e
+incrementou/escreveu antes que a réplica do Team Create do outro lado
+chegasse — não há nenhuma forma de compare-and-swap ou re-checagem pós-yield
+na eleição atual (`TeamCreateElection.elect`, porte 1:1 do RojoCoop, nunca
+exercitado contra essa condição de corrida específica no projeto original
+porque lá a liderança era só "shadow", nunca bloqueava escrita de verdade).
+`term=6`/`sequence=8` em vez de `1`/`0` no Studio1 indica que
+`TestService.SyncTeam` já tinha histórico de uma sessão de teste anterior
+(valores persistidos na place) — não é bug em si, só contexto.
+
+**Não corrigido nesta sessão** — log capturado termina em ~12:43:23, sem
+uma reconciliação visível (nenhum "líder atual: X" substituindo a auto-
+declaração de nenhum dos dois lados nesse trecho). Pendente: (a) pedir mais
+logs depois de mais alguns ciclos de pulso para ver se autocorrige sozinho
+(a eleição reavalia `LeaderClientId` a cada tick, então pode convergir depois
+que o Team Create sincronizar); (b) se não convergir sozinho, é bug real
+bloqueante do M3.1 e precisa de fix (candidatos: reler `LeaderTerm` logo
+antes de escrever e abortar se mudou — mesmo princípio de "reconfirmar após
+yield" já usado em `TeamCreateLease`/`ScriptRegistry`; ou atrasar a primeira
+eleição de cada sessão por um valor aleatório pequeno para reduzir chance de
+corrida simultânea).
+
+**Achado ambiental, não é bug do SyncTeam**: nenhum dos dois Studios
+conseguiu manter conexão WS de verdade — `erro WS 400 HttpError:
+ConnectFail` em loop nos dois lados, porque **não havia nenhum processo
+escutando `127.0.0.1:34980`** (nem extensão VS Code, nem
+`run-node-harness.ts`) no momento do teste — confirmado via `netstat`
+(`SYN_SENT`, nunca completou o handshake) e checagem de processos Node
+ativos (só processos de outro projeto, nenhum do SyncTeam). Isso significa
+que só a eleição de líder pôde ser observada nesse teste — nada de
+`writeSource`/lease foi exercitado (precisa da extensão ou do harness
+rodando na porta 34980 antes de continuar o roteiro combinado do M3).
+
 ## 2026-07-04 — M3.3: bug de escopo Lua deixava `leaseChanged` mudo (corrigido)
 
 Code review independente (sem execução em Studio, só leitura de código) do
