@@ -1,0 +1,3 @@
+return {
+    SnapshotExpiration = 10
+}
