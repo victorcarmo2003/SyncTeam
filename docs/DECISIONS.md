@@ -1,5 +1,186 @@
 # Decisões registradas
 
+## 2026-07-16 — Rejeitado: auto-editar `wally.toml` do colega ao detectar pacote novo replicado
+
+**Decisão pendente resolvida como "não fazer" por ora** (usuário pediu
+avaliação de custo antes de decidir). Ideia avaliada: quando um pacote novo
+aparece no Studio compartilhado via Team Create (alguém instalou via Wally),
+o SyncTeam do lado de quem RECEBE detectaria "isso é um pacote Wally" (via
+metadado novo em `TestService.SyncTeam`) e escreveria automaticamente a
+entrada correspondente (`alias = "author/repo@version"`) no `wally.toml`
+local do colega, evitando que o próximo `wally install` dele apague o
+arquivo recebido (ver decisão acima).
+
+**Por que não**: exigiria (1) schema novo de metadados só pra isso — alias
+real só existe no `wally.toml` de quem instalou, não é 100% derivável do
+nome da pasta `_Index`; (2) parser/writer de TOML de verdade do lado da
+extensão (edição ingênua por string arrisca reproduzir bug de chave
+duplicada real já encontrado no `wally.toml` de teste do usuário, ver
+`Packages` do projeto `StudioSync/Studio1`); (3) tratamento de conflito
+(arquivo aberto/sujo no editor do colega, versão já declarada diferente,
+merge com git). Custo desproporcional ao ganho (economiza uma frase em
+chat). **Alternativa aceita**: comunicação manual — quem instala pacote novo
+avisa o time pra rodar `wally install` também. Revisitar só se isso virar
+dor recorrente de verdade (múltiplos devs, múltiplos incidentes).
+
+## 2026-07-16 — Pastas de pacotes Wally (`Packages`/`ServerPackages`/`DevPackages`) excluídas do live edit sync
+
+**Risco de arquitetura identificado e aprovado pelo usuário** (não é
+experimental — decisão já implementável): `Config.getWatchedRoots()`
+(`plugin/src/Config.luau`) e o observador genérico de Source
+(`SourceWatcher.luau`) tratavam QUALQUER `ModuleScript` igual, incluindo os
+instalados via Wally (https://wally.sh) dentro de pastas `Packages`/
+`ServerPackages`/`DevPackages` (convenção padrão do gerenciador — `Packages`
+é a mais comum, mas projetos podem ter as 3, separando dependências por
+lado). Isso é um problema real: se dois devs tiverem `wally.lock`/`Packages/`
+locais divergentes (versão desatualizada de um lado), o SyncTeam podia
+empurrar o Source do pacote vendorizado de um dev pro Team Create
+compartilhado, alterando silenciosamente a dependência de TODOS os devs —
+pacote vendorizado nunca deveria ser editado via editor colaborativo ao vivo.
+
+**Escopo exato da exclusão** (não é exclusão total):
+
+- Pastas cujo `Name` seja exatamente `Packages`, `ServerPackages` ou
+  `DevPackages`, em qualquer profundidade dentro dos watched roots (não só
+  na raiz), marcam tudo abaixo delas como "vendorizado".
+- **Bloqueado nos dois sentidos**: (a) `checkSourceChanged` em
+  `SourceWatcher.luau` nunca emite `sourceChanged` para scripts vendorizados
+  (nunca puxa Studio→disco uma edição neles); (b) `handleWriteSource` em
+  `init.server.luau`, modo ATUALIZAÇÃO (script já existente, `message.uuid ~=
+  nil`), rejeita a escrita com `writeAck {ok=false, error="edição bloqueada:
+  ..."}` e log claro, sem chamar `TeamCreateLease.ensureIntent`/`canWrite`
+  nem `SourceWatcher.writeSource` — ou seja, também não arbitra lease para
+  esses scripts (nunca cria intent para eles, então nunca ganham entrada em
+  `Leases/<uuid>`).
+- **NÃO afeta discovery/identidade nem criação**: `ScriptRegistry`
+  (`resolveOrAllocate`/`forEach`/`getUuid`) e `SourceWatcher.listScripts()`
+  continuam tratando scripts vendorizados normalmente — necessário para o
+  "Refresh Sync" da extensão VS Code detectar "esse pacote já existe no
+  Studio, não duplicar" quando o usuário instala um pacote novo. Modo
+  CRIAÇÃO do `writeSource` (sem `uuid`, script novo) também não é afetado —
+  é assim que um pacote novo chega ao Studio pela primeira vez; só DEPOIS de
+  criado é que ele entra em "modo vendorizado" (sem watch/lease).
+
+**Implementação**: `Config.SYNC_EXCLUDED_FOLDER_NAMES` (tabela de nomes) +
+`Config.isInsideExcludedPackageFolder(instance)` (sobe `instance.Parent` até
+a raiz, `true` se algum ancestral tiver `Name` na lista) em
+`plugin/src/Config.luau`. Consumido em dois pontos: `SourceWatcher.luau`
+(`checkSourceChanged`, early-return antes de qualquer leitura/dedupe de
+`Source`) e `init.server.luau` (`handleWriteSource`, modo ATUALIZAÇÃO,
+checagem logo após resolver a Instance por uuid, antes de
+`TeamCreateLease.ensureIntent`). Trabalho equivalente no lado extension-dev
+(TypeScript) feito em paralelo, mesmo contrato de nomes de pasta.
+
+Validado só por `rojo build` (layout ok) + `lune run` em `Config.luau`,
+`SourceWatcher.luau`, `init.server.luau` — sem erro de sintaxe, erro esperado
+só na 1ª linha que toca `game`. **Nada testado em Studio real nesta tarefa**
+— instalar um pacote Wally de verdade, editar `Packages/algum-pacote/init.luau`
+pelo Explorer e confirmar que nenhum `sourceChanged` é emitido, e mandar um
+`writeSource` de atualização via extensão contra um uuid dentro de `Packages/`
+e confirmar `writeAck {ok=false}` com o motivo, ficam `[Hipótese]` até o
+usuário executar com Studio real.
+
+**Lado extensão (extension-dev, TypeScript)**: módulo puro
+`vscode-extension/src/mapping/wallyPackageFolders.ts`
+(`isExcludedPackageFolderName`/`isInsideExcludedPackageFolder`, mesmo contrato
+exato de nomes — "Packages"/"ServerPackages"/"DevPackages", case-sensitive,
+segmento inteiro do path, nunca substring), consumido em três pontos de
+`SyncBridge.ts`:
+
+- `handleSourceChanged` (Studio→disco, mensagem espontânea): early-return
+  antes de `applyStudioContent` se o `instancePath` conhecido (via
+  `this.scripts.get(uuid)?.path`, com fallback ao `message.path` informativo)
+  estiver dentro de uma pasta excluída. Log `info` (não é erro).
+- `handleLocalFileChange` (disco→Studio, watcher de arquivo), só no ramo de
+  ATUALIZAÇÃO (`knownUuid` já existe): early-return equivalente, sem tocar
+  `contentCache`/rede. O ramo de CRIAÇÃO (uuid ainda desconhecido) não tem
+  nenhum check — continua funcionando normalmente dentro dessas pastas, é
+  assim que um pacote novo chega ao Studio pela primeira vez.
+- `reconcileUuidOnRefresh` (Refresh Sync, merge de 3 vias): qualquer ramo que
+  faria PUSH de atualização (só disco mudou, só Studio mudou) ou reportaria
+  CONFLITO (com ou sem ancestral em `contentCache`) é pulado silenciosamente
+  (log `info`, sem chamar `onSyncConflict`) quando dentro de pasta excluída.
+  Os ramos "descoberto só no Studio → pull" e "convergiram → atualiza
+  baseline" continuam normais (não são push nem conflito); e
+  `reconcileDiskOnlyFiles` (arquivo só no disco, uuid nunca visto → criação)
+  não tem check nenhum, igual ao ramo de criação acima.
+
+Testes novos: `test/wallyPackageFolders.test.ts` (13, função pura) +
+`describe`s dedicados em `test/syncBridge.test.ts` (7 testes: skip de
+`sourceChanged`, skip de atualização local, criação local continua
+funcionando, e os 4 cenários de `refreshSync` — só disco, só Studio, conflito
+sem `onSyncConflict`, criação nova continua funcionando). 179 testes no total
+(`npx vitest run --pool=threads`), `npx tsc --noEmit` e `npm run build`
+limpos. **Não testado com Studio real** — mesma limitação do lado Luau, fica
+`[Hipótese]` até round-trip real com os dois lados.
+
+## 2026-07-15 (2ª rodada) — mesmo bug de montagem, segundo erro real: `Enum.AutomaticCanvasSize` não existe
+
+Depois do fix do escopo `vide.root()` (entrada abaixo), reteste real revelou
+o erro EXATO pela primeira vez (usuário conseguiu ler o Output e colar o
+stack trace completo): `AutomaticCanvasSize is not a valid member of "Enum"`
+em `StatusPanel.luau` (`SessionsTable`, propriedade `ScrollingFrame.AutomaticCanvasSize`).
+
+**Causa**: confusão entre nome de propriedade e nome de enum — a propriedade
+`ScrollingFrame.AutomaticCanvasSize` existe de verdade, mas o TIPO do valor
+é `Enum.AutomaticSize` (membros `None`/`X`/`Y`/`XY`), não um enum chamado
+`Enum.AutomaticCanvasSize` (que não existe). Código tinha
+`Enum.AutomaticCanvasSize.Y`, corrigido para `Enum.AutomaticSize.Y`.
+
+**Por que `lune run` não pegou isso**: indexação de `Enum.<Nome>` inválido
+não é erro de sintaxe (Lune não emula os Enums reais do Roblox com essa
+fidelidade) — só quebra em tempo de execução contra o Roblox de verdade.
+Nenhuma das validações usadas neste projeto (`rojo build`, `lune run`) pega
+esse tipo de erro; só teste real em Studio revela. Reforça a regra já
+existente do projeto ("confirme APIs contra documentação oficial antes de
+depender"), mas o caso aqui é mais sutil: a API (`AutomaticCanvasSize`)
+EXISTE, só o enum do valor é que tem nome diferente da propriedade — fácil
+de errar por analogia com outras props que reusam o próprio nome como enum.
+
+**Lição de processo**: o stack trace completo (via `error while running
+root()/branch()/switch_map()`) só ficou visível porque o usuário limpou o
+Output antes de recarregar o plugin e buscou por "painel" — sem isso,
+o erro genérico da entrada anterior ("cannot use effect()...") escondia
+esse segundo erro atrás de um scroll-back poluído por reloads antigos.
+
+## 2026-07-15 — M4.5: painel Vide não montava — `vide.create`/`effect`/`indexes`/`switch` chamados fora de `vide.root()`
+
+**Bug real, encontrado ao investigar relato do usuário** ("cliquei no SyncTeam
+mas não surgiu nada na interface"): `plugin/src/ui/PluginUI.luau` chamava
+`StatusPanel.build(state, callbacks)` e SÓ DEPOIS passava o `rootFrame` já
+pronto para `vide.mount(function() return rootFrame end, widget)`. Como toda
+a árvore (`vide.create` com propriedades reativas, `vide.indexes` da tabela
+de sessões, `vide.switch` das duas telas) já tinha sido CONSTRUÍDA antes de
+`vide.mount` empurrar o escopo de `vide.root()`, a primeira propriedade
+reativa encontrada (ex.: `Text` do campo de porta) disparava
+`assert_stable_scope()` (confirmado lendo
+`plugin/Packages/_Index/centau_vide@0.4.1/vide/src/{implicit_effect,effect,graph}.luau`)
+e lançava `"cannot use effect() outside a stable or reactive scope"`.
+
+**Efeito observável**: o `pcall` em `PluginUI.init` captura esse erro (linha
+já existente, log só localmente — ver entrada de descoberta relacionada
+abaixo sobre o ponto cego do log remoto), mas toolbar+`DockWidgetPluginGui`
+JÁ tinham sido criados nas linhas anteriores do mesmo `pcall` — resultado:
+botão existe, clique alterna `widget.Enabled`, mas o painel nunca é montado
+(fica vazio). Dá exatamente a impressão de "cliquei e não aconteceu nada".
+
+**Fix**: mover a chamada de `StatusPanel.build(...)` para DENTRO do closure
+passado a `vide.mount(function() ... end, widget)` — agora toda a construção
+reativa acontece já dentro do escopo de `root()` que `mount` empurra.
+`rojo build`/`lune run` limpos depois do fix. **Pendente confirmação real**
+(usuário vai testar depois do redeploy) — não promover a `[Verificado]`
+até confirmar que o painel aparece.
+
+**Achado relacionado, mesma investigação**: `PluginUI.init` roda em código
+de TOPO do script (`init.server.luau`, antes de `start()`), e `Logger.init(sendMessage)`
+só é chamado DENTRO de `start()` — ou seja, qualquer `log(...)` chamado por
+`PluginUI.init` (sucesso OU falha) só aparece no Output LOCAL do Studio,
+nunca é encaminhado pro log remoto via WS. Isso não é um bug (é a ordem
+correta — `Logger` só pode encaminhar depois que a conexão existe), mas é um
+ponto cego real do fluxo de debug remoto (`Tools/`): qualquer erro que
+aconteça ANTES de `start()` rodar precisa ser lido no Output do Studio
+diretamente, não dá pra diagnosticar só pelos logs de arquivo.
+
 ## 2026-07-15 — M3 fechado com 2 Studios reais: convergência, failover, leases e não-regressão confirmados
 
 Sessão de teste real completa contra os 2 Studios (`Tools/`, sem intervenção

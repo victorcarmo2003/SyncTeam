@@ -2,3 +2,8 @@
 /SyncTeam.rbxm
 /SyncTeam.rbxmx
 sourcemap.json
+
+# Dependências Wally (M4.5, lib Vide) — regeneradas via `wally install` a
+# partir de wally.toml/wally.lock (versionados), mesmo princípio de
+# node_modules/ na raiz do repo.
+/Packages/

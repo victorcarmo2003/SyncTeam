@@ -16,15 +16,41 @@
       "properties": {
         "syncteam.port": {
           "type": "number",
-          "default": 34980,
+          "default": 1400,
           "description": "Porta local (127.0.0.1) onde a extensão hospeda o servidor WebSocket para o plugin Studio conectar."
+        },
+        "syncteam.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Iniciar o servidor automaticamente ao ativar a extensão (quando há um default.project.json no workspace). Desligue para ativar sem subir o servidor e iniciá-lo manualmente com 'SyncTeam: Iniciar'."
+        },
+        "syncteam.multiSync": {
+          "type": "boolean",
+          "default": false,
+          "description": "Permitir múltiplos Studios (plugins) conectados à mesma porta/extensão ao mesmo tempo — útil para testar multiplayer com 2 contas Roblox/2 Studios na mesma máquina e 1 VS Code só. Default (desligado): uma 2ª conexão é rejeitada (comportamento de sempre, 1 plugin por extensão)."
         }
       }
     },
     "commands": [
       {
+        "command": "syncteam.refreshSync",
+        "title": "SyncTeam: Refresh Sync (reconciliar disco e Studio)"
+      },
+      {
+        "command": "syncteam.start",
+        "title": "SyncTeam: Iniciar servidor"
+      },
+      {
+        "command": "syncteam.stop",
+        "title": "SyncTeam: Parar servidor"
+      },
+      {
         "command": "syncteam.restart",
         "title": "SyncTeam: Reiniciar servidor"
+      },
+      {
+        "command": "syncteam.setPort",
+        "title": "SyncTeam: Definir porta"
       },
       {
         "command": "syncteam.showOutput",

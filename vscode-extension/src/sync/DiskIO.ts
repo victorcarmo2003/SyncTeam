@@ -30,6 +30,16 @@ export interface DiskIO {
    * fallback (ex.: tratar como criação nova).
    */
   renameFile(oldRelPath: string, newRelPath: string): Promise<void>;
+  /**
+   * Enumera recursivamente todos os ARQUIVOS (não diretórios) sob `relDir`
+   * (relativo à raiz do workspace de sincronização), devolvendo caminhos
+   * relativos à raiz, "/"-separados. `relDir` vazio significa a própria raiz.
+   * Retorna `[]` se `relDir` não existir. Usado pela reconciliação sob
+   * demanda ("Refresh Sync") para descobrir arquivos que existem no disco mas
+   * não têm uuid conhecido (ex.: um script externo criou o arquivo enquanto a
+   * extensão estava fechada, então o watcher nunca viu o evento).
+   */
+  listFiles(relDir: string): Promise<string[]>;
 }
 
 export interface DiskWatcher {

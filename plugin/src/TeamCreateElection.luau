@@ -481,4 +481,54 @@ function TeamCreateElection.isLeader()
 	return rootValues ~= nil and clientId ~= nil and rootValues.LeaderClientId.Value == clientId
 end
 
+-- ---------------------------------------------------------- leitura p/ UI (M4.5)
+--
+-- Getters read-only adicionados para o painel de status do plugin
+-- (plugin/src/ui/), pedido explícito da tarefa ("se já existir algo assim,
+-- use; se faltar, adicione um getter pequeno e read-only, não mude a lógica
+-- interna"). Nenhuma das duas funções abaixo cria/muta Instance nenhuma nem
+-- participa do ciclo de eleição — só leem o estado já mantido por tick().
+
+-- ClientId do líder atual, ou nil se a eleição ainda não convergiu nenhuma
+-- vez nesta sessão (rootValues ainda não lido) ou se LeaderClientId está
+-- vazio (bootstrap, nenhum term concedido ainda).
+function TeamCreateElection.getLeaderClientId()
+	if rootValues == nil then
+		return nil
+	end
+	local value = rootValues.LeaderClientId.Value
+	return if value ~= "" then value else nil
+end
+
+-- Snapshot de todas as sessões atualmente em Sessions/ (própria incluída —
+-- decisão desta fatia: a UI mostra "quem mais está na sessão" incluindo o
+-- próprio Studio, já que ele também pode ser o líder ou estar editando algo).
+-- Array de { clientId, username, userId, joinSequence }, em nenhuma ordem
+-- garantida (quem chama decide como ordenar) — mesmo formato de campo de
+-- readSessionEntry, só que sem heartbeatAge (a UI não filtra por liveness
+-- nesta fatia: uma sessão que já saiu de Sessions/ simplesmente não aparece
+-- mais no próximo refresh, não precisa de um terceiro estado "stale" na
+-- tabela). nil-safe: devolve {} se a eleição não estiver rodando ainda.
+function TeamCreateElection.listSessions()
+	if sessionsFolder == nil then
+		return {}
+	end
+	local sessions = {}
+	for _, folder in ipairs(sessionsFolder:GetChildren()) do
+		if not folder:IsA("Folder") then
+			continue
+		end
+		local entry = readSessionEntry(folder)
+		if entry ~= nil and entry.clientId ~= "" then
+			table.insert(sessions, {
+				clientId = entry.clientId,
+				username = entry.username,
+				userId = entry.userId,
+				joinSequence = entry.joinSequence,
+			})
+		end
+	end
+	return sessions
+end
+
 return TeamCreateElection

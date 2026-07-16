@@ -66,6 +66,37 @@ export class VscodeDiskIO implements DiskIO {
     await vscode.workspace.fs.rename(oldUri, newUri, { overwrite: false });
   }
 
+  async listFiles(relDir: string): Promise<string[]> {
+    const prefix = relDir === "" ? "" : `${relDir.replace(/\/+$/g, "")}/`;
+    const files: string[] = [];
+
+    const walk = async (dirRel: string, relPrefix: string): Promise<void> => {
+      const uri = dirRel === "" ? this.root : this.toUri(dirRel);
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(uri);
+      } catch (error) {
+        // Diretório inexistente é esperado quando um mount ainda não foi
+        // materializado — devolve vazio em vez de propagar.
+        if (this.isNotFound(error)) {
+          return;
+        }
+        throw error;
+      }
+      for (const [name, type] of entries) {
+        const childRel = `${relPrefix}${name}`;
+        if (type === vscode.FileType.Directory) {
+          await walk(childRel, `${childRel}/`);
+        } else if (type === vscode.FileType.File) {
+          files.push(childRel);
+        }
+      }
+    };
+
+    await walk(relDir, prefix);
+    return files;
+  }
+
   async removeEmptyDirsUpward(relDir: string): Promise<void> {
     let current = relDir;
     while (current !== "") {

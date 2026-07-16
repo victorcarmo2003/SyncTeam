@@ -1,6 +1,213 @@
 # Status do projeto
 
-Última atualização: 2026-07-15 (M3 fechado com 2 Studios reais — convergência, failover, leases e não-regressão)
+Última atualização: 2026-07-16 (aviso visual de lease alheia no VS Code — metade que faltava do lease-UX)
+
+## Nota de sessão (2026-07-16) — aviso visual de lease alheia no VS Code (lado Studio pendente)
+
+`docs/DECISIONS.md` já registrava a decisão "conflito no mesmo arquivo = lease
+por arquivo... o outro vê o arquivo somente-leitura com aviso", mas só metade
+existia: o Studio já negava a escrita (`writeRejected`) e o VS Code só
+mostrava um `showWarningMessage` PONTUAL na hora da rejeição — nada impedia o
+usuário de continuar digitando num arquivo sob lease alheia, e não havia
+indicador visual PERSISTENTE. Usuário pediu explicitamente "highlight nas
+bordas"/"forçar read-only", priorizando o lado VS Code.
+
+**Implementado pelo `ui-dev`** (lado VS Code, 100% completo e testado —
+159/159 testes, `tsc --noEmit` limpo, **round-trip real em Studio/2 devs
+ainda pendente**): `vscode-extension/src/ui/leaseBorderState.ts` (lógica
+pura, decide "bloquear ou não" reusando `LeaseTracker.isOwnedByMe`/
+`describeOwner` já existentes) + `vscode-extension/src/ui/LeaseBorderDecoration.ts`
+(overlay de fundo translúcido laranja cobrindo o documento inteiro + rótulo
+"🔒 Bloqueado por `<nome>`" na primeira linha), instanciado em `extension.ts`
+e reagindo a `service.setOnLeaseChanged`. Reforço passivo no
+`onWillSaveTextDocument` (aviso adicional ao tentar salvar um arquivo
+bloqueado) — **limitação de API confirmada por pesquisa**: não existe forma
+limpa de VETAR o save nesse hook (`waitUntil` só aplica edições, não
+cancela), então o save prossegue e a rejeição real continua vindo do lado do
+Studio depois. Detalhes de design (por que overlay em vez de borda por
+linha, paleta laranja compartilhada com o painel Vide do plugin) em
+`.claude/agent-memory/ui-dev.md`.
+
+**Pendente**: (1) round-trip real em 2 Studios/2 VS Code do que foi
+implementado agora; (2) **lado Studio** (highlight/readonly no Script Editor
+nativo do Roblox) — não investigado nesta tarefa, viabilidade de API ainda
+incerta, fica para uma sessão futura de pesquisa antes de codar.
+
+## Nota de sessão (2026-07-15, tarde) — painel confirmado + 3 melhorias de UX pedidas pelo usuário
+
+Usuário confirmou em Studio real que o painel Vide (M4.5) funciona depois
+dos 2 fixes registrados em `docs/DECISIONS.md`. A partir do uso real,
+pediu 3 melhorias, todas implementadas e verificadas (build/lint/test
+limpos; **round-trip real em Studio ainda pendente** para as 3):
+
+- **Porta padrão trocada para 1400** (era 34980) em `plugin/src/Config.luau`,
+  `vscode-extension/src/extension.ts` e `package.json` — só afeta instalação
+  NOVA; Studios com porta já persistida continuam nela até digitar a nova
+  porta no campo do painel.
+- **Botão CONNECT com 3 estados** (`ui-dev`): era binário azul/vermelho e
+  piscava a cada ciclo do loop de reconexão (queixa do usuário). Agora
+  `state.connectionStatus: "disconnected"|"connecting"|"connected"` —
+  laranja "CONECTANDO..." estável durante todo o loop de retry; "conectado"
+  visual usa critério fraco (igual à persistência de porta), toast de queda
+  mantém o critério forte (`hasStabilizedOnce`) — decisão deliberada,
+  documentada em `.claude/agent-memory/ui-dev.md`.
+- **Popup de erro virou overlay de verdade** (`ui-dev`, pesquisa prévia em
+  `.claude/research/2026-07-15-plugin-floating-overlay-notification.md`
+  confirmou que plugins de Studio PODEM criar `ScreenGui` em
+  `game:GetService("CoreGui")` — é isso que o Rojo real faz, não um
+  `DockWidgetPluginGui` disfarçado). `Toast.luau` reescrito: `ScreenGui` em
+  `CoreGui`, botão ✕ no canto superior direito, some sozinho em 5s. Não
+  força mais o painel abrir (o popup já aparece sozinho). Ressalva não
+  100% confirmada: overlay via CoreGui pode cobrir só o viewport 3D, não
+  os painéis nativos do Studio — validar visualmente no teste real.
+- **Investigação do "toast não apareceu"**: não era bug — `erro WS 400
+  ConnectFail` em loop significa que o WebSocket nunca completou o
+  handshake, então o plugin nunca recebeu nenhuma mensagem do harness
+  (`hasStabilizedOnce` nunca vira true) — supressão de toast é
+  intencional pra não notificar o cenário rotineiro "extensão ainda não
+  aberta". O estado laranja novo já resolve a queixa de fundo (feedback
+  visual contínuo durante o loop).
+- **Comando novo "Refresh Sync"** (`extension-dev`,
+  `syncteam.refreshSync`): reconciliação bidirecional sob demanda pra
+  pegar deriva que o watcher ao vivo perdeu (ex.: script `.bat`/`.ps1` ou
+  edição externa enquanto a extensão estava fechada). Merge de 3 vias
+  usando `contentCache` (SyncBridge) como ancestral comum: só disco mudou →
+  propaga pro Studio; só Studio mudou → propaga pro disco; convergiram →
+  só atualiza baseline; **conflito genuíno (os 2 mudaram e divergem)** →
+  não sobrescreve nenhum lado, avisa o usuário via `showWarningMessage`
+  listando os arquivos, resolução manual (M5 "artefato de conflito legível"
+  ainda não existe — isso é o piso mínimo até lá). 108/108 testes (vitest),
+  typecheck e build limpos.
+- **Pendente pra fechar de vez**: round-trip real em Studio dos 3 itens
+  acima (deploy já feito, usuário testando).
+
+## Nota de sessão (2026-07-15, madrugada) — painel Vide não aparecia: bug real encontrado e corrigido
+
+Usuário reportou em teste real: "cliquei no SyncTeam mas não surgiu nada na
+interface". Investigação (sem MCP Roblox_Studio disponível nesta sessão,
+harness sem visão desse momento específico do boot — ver achado abaixo)
+levou à leitura direta do código vendorizado do Vide
+(`plugin/Packages/_Index/centau_vide@0.4.1/`). Causa raiz e fix completos em
+`docs/DECISIONS.md` (entrada "M4.5: painel Vide não montava..."), resumo:
+`StatusPanel.build(...)` rodava fora do escopo de `vide.root()` (só
+`vide.mount`, chamado DEPOIS, empurra esse escopo) — toda propriedade
+reativa lançava `assert_stable_scope()`, painel nunca montava (toolbar+
+widget vazio criados, conteúdo não). Corrigido movendo `StatusPanel.build`
+para dentro do closure de `vide.mount`. Rebuild+deploy feito
+(`Tools/build-and-deploy-plugin.sh`). **Não promovido a `[Verificado]`** —
+aguardando o usuário confirmar que o painel aparece agora.
+
+Também removidos da pasta de Plugins arquivos velhos de spike (`SyncTeamM0.lua`,
+`SyncTeamM1.rbxm`, uma versão antiga de `SyncTeam.rbxm`) que estavam na
+subpasta `inactive/` do Roblox (desabilitados via Studio, não pelo nosso
+código) — limpeza pedida pelo usuário, sem relação com o bug acima.
+
+## Nota de sessão (2026-07-15, noite) — painel de status do plugin (Vide), substitui os 3 botões de toolbar
+
+Pedido do usuário: decidir uma interface pro plugin (mockup: título, campo de
+porta, botão CONNECT, tabela USER|INFO) e construir com **Vide** (lib
+reativa nova no projeto, trazida pelo usuário via Wally nesta sessão).
+Tarefa 100% `ui-dev`, lado do plugin (Luau) — ver `.claude/agent-memory/ui-dev.md`
+seção "M4.5 — Painel de status do plugin com Vide" pro detalhe completo.
+
+- **Toolbar reduzida a 1 botão** (toggle abre/fecha o `DockWidgetPluginGui`
+  novo) — substitui os 3 antigos ("Conectar"/"Parar"/"Alternar porta").
+- **Painel novo** (`plugin/src/ui/{Theme,Toast,StatusPanel,PluginUI}.luau`):
+  campo de porta editável (reusa a mesma sequência de troca de porta que o
+  botão antigo já fazia — `SetSetting`+`stop()`+`start()`, só generalizada
+  pra porta arbitrária), botão CONNECT/DISCONNECT reativo, engrenagem que
+  abre tela de configurações (só "mostrar notificações" é real; resto
+  "em breve"), tabela USER|INFO com bolinha só no líder e INFO priorizando
+  lease ativa > presença sem lease > "ocioso" — dados lidos via getters
+  read-only pequenos adicionados a `TeamCreateElection`/`TeamCreateLease`/
+  `TeamCreatePresence` (nenhuma mudança na lógica de eleição/lease/presença
+  em si).
+- **Toast interno ao painel**: `Logger.notify` (novo, ao lado de
+  `Logger.log`) dispara toast (tween da direita) SÓ pros poucos pontos já
+  identificados como erro genuíno (lease negada, reconexão WS falhando
+  depois de já ter estabilizado uma vez, reconciliação de duplicata do
+  schema) — sempre loga no Output incondicionalmente, painel auto-abre se
+  estava fechado. Dedupe por "episódio de queda" evita spam no cenário
+  normal de reconectar antes da extensão VS Code abrir.
+- **Achado de coordenação entre tarefas paralelas**: a tarefa de M4
+  (extensão, nota abaixo) tinha removido `wally.toml`/`Packages/` do plugin
+  por achar Vide "não usado em lugar nenhum" NAQUELE momento (antes desta
+  tarefa existir) — recriado do zero aqui. Lição registrada: `git status`
+  de trabalho delegado antes de aceitar como pronto, mesmo entre tarefas
+  supostamente independentes.
+- **Validado nesta sessão** (não só relato do agente): `rojo build` limpo,
+  `lune run` sem erro de sintaxe (erro esperado só na primeira linha que
+  toca `game`/`plugin`/`script`) em todos os arquivos novos/tocados.
+  **Nada testado em Studio real** — pendente (precisa ver o painel de
+  verdade: cores, tween do toast, tabela populando com sessões reais).
+
+## Nota de sessão (2026-07-15, tarde) — M4, lado da extensão: publicar/renderizar presença
+
+Tarefa do `ui-dev`, paralela ao `luau-dev` (nota abaixo), contrato de
+protocolo fechado entre os dois antes de começar (mensagens `presenceUpdate`
+extensão→plugin, `presenceChanged`/`presenceLeft` plugin→extensão).
+
+- **Novo**: `src/presence/PresencePublisher.ts` + `PresenceTracker.ts`
+  (módulos puros, sem `import "vscode"`, testáveis com vitest simples) e
+  `src/ui/FilePresenceDecorations.ts` (porte do badge `●` do Explorer do
+  RojoCoop) + `src/ui/RemoteCursorDecorations.ts` (cursor/seleção coloridos
+  DENTRO do editor — trabalho novo, sem referência no RojoCoop, que só
+  validou o badge).
+- **Modificado**: `protocol.ts` (3 tipos novos, aditivos, sem bump de
+  `PROTOCOL_VERSION`), `SyncServer.sendSpontaneous` (envio sem
+  requestId/ack), `SyncBridge`/`SyncTeamService` (`resolveUuidForDiskPath`/
+  `resolveDiskPathForUuid` + roteamento de `presenceChanged`/`presenceLeft`
+  com a mesma normalização `undefined→null` já usada em `leaseChanged`),
+  `extension.ts` (wiring completo, debounce de 150ms na publicação).
+- **Verificado nesta sessão** (independente do relato do agente):
+  `npm run lint` (tsc --noEmit) limpo, `npm test` 100/100 passando, `npm run
+  build` limpo.
+- **Achado ao revisar o trabalho do `luau-dev` (não pedido, removido)**: a
+  tarefa dele deixou pra trás `rokit.toml`/`wally.toml`/`wally.lock`/
+  `Packages/` (dependência Wally de uma lib de UI reativa, `vide`,
+  **nunca usada em lugar nenhum do código** — nem `TeamCreatePresence.luau`
+  nem `init.server.luau` a referenciam). Removido antes de qualquer commit.
+  Registrar como lembrete: revisar `git status` de trabalho delegado antes
+  de commitar, mesmo quando o agente reporta sucesso — relato descreve
+  intenção, não necessariamente execução completa.
+- **Pendente, MAIS pesado que M1-M3**: teste real precisa de **2 janelas de
+  VS Code Extension Development Host** (não dá pra usar só o harness Node —
+  presença depende de `vscode.window`, que não existe fora de um VS Code de
+  verdade), cada uma conectada a um Studio diferente. Ver `docs/MILESTONES.md`
+  (M4) para o roteiro.
+
+## Nota de sessão (2026-07-15, tarde) — M4, lado do plugin: presença (cursor/seleção/arquivo ativo)
+
+Tarefa do `luau-dev`, paralela ao trabalho do `ui-dev` no lado da extensão
+(contrato de protocolo já fechado entre os dois, ver `plugin/src/TeamCreatePresence.luau`).
+
+- **Módulo novo `plugin/src/TeamCreatePresence.luau`**: passthrough puro de
+  cursor/seleção/arquivo ativo vindo da extensão VS Code — o plugin NUNCA lê
+  cursor de uma Instance de Script no Studio. Grava a própria presença em
+  `Sessions/<clientId>/Presence` (`ActiveScriptUuid` `""=nenhum`,
+  `CursorLine`/`CursorColumn`/`SelectionStartLine`/`SelectionStartColumn`
+  `IntValue` `-1=null`) ao receber `presenceUpdate` (espontânea, sem ack), e
+  observa as sessões de outros devs no mesmo ciclo de poll de
+  `TeamCreateLease.checkLeaseDrift` (`Config.POLL_INTERVAL_SECONDS`),
+  emitindo `presenceChanged`/`presenceLeft` espontâneos. Mesmo padrão
+  estrutural de `TeamCreateLease.luau` (schema/ensure, token de geração,
+  dedupe por último valor visto).
+- **Integrado em `plugin/src/init.server.luau`**: dispatch de `presenceUpdate`
+  em `handleMessage`; `TeamCreatePresence.init(sendMessage)`/`.start()` em
+  `start()` (depois de `TeamCreateElection.start()`); `.stop()` em `stop()`
+  (ao lado de `TeamCreateLease.stop()`).
+- Decisões de design não 100% especificadas na tarefa (dedupe por chave
+  composta, dois gatilhos distintos para `presenceLeft`, escrita protegida
+  por `pcall` por ser o primeiro campo numérico do schema vindo direto de
+  mensagem externa não confiável) documentadas em detalhe em
+  `.claude/agent-memory/luau-dev.md` (seção "M4 — Presença...").
+- **Validado só por `rojo build` + `lune run`** (`TeamCreatePresence.luau`
+  novo, `init.server.luau`) — sem erro de sintaxe, erro esperado só na
+  primeira linha que toca `script`/`game`. **Nada testado em Studio real
+  nesta tarefa** — pendente o lado da extensão (`ui-dev`) terminar para
+  rodar o roteiro combinado com 2 Studios (latência ~2s, troca de arquivo
+  ativo, `presenceLeft` ao fechar editor/Studio). `docs/MILESTONES.md` (M4)
+  atualizado com o item do plugin marcado `[Implementado]`.
 
 ## Nota de sessão (2026-07-15) — M3 fechado com 2 Studios reais
 

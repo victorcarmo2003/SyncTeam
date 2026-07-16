@@ -1,4 +1,4 @@
--- SyncTeam — Plugin de produção (M2 + M3.1 + M3.2)
+-- SyncTeam — Plugin de produção (M2 + M3.1 + M3.2 + M4 + M4.5)
 --
 -- Ponte local mínima para 1 desenvolvedor: cliente WebSocket único da
 -- extensão VS Code (a extensão hospeda o servidor; o plugin é sempre
@@ -11,12 +11,24 @@
 -- líder sob TestService.SyncTeam) junto com SourceWatcher. A partir do
 -- M3.2, também inicia/para TeamCreateLease (leases autoritativas por
 -- script) e `handleWriteSource` em modo atualização passa a checar a lease
--- antes de escrever (ver TeamCreateLease.luau).
+-- antes de escrever (ver TeamCreateLease.luau). A partir do M4, também
+-- inicia/para TeamCreatePresence (passthrough de cursor/seleção/arquivo ativo
+-- vindo da extensão para Sessions/<clientId>/Presence) e despacha a mensagem
+-- espontânea `presenceUpdate` para `TeamCreatePresence.updateOwnPresence`
+-- (ver TeamCreatePresence.luau). A partir do M4.5, a antiga toolbar de 3
+-- botões (Conectar/Parar/Alternar porta) foi substituída por 1 botão só que
+-- alterna um DockWidgetPluginGui (painel de status construído com Vide, ver
+-- plugin/src/ui/PluginUI.luau) — este arquivo continua sendo o ÚNICO dono da
+-- lógica de conexão/sessão; PluginUI só invoca callbacks (onConnect/
+-- onDisconnect/onPortChange) e reflete estado (setConnectionStatus/setPort),
+-- nunca reimplementa nada de start()/stop()/troca de porta.
 --
 -- Fora de escopo aqui (ver docs/MILESTONES.md): UX de lease no VS Code
--- (M3.3, delegado a ui-dev); presença/cursores (M4); schema versionado
--- (SchemaVersion, nunca existiu no SyncTeam); propriedades de instâncias
--- não-script (decisão fixa do projeto, v1 só scripts).
+-- (M3.3, delegado a ui-dev); renderização de cursores/seleções na extensão
+-- (M4, delegado a ui-dev — este arquivo só faz o passthrough de dados
+-- opacos); schema versionado (SchemaVersion, nunca existiu no SyncTeam);
+-- propriedades de instâncias não-script (decisão fixa do projeto, v1 só
+-- scripts).
 --
 -- Porta do padrão de spikes/m0_5-local-pipeline/plugin/SyncTeamLab.lua
 -- (checkSourceChanged polling+sinal) e spikes/m0-source-replication/
@@ -25,9 +37,10 @@
 -- 2026-07-07: auto-descoberta de porta em runConnection (ver comentário na
 -- própria função) — estopgap para o cenário de teste com 2 Studios na mesma
 -- máquina/mesma pasta de Plugins, que hoje colidem na mesma porta sem isso.
--- O botão manual "Alternar porta" (toolbar, abaixo) continua funcionando
--- como fallback: uma porta setada manualmente é sempre a única tentada,
--- nunca cicla pelas candidatas (ver Config.resolveCandidatePorts).
+-- O campo de porta do painel (M4.5, PluginUI.luau/onPortChange abaixo)
+-- continua funcionando como fallback manual: uma porta setada
+-- explicitamente é sempre a única tentada, nunca cicla pelas candidatas (ver
+-- Config.resolveCandidatePorts).
 
 local HttpService = game:GetService("HttpService")
 local StudioService = game:GetService("StudioService")
@@ -37,12 +50,62 @@ local Logger = require(script.Logger)
 local SourceWatcher = require(script.SourceWatcher)
 local TeamCreateElection = require(script.TeamCreateElection)
 local TeamCreateLease = require(script.TeamCreateLease)
+local TeamCreatePresence = require(script.TeamCreatePresence)
+local PluginUI = require(script.ui.PluginUI)
 
 local enabled = false
 local currentToken = 0
 local client = nil -- WebStreamClient conectado no momento (nil se desconectado)
 
+-- Sinal EXPLÍCITO de rejeição de porta (2026-07-15): a extensão VS Code rejeita
+-- um 2º cliente na mesma porta mandando uma mensagem de aplicação
+-- {kind="connectionRejected", reason="port_in_use"} ANTES de fechar o WS. Como
+-- WebStreamClient.Closed não expõe close code nem motivo
+-- (.claude/research/2026-07-15-webstreamclient-close-code.md), essa mensagem é o
+-- único jeito CONFIÁVEL de o plugin saber que o motivo real da queda é "porta
+-- ocupada por outro Studio" — a heurística de tempo em runConnection só INFERE
+-- isso. handleMessage seta `connectionRejected`; runConnection lê a flag para
+-- tratar como rejeição confirmada sem esperar a janela de tempo. É module-level
+-- porque handleMessage (dispatch genérico) não enxerga os locals de
+-- runConnection — por isso runConnection reseta a flag a cada tentativa.
+-- `activePort` = porta da tentativa em curso, usada só para o texto do toast em
+-- handleMessage. `lastRejectedPortToasted` deduplica o toast: o Toast é
+-- single-instance e re-show reinicia o timer (ver ui/Toast.luau), então sem
+-- dedup reconectar numa porta explícita ocupada a cada RECONNECT_SECONDS
+-- deixaria um toast permanente/indispensável — mesma disciplina anti-spam de
+-- outageToasted/hasStabilizedOnce abaixo.
+local connectionRejected = false
+local activePort = nil
+local lastRejectedPortToasted = nil
+
+-- Guarda de reentrância da troca de porta pelo painel (2026-07-16, bug real
+-- com log). FocusLost do campo de porta (ui/StatusPanel.luau, PortRow) pode
+-- disparar MAIS DE UMA VEZ para o mesmo Enter/perda de foco (quirk conhecido de
+-- TextBox no Roblox). O único guard contra repetição que existia é
+-- `newPort ~= state.port()` DENTRO do PortRow, mas ele NÃO é seguro contra
+-- reentrância: `state.port()` (portSource) só é atualizado de forma ASSÍNCRONA
+-- por PluginUI.setPort, chamado lá dentro de runConnection (já no novo start()).
+-- Existe portanto uma janela em que um 2º FocusLost lê o state.port() AINDA
+-- ANTIGO contra o portBox.Text já NOVO, passa pelo guard e dispara um 2º
+-- onPortChange. Esse 2º onPortChange roda stop()+start() de novo e o stop() mata
+-- a sessão/conexão que o 1º start() acabou de criar (sintoma observado no log:
+-- conecta em ws://127.0.0.1:1405 e ~40ms depois um stop() completo do MESMO
+-- clientId recém-criado). Duas camadas de proteção, complementares:
+--   (a) portChangeInFlight: enquanto o stop()+start() de uma troca ainda está
+--       rodando (start() pode yieldar internamente), uma 2ª chamada é ignorada
+--       — protege o caso de reentrância por yield.
+--   (b) dedupe por VALOR+TEMPO: uma 2ª chamada com o MESMO newPort dentro de
+--       PORT_CHANGE_DEDUPE_SECONDS é ignorada mesmo depois que a flag baixou —
+--       cobre a janela entre start() retornar (flag=false) e o runConnection de
+--       fato atualizar state.port(), que é EXATAMENTE quando o guard do PortRow
+--       falha.
+local PORT_CHANGE_DEDUPE_SECONDS = 1
+local portChangeInFlight = false
+local lastPortChangeValue = nil
+local lastPortChangeAt = 0
+
 local log = Logger.log
+local notify = Logger.notify
 
 -- sendMessage é a própria função que o Logger usa para encaminhar logs pela
 -- conexão WS (injetada em Logger.init(sendMessage) dentro de start()) — os
@@ -91,21 +154,49 @@ local function handleWriteSource(message)
 			return
 		end
 
-		TeamCreateLease.ensureIntent(message.uuid, instance)
-		local canWrite, ownerClientId = TeamCreateLease.canWrite(message.uuid)
-		if not canWrite then
-			local ownerDisplay = TeamCreateLease.describeClient(ownerClientId)
+		-- Pastas vendorizadas (Packages/ServerPackages/DevPackages, ver
+		-- Config.luau/docs/DECISIONS.md 2026-07-16): edição normal (modo
+		-- ATUALIZAÇÃO, script já existente) é bloqueada/ignorada — nunca
+		-- arbitra lease nem escreve Source para esses scripts, para não
+		-- empurrar ao Team Create compartilhado uma versão vendorizada
+		-- divergente entre devs. Modo CRIAÇÃO (path abaixo, sem uuid) não é
+		-- afetado por esta checagem — é assim que um pacote novo chega ao
+		-- Studio pela 1ª vez.
+		if Config.isInsideExcludedPackageFolder(instance) then
+			local blockedMessage = "edição bloqueada: script dentro de pasta de pacote vendorizado (Packages/ServerPackages/DevPackages) — não sincronizado ao vivo"
 			sendMessage({
 				kind = "writeAck",
 				requestId = message.requestId,
 				ok = false,
 				uuid = message.uuid,
-				error = ("lease negada — script sendo editado por %s"):format(ownerDisplay),
+				error = blockedMessage,
 			})
-			log(("writeSource (update) uuid=%s -> ERRO: lease negada (owner=%s)"):format(
+			log(("writeSource (update) uuid=%s -> BLOQUEADO (pasta vendorizada): %s"):format(
 				tostring(message.uuid),
-				ownerDisplay
+				instance:GetFullName()
 			))
+			return
+		end
+
+		TeamCreateLease.ensureIntent(message.uuid, instance)
+		local canWrite, ownerClientId = TeamCreateLease.canWrite(message.uuid)
+		if not canWrite then
+			local ownerDisplay = TeamCreateLease.describeClient(ownerClientId)
+			local leaseDeniedMessage = ("lease negada — script sendo editado por %s"):format(ownerDisplay)
+			sendMessage({
+				kind = "writeAck",
+				requestId = message.requestId,
+				ok = false,
+				uuid = message.uuid,
+				error = leaseDeniedMessage,
+			})
+			-- M4.5: toast-worthy (Logger.notify, não Logger.log) — recusa de
+			-- escrita é um evento que o usuário precisa perceber sem precisar
+			-- olhar o Output (spec da tarefa: writeAck ok=false/lease negada é
+			-- um dos gatilhos sugeridos). Log incondicional continua
+			-- acontecendo (Logger.notify sempre loga, ver Logger.luau) — só a
+			-- exibição do toast depende da preferência "Mostrar notificações".
+			notify(("%s (uuid=%s)"):format(leaseDeniedMessage, tostring(message.uuid)))
 			return
 		end
 
@@ -202,6 +293,38 @@ local function handleMessage(raw)
 		handleReadSource(message)
 	elseif message.kind == "listScripts" then
 		handleListScripts(message)
+	elseif message.kind == "presenceUpdate" then
+		-- M4: espontânea, sem requestId, sem ack (spec docs/MILESTONES.md) —
+		-- só grava a própria Presence; TeamCreatePresence.updateOwnPresence já
+		-- degrada sem erro se a sessão local ainda não estiver pronta.
+		TeamCreatePresence.updateOwnPresence(message)
+	elseif message.kind == "ping" then
+		-- Heartbeat da extensão (vscode-extension HeartbeatMonitor.ts): a
+		-- extensão manda {kind:"ping"} a cada 5s enquanto conectada e responde-se
+		-- pong imediatamente. Mensagem ADITIVA — não bumpa PROTOCOL_VERSION. Sem
+		-- requestId, sem estado: é só liveness. O plugin NÃO origina ping próprio;
+		-- só RECEBER este ping já conta como atividade (o handler de
+		-- MessageReceived em runConnection atualiza lastMessageAt para QUALQUER
+		-- mensagem, inclusive esta — a ausência dele é o que detecta a queda).
+		sendMessage({ kind = "pong" })
+	elseif message.kind == "connectionRejected" then
+		-- A extensão rejeitou explicitamente esta conexão (2º cliente na mesma
+		-- porta) e fechará o WS logo em seguida. Sinal DEFINITIVO de "porta
+		-- ocupada por outro Studio" — runConnection lê a flag e trata como
+		-- rejeição confirmada na hora (sem depender da heurística de tempo
+		-- Config.PROBABLE_REJECTION_WINDOW_SECONDS, que passa a ser só o fallback
+		-- para quando este sinal NÃO chega, ex.: extensão antiga sem este fix).
+		-- Toast (Logger.notify, não Logger.log) só na 1ª vez por porta ocupada;
+		-- rejeições repetidas na mesma porta só logam (ver dedupe no topo do
+		-- arquivo). `reason` hoje é sempre "port_in_use" (único definido) — a
+		-- flag/aviso assumem esse motivo.
+		connectionRejected = true
+		if lastRejectedPortToasted ~= activePort then
+			lastRejectedPortToasted = activePort
+			notify(("porta %d já está em uso por outro Studio"):format(activePort or 0))
+		else
+			log(("porta %d já está em uso por outro Studio (rejeição repetida; toast já exibido)"):format(activePort or 0))
+		end
 	else
 		log("kind desconhecido/ignorado:", tostring(message.kind))
 	end
@@ -260,8 +383,45 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 	-- anterior). Só descobertas automáticas desta sessão chegam a persistir.
 	local persistedAutoPort = explicitAtStart
 
+	-- Estado visual do botão CONNECT/DISCONNECT (item 1 da tarefa): a cada
+	-- volta deste loop o estado vai para "connecting" (laranja) e só passa a
+	-- "connected" (vermelho) quando a conexão estabiliza (abaixo). O estado
+	-- "disconnected" (azul) é setado SÓ por stop(), nunca aqui — assim um loop
+	-- de ConnectFail fica laranja estável em vez de piscar azul/vermelho, que
+	-- era o que o usuário via como confuso.
+	--
+	-- M4.5 (toast de "reconexão falhando"): `hasStabilizedOnce` vira true na
+	-- primeira vez que esta runConnection (mesmo myToken, ou seja, mesmo
+	-- ciclo start()/stop()) recebe de verdade qualquer mensagem do harness —
+	-- só a partir daí uma queda é tratada como "algo que estava funcionando
+	-- parou", digno de toast. Sem isso, o cenário normal "extensão VS Code
+	-- ainda não foi aberta" (loop de reconexão tentando a cada
+	-- RECONNECT_SECONDS sem nunca ter recebido nada) dispararia toast
+	-- repetido desde o primeiro segundo — exatamente o "evento rotineiro"
+	-- que a spec pede pra NÃO notificar. Isto é MAIS forte que o critério
+	-- visual acima (que também aceita "ficou de pé além da janela") de
+	-- propósito: um ConnectFail nunca recebe mensagem NEM fica de pé, então
+	-- não vira nem laranja-confirmado nem toast — é o cenário "nunca conectou
+	-- de verdade", corretamente silencioso. `outageToasted` garante só 1 toast
+	-- por "episódio" de queda (reseta pra false assim que uma nova conexão
+	-- estabiliza de novo, permitindo um novo toast se cair de novo depois).
+	local hasStabilizedOnce = false
+	local outageToasted = false
+
 	while enabled and currentToken == myToken do
 		local port = ports[index]
+		activePort = port
+		-- Reset por tentativa: `connectionRejected` é module-level (setado por
+		-- handleMessage), então precisa nascer false a cada nova conexão para
+		-- não vazar uma rejeição de uma tentativa anterior para a lógica de
+		-- decisão abaixo.
+		connectionRejected = false
+		PluginUI.setPort(port)
+		-- Cada volta do loop = uma tentativa de conexão → estado "connecting"
+		-- (botão laranja). Dedupe no setter evita reexecutar effects quando já
+		-- está "connecting" (o caso comum no loop de reconexão). Só vira
+		-- "connected" (vermelho) quando a conexão estabiliza de fato, abaixo.
+		PluginUI.setConnectionStatus("connecting")
 		local url = ("ws://127.0.0.1:%d"):format(port)
 		local ok, newClient = pcall(function()
 			return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = url })
@@ -278,9 +438,17 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 		local closed = false
 		local receivedAnyMessage = false
 		local connectedAt = os.clock()
+		-- Timestamp local da ÚLTIMA mensagem recebida de QUALQUER tipo (estende o
+		-- rastreamento que `receivedAnyMessage` já fazia como booleano — agora
+		-- também guardamos QUANDO, para detectar silêncio prolongado). Inicia em
+		-- connectedAt: se nada chegar desde a abertura, o silêncio conta a partir
+		-- daqui. Atualizado no handler de MessageReceived abaixo, para ping
+		-- (heartbeat da extensão a cada 5s) e para toda outra mensagem por igual.
+		local lastMessageAt = connectedAt
 		local connections = {}
 		table.insert(connections, newClient.MessageReceived:Connect(function(raw)
 			receivedAnyMessage = true
+			lastMessageAt = os.clock()
 			handleMessage(raw)
 		end))
 		table.insert(connections, newClient.Closed:Connect(function()
@@ -293,19 +461,74 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 
 		client = newClient
 		sendHello()
+		-- NÃO vira "connected" (vermelho) aqui: criar o WebStreamClient e
+		-- mandar o hello é otimista (a conexão pode falhar logo em seguida com
+		-- ConnectFail). O botão só passa a vermelho quando a conexão
+		-- ESTABILIZA de fato (abaixo) — até lá fica laranja ("connecting").
 		log(("conectado em %s"):format(url))
+
+		-- Vira "connected" (vermelho) só na 1ª vez que esta tentativa
+		-- estabiliza — não repete o setter a cada 0.5s.
+		local shownConnected = false
 
 		while enabled and currentToken == myToken and not closed do
 			task.wait(0.5)
+
+			-- Garantia independente de Closed/Error: se ficamos silenciosos por
+			-- mais de DEAD_CONNECTION_TIMEOUT_SECONDS (nenhuma mensagem de nenhum
+			-- tipo — nem o ping periódico da extensão a cada 5s, nem qualquer
+			-- outra), a extensão provavelmente caiu sem fechar o WS (ex.: "Reload
+			-- Window" do VS Code) — cenário em que Closed/Error do WebStreamClient
+			-- podem NÃO disparar (o bug que esta detecção existe para cobrir).
+			-- Só setamos `closed = true`: EXATAMENTE o que os handlers de
+			-- Closed/Error já fazem (o restante da iteração corrente termina
+			-- inócuo e a condição do `while` encerra o loop na próxima checagem —
+			-- mesmíssimo timing de quando um Closed dispara durante o task.wait),
+			-- então caímos no MESMO teardown + ciclo de reconexão logo abaixo (que
+			-- por sua vez repõe o painel em "connecting" sozinho — não duplicamos
+			-- setConnectionStatus aqui).
+			if os.clock() - lastMessageAt >= Config.DEAD_CONNECTION_TIMEOUT_SECONDS then
+				log(("sem mensagens da extensão há %ds (provável queda sem close do WS); forçando reconexão"):format(
+					Config.DEAD_CONNECTION_TIMEOUT_SECONDS
+				))
+				closed = true
+			end
+
 			-- "Estabilizou" (item 4): recebeu qualquer mensagem do harness
-			-- depois do hello, OU já ficou conectada além da janela curta de
-			-- rejeição provável sem cair. Persistir assim que estabilizar (não
-			-- espera a conexão cair) para reloads futuros já reconectarem
-			-- direto nesta porta.
-			if
-				not persistedAutoPort
-				and (receivedAnyMessage or (os.clock() - connectedAt) >= Config.PROBABLE_REJECTION_WINDOW_SECONDS)
-			then
+			-- depois do hello (a extensão dispara um listScripts inicial em
+			-- runInitialSync assim que valida o hello — ver vscode-extension/
+			-- src/sync/SyncTeamService.ts), OU já ficou conectada além da
+			-- janela curta de rejeição provável sem cair.
+			-- `not connectionRejected` suprime "estabilizou": uma conexão
+			-- rejeitada RECEBE sim uma mensagem (o próprio connectionRejected),
+			-- então sem esta guarda ela contaria como estável e o plugin (a)
+			-- piscaria o botão em "connected" e (b) PERSISTIRIA a porta ocupada
+			-- como porta descoberta (SetSetting abaixo) — os dois errados. Ver
+			-- handleMessage/connectionRejected.
+			local stabilized = not connectionRejected
+				and (receivedAnyMessage
+					or (os.clock() - connectedAt) >= Config.PROBABLE_REJECTION_WINDOW_SECONDS)
+
+			-- Estado visual (item 1 da tarefa): só vira "connected" (vermelho)
+			-- ao estabilizar. Um ConnectFail nunca estabiliza (cai em
+			-- <PROBABLE_REJECTION_WINDOW_SECONDS sem receber nada), então o
+			-- botão fica laranja o loop inteiro em vez de piscar azul/vermelho.
+			-- Nota: usa o critério FRACO (recebeu msg OU ficou de pé além da
+			-- janela), igual à persistência de porta — mais permissivo que o
+			-- critério de toast (hasStabilizedOnce, só recebeu msg). Ver
+			-- .claude/agent-memory/ui-dev.md para o porquê da diferença.
+			if stabilized and not shownConnected then
+				shownConnected = true
+				-- Conexão real estabeleceu: zera o dedupe de toast de rejeição,
+				-- para que uma futura ocupação DESTA mesma porta (outro Studio a
+				-- toma depois) volte a notificar.
+				lastRejectedPortToasted = nil
+				PluginUI.setConnectionStatus("connected")
+			end
+
+			-- Persistir assim que estabilizar (não espera a conexão cair) para
+			-- reloads futuros já reconectarem direto nesta porta.
+			if not persistedAutoPort and stabilized then
 				local okSet, errSet = pcall(function()
 					pluginObject:SetSetting(Config.PORT_SETTING_KEY, port)
 				end)
@@ -315,6 +538,18 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 					log(("falha ao salvar porta descoberta automaticamente (%d): %s"):format(port, tostring(errSet)))
 				end
 				persistedAutoPort = true
+			end
+			-- M4.5: ver comentário no topo de runConnection — só o recebimento
+			-- REAL de uma mensagem do harness conta como "estabilizou" para
+			-- fins de toast (mais forte que o critério visual/porta acima, que
+			-- também aceita só "ficou de pé um tempo").
+			-- `and not connectionRejected`: um connectionRejected É uma mensagem
+			-- recebida, mas NÃO é "a conexão funcionou" — não deve armar o toast
+			-- genérico de "conexão perdida" (já existe o toast específico de
+			-- porta ocupada em handleMessage).
+			if not hasStabilizedOnce and receivedAnyMessage and not connectionRejected then
+				hasStabilizedOnce = true
+				outageToasted = false
 			end
 		end
 
@@ -328,12 +563,37 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 		end)
 
 		if not (enabled and currentToken == myToken) then
+			-- stop() já colocou o estado em "disconnected" (botão azul) — não
+			-- sobrescreve com "connecting" aqui.
 			return
 		end
 
-		local probablyRejected = (not receivedAnyMessage)
-			and aliveSeconds < Config.PROBABLE_REJECTION_WINDOW_SECONDS
-			and #ports > 1
+		-- Ainda habilitado: vamos tentar de novo → volta a "connecting"
+		-- (laranja). Cobre a espera até a próxima tentativa (RECONNECT_SECONDS
+		-- ou CANDIDATE_RETRY_DELAY_SECONDS) sem deixar o botão preso em
+		-- "connected" (vermelho) depois de uma queda.
+		PluginUI.setConnectionStatus("connecting")
+
+		-- Rejeição CONFIRMADA pelo sinal explícito (connectionRejected) OU
+		-- inferida pela heurística de tempo (fallback quando o sinal não chega:
+		-- extensão antiga — "caiu cedo sem nunca receber mensagem"). O sinal
+		-- explícito dispensa tanto a janela de tempo quanto o "não recebeu
+		-- mensagem" (o próprio connectionRejected É uma mensagem). Só cicla
+		-- candidatas se houver >1 porta; porta explícita (#ports==1) sempre
+		-- reconecta na mesma — o toast de handleMessage já avisou o motivo e o
+		-- usuário decide trocar de porta no painel (item 2 da tarefa).
+		local rejected = connectionRejected
+			or ((not receivedAnyMessage) and aliveSeconds < Config.PROBABLE_REJECTION_WINDOW_SECONDS)
+		local probablyRejected = rejected and #ports > 1
+
+		-- M4.5: toast só quando uma conexão que JÁ FUNCIONOU cai de um jeito
+		-- que não é a rotina de "ciclar candidatas de porta" — evita o ruído
+		-- de notificar o cenário normal "extensão ainda não foi aberta" (ver
+		-- comentário no topo da função).
+		if not probablyRejected and hasStabilizedOnce and not outageToasted then
+			outageToasted = true
+			notify("conexão com a extensão VS Code perdida; tentando reconectar...")
+		end
 
 		if probablyRejected then
 			attemptsInLap += 1
@@ -372,12 +632,14 @@ local function stop()
 	enabled = false
 	currentToken += 1
 	SourceWatcher.stop()
-	-- TeamCreateLease.stop() antes de TeamCreateElection.stop(): só limpa
-	-- estado em memória (pastas de intent morrem em cascata quando
+	-- TeamCreateLease.stop()/TeamCreatePresence.stop() antes de
+	-- TeamCreateElection.stop(): ambos só limpam estado em memória (a própria
+	-- Presence e as pastas de intent morrem em cascata quando
 	-- TeamCreateElection.stop() destrói a própria sessão a seguir) — ordem
 	-- não é estritamente necessária, mas segue a mesma disciplina "parar o
 	-- que depende antes do que é dependido" já usada neste arquivo.
 	TeamCreateLease.stop()
+	TeamCreatePresence.stop()
 	-- TeamCreateElection.stop() remove a própria entrada de Sessions/ de forma
 	-- SÍNCRONA (M3.1) — mesmo cuidado do fix de WebStreamClient abaixo:
 	-- plugin.Unloading pode não dar chance de uma coroutine assíncrona notar
@@ -396,6 +658,14 @@ local function stop()
 		end)
 	end
 	client = nil
+	-- Zera o dedupe de toast de rejeição de porta: um novo start() deve poder
+	-- notificar de novo se reencontrar uma porta ocupada.
+	lastRejectedPortToasted = nil
+	-- Estado visual: "disconnected" (botão azul, ação = conectar) — o loop de
+	-- runConnection já não vai sobrescrever porque enabled == false (ele volta
+	-- cedo ao notar isso). runConnection NUNCA seta "disconnected" sozinho:
+	-- esse estado parado é responsabilidade exclusiva do stop().
+	PluginUI.setConnectionStatus("disconnected")
 	log("parado.")
 end
 
@@ -407,6 +677,10 @@ local function start(pluginObject)
 	enabled = true
 	currentToken += 1
 	local myToken = currentToken
+	-- Estado visual imediato: o clique em CONNECT (ou o auto-start) já coloca o
+	-- botão em "connecting" (laranja) antes mesmo da 1ª tentativa de WS em
+	-- runConnection, sem esperar o loop começar.
+	PluginUI.setConnectionStatus("connecting")
 	local ports, explicitPort = Config.resolveCandidatePorts(pluginObject)
 	local okUserId, resolvedUserId = pcall(function()
 		return StudioService:GetUserId()
@@ -418,6 +692,12 @@ local function start(pluginObject)
 	-- antes — mesmo cuidado de ordem já seguido para SourceWatcher.init/
 	-- TeamCreateLease.init abaixo.
 	Logger.init(sendMessage)
+	-- M4.5: injeta o callback de toast do painel — Logger.notify(...) (usado
+	-- pelos poucos pontos "toast-worthy" deste arquivo e de
+	-- TeamCreateSchema.luau) passa a acionar PluginUI.notify a partir de
+	-- agora. Antes deste ponto (e se PluginUI.init tiver falhado, ver
+	-- PluginUI.luau), Logger.notify se comporta como Logger.log.
+	Logger.initNotify(PluginUI.notify)
 	SourceWatcher.init(sendMessage)
 	SourceWatcher.start()
 	TeamCreateElection.start(if okUserId then resolvedUserId else 0)
@@ -428,6 +708,11 @@ local function start(pluginObject)
 	-- checkLeaseDrift poder emitir `leaseChanged` espontâneo.
 	TeamCreateLease.init(sendMessage)
 	TeamCreateLease.start()
+	-- TeamCreatePresence depois de TeamCreateElection, mesmo motivo de
+	-- TeamCreateLease acima: updateOwnPresence/checkPresenceDrift dependem de
+	-- TeamCreateElection.getSessionFolder()/getClientId() já existirem.
+	TeamCreatePresence.init(sendMessage)
+	TeamCreatePresence.start()
 	task.spawn(runConnection, myToken, ports, explicitPort, pluginObject)
 	if explicitPort then
 		log(("iniciado. Conectando à porta %d..."):format(ports[1]))
@@ -436,67 +721,88 @@ local function start(pluginObject)
 	end
 end
 
--- ---------------------------------------------------------------- toolbar
-
-local toolbar = plugin:CreateToolbar("SyncTeam")
-
-local startButton = toolbar:CreateButton(
-	"syncteam-start",
-	"Conecta à extensão VS Code local (no-op se já ativo; use após reinstalar sem reload automático)",
-	"",
-	"SyncTeam: Conectar"
-)
-local stopButton = toolbar:CreateButton("syncteam-stop", "Desconecta e para a observação", "", "SyncTeam: Parar")
-
--- Botão TEMPORÁRIO de teste (pedido do orquestrador, 2026-07-07): não há
--- como chamar `plugin:SetSetting(...)` pelo Command Bar do Studio (a global
--- `plugin` só existe dentro do script do próprio plugin, `attempt to index
--- nil with 'SetSetting'` fora dele) — sem isso, não havia jeito de apontar
--- os 2 Studios de um teste na mesma máquina/mesma pasta de Plugins para
--- portas diferentes (34980/34981), 1 harness Node por Studio. Alterna só
--- entre esses dois valores fixos (únicos usados nos testes atuais) e
--- reconecta na hora (stop() + start()) — ferramenta de teste, não feature de
--- produto; não precisa de UI além do próprio botão.
-local ALT_PORT_A = 34980
-local ALT_PORT_B = 34981
-local togglePortButton = toolbar:CreateButton(
-	"syncteam-toggle-port",
-	("Alterna a porta WS entre %d e %d e reconecta (só para teste com 2 Studios na mesma máquina)"):format(
-		ALT_PORT_A,
-		ALT_PORT_B
-	),
-	"",
-	"SyncTeam: Alternar porta (34980/34981)"
-)
-
-startButton.ClickableWhenViewportHidden = true
-stopButton.ClickableWhenViewportHidden = true
-togglePortButton.ClickableWhenViewportHidden = true
-
-startButton.Click:Connect(function()
-	task.spawn(start, plugin)
-end)
-stopButton.Click:Connect(stop)
-togglePortButton.Click:Connect(function()
-	task.spawn(function()
-		local currentPort = Config.resolvePort(plugin)
-		local nextPort = if currentPort == ALT_PORT_A then ALT_PORT_B else ALT_PORT_A
-		local ok, err = pcall(function()
-			plugin:SetSetting(Config.PORT_SETTING_KEY, nextPort)
-		end)
-		if not ok then
-			log("falha ao alternar porta:", tostring(err))
+-- ------------------------------------------------------------------- UI (M4.5)
+--
+-- Substitui a antiga toolbar de 3 botões (Conectar/Parar/Alternar porta) por
+-- 1 botão só que alterna o painel (PluginUI.luau cria toolbar+
+-- DockWidgetPluginGui+monta a árvore Vide) — este arquivo continua sendo o
+-- ÚNICO dono de start()/stop()/troca de porta; PluginUI só invoca os
+-- callbacks abaixo e reflete estado via setConnectionStatus/setPort (chamados
+-- dentro de runConnection/start/stop, ver acima).
+--
+-- onPortChange reusa EXATAMENTE a mesma sequência que o antigo botão
+-- "Alternar porta" fazia (SetSetting + stop() + start(plugin)) — só
+-- generalizada para um valor arbitrário digitado no painel em vez de
+-- alternar entre 2 constantes fixas (34980/34981, que eram só uma
+-- ferramenta de teste para 2 Studios na mesma máquina — o campo de porta do
+-- painel substitui essa necessidade sem precisar de nenhum botão dedicado).
+PluginUI.init(plugin, {
+	onConnect = function()
+		task.spawn(start, plugin)
+	end,
+	onDisconnect = stop,
+	onPortChange = function(newPort)
+		-- Guarda de reentrância/dedupe (ver comentário no topo do arquivo):
+		-- ignora uma 2ª chamada de FocusLost residual que dispararia um
+		-- stop()+start() concorrente, matando a conexão recém-criada.
+		if portChangeInFlight then
+			log(("troca de porta para %d ignorada: outra troca ainda em andamento"):format(newPort))
 			return
 		end
-		log(("porta alternada %d -> %d; reconectando..."):format(currentPort, nextPort))
-		stop()
-		start(plugin)
-	end)
-end)
+		if lastPortChangeValue == newPort and (os.clock() - lastPortChangeAt) < PORT_CHANGE_DEDUPE_SECONDS then
+			log(("troca de porta para %d ignorada: repetição do mesmo valor em <%ds"):format(
+				newPort,
+				PORT_CHANGE_DEDUPE_SECONDS
+			))
+			return
+		end
+		portChangeInFlight = true
+		lastPortChangeValue = newPort
+		lastPortChangeAt = os.clock()
+		task.spawn(function()
+			local currentPort = Config.resolvePort(plugin)
+			local okSet, errSet = pcall(function()
+				plugin:SetSetting(Config.PORT_SETTING_KEY, newPort)
+			end)
+			if not okSet then
+				log("falha ao mudar porta pelo painel:", tostring(errSet))
+				-- Libera a guarda ANTES de sair: sem isso, uma falha de SetSetting
+				-- deixaria portChangeInFlight travado em true para sempre,
+				-- bloqueando toda troca de porta futura (bug pior que o que estamos
+				-- corrigindo).
+				portChangeInFlight = false
+				return
+			end
+			log(("porta alterada pelo painel %d -> %d; reconectando..."):format(currentPort, newPort))
+			-- stop()+start() em pcall só para GARANTIR que a guarda sempre baixa
+			-- (um erro aqui deixaria portChangeInFlight travado, ver acima) — o
+			-- erro, se houver, continua sendo logado, não engolido silenciosamente.
+			local okCycle, errCycle = pcall(function()
+				stop()
+				start(plugin)
+			end)
+			-- Reinicia a janela de dedupe a partir do FIM do stop()+start() (que
+			-- pode ter yieldado): é a partir daqui que o PortRow fica vulnerável de
+			-- novo, até runConnection atualizar state.port(). Só então libera a
+			-- flag de reentrância.
+			lastPortChangeAt = os.clock()
+			portChangeInFlight = false
+			if not okCycle then
+				log("erro ao reconectar após troca de porta:", tostring(errCycle))
+			end
+		end)
+	end,
+})
+PluginUI.setPort(Config.resolvePort(plugin))
 
 plugin.Unloading:Connect(stop)
+-- PluginUI.stop() é um ciclo de vida SEPARADO do stop() de conexão acima
+-- (ver PluginUI.luau): só desliga o refresh em segundo plano da tabela de
+-- sessões; o painel em si (toolbar+widget) não precisa ser destruído, o
+-- Studio cuida disso ao descarregar o plugin.
+plugin.Unloading:Connect(PluginUI.stop)
 
-log("plugin carregado. Auto-start ao carregar; toolbar 'SyncTeam': Conectar (no-op se já ativo) / Parar.")
+log("plugin carregado. Auto-start ao carregar; toolbar 'SyncTeam' alterna o painel de status.")
 
 -- ------------------------------------------------------------ auto-start
 --

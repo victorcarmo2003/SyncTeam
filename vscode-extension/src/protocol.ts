@@ -155,6 +155,87 @@ export interface LeaseChangedEvent {
 }
 
 /**
+ * Extensão → plugin (M4, nova, aditiva — não muda `PROTOCOL_VERSION`, mesmo
+ * precedente de `leaseChanged`/`hello.clientId` no M3): mensagem espontânea
+ * (sem `requestId`/ack, mesmo mecanismo de `SyncServer.sendSpontaneous` usado
+ * para mandar isso) publicando o cursor/seleção/arquivo ativo do dev LOCAL.
+ * `uuid: null` significa "nenhum script sincronizado conhecido está ativo"
+ * (limpar minha presença) — sem editor ativo cai no mesmo caso.
+ */
+export interface PresenceUpdateMessage {
+  kind: "presenceUpdate";
+  uuid: string | null;
+  cursorLine: number | null;
+  cursorColumn: number | null;
+  selectionStartLine: number | null;
+  selectionStartColumn: number | null;
+}
+
+/**
+ * Plugin → extensão (M4, nova), espontânea, uma por sessão remota que
+ * mudou — o plugin nunca manda a presença da PRÓPRIA sessão de volta (mesmo
+ * espírito de `leaseChanged`). `uuid: null` = colaborador sem script
+ * sincronizado ativo.
+ */
+export interface PresenceChangedEvent {
+  kind: "presenceChanged";
+  clientId: string;
+  displayName: string;
+  uuid: string | null;
+  cursorLine: number | null;
+  cursorColumn: number | null;
+  selectionStartLine: number | null;
+  selectionStartColumn: number | null;
+}
+
+/** Plugin → extensão (M4, nova), espontânea: sessão remota saiu ou expirou. */
+export interface PresenceLeftEvent {
+  kind: "presenceLeft";
+  clientId: string;
+}
+
+/**
+ * Extensão → plugin (heartbeat, aditiva — NÃO muda `PROTOCOL_VERSION`, mesmo
+ * precedente de `leaseChanged`/`presenceUpdate`): ping periódico de vida,
+ * enviado a cada `HEARTBEAT_INTERVAL_MS` pelo `SyncServer`. Espontânea (sem
+ * `requestId`/ack — vai por `SyncServer.send`). O plugin DEVE responder com
+ * `pong`; qualquer outra mensagem do plugin também reseta o relógio de silêncio
+ * do lado da extensão. Serve para detectar queda de conexão que o socket TCP
+ * não avisou (ex.: processo da extensão morto num "Reload Window" — o cliente
+ * do plugin não recebe frame de close e ficaria "conectado" para sempre). Ver
+ * .claude/agent-memory/extension-dev.md para o contrato exato (intervalo/
+ * timeout) que o lado Luau precisa espelhar.
+ */
+export interface PingMessage {
+  kind: "ping";
+}
+
+/**
+ * Plugin → extensão (heartbeat): resposta ao `ping`. A extensão a trata só
+ * como sinal de vida (reseta o relógio de silêncio) e NÃO a roteia como
+ * mensagem espontânea. Qualquer outra mensagem do plugin cumpre o mesmo papel.
+ */
+export interface PongMessage {
+  kind: "pong";
+}
+
+/**
+ * Extensão → plugin (aditiva — NÃO muda `PROTOCOL_VERSION`, mesmo precedente de
+ * `leaseChanged`/`ping`): enviada IMEDIATAMENTE ANTES de o servidor fechar uma
+ * conexão rejeitada, porque o lado do plugin (`WebStreamClient`) não consegue
+ * ler o close code nem o reason de um close (o evento `Closed()` do Luau não
+ * tem parâmetro — .claude/research/2026-07-15-webstreamclient-close-code.md).
+ * Uma mensagem de aplicação (`MessageReceived`) é o único canal que carrega o
+ * motivo até o plugin. `reason` é string (não booleano) para poder crescer no
+ * futuro; hoje o único valor é `"port_in_use"` (já existe outro plugin
+ * conectado nesta porta / servidor local).
+ */
+export interface ConnectionRejectedMessage {
+  kind: "connectionRejected";
+  reason: "port_in_use";
+}
+
+/**
  * Mensagem recebida crua, só com a garantia de que `kind` é uma string não
  * vazia — todo o resto é validado por quem consome cada `kind` específico
  * (nunca confiar na forma do payload sem checar os campos).

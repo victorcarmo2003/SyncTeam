@@ -53,6 +53,37 @@ export class NodeDiskIO implements WatchableDiskIO {
     await fsp.rename(oldAbsolute, newAbsolute);
   }
 
+  async listFiles(relDir: string): Promise<string[]> {
+    const base = relDir === "" ? this.root : this.toAbsolute(relDir);
+    const prefix = relDir === "" ? "" : `${relDir.replace(/\/+$/g, "")}/`;
+    const files: string[] = [];
+
+    const walk = async (absDir: string, relPrefix: string): Promise<void> => {
+      let entries: fs.Dirent[];
+      try {
+        entries = await fsp.readdir(absDir, { withFileTypes: true });
+      } catch (error) {
+        // Diretório inexistente (ENOENT) é esperado quando um mount ainda não
+        // foi materializado — devolve vazio em vez de propagar.
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return;
+        }
+        throw error;
+      }
+      for (const entry of entries) {
+        const childRel = `${relPrefix}${entry.name}`;
+        if (entry.isDirectory()) {
+          await walk(path.join(absDir, entry.name), `${childRel}/`);
+        } else if (entry.isFile()) {
+          files.push(childRel);
+        }
+      }
+    };
+
+    await walk(base, prefix);
+    return files;
+  }
+
   async removeEmptyDirsUpward(relDir: string): Promise<void> {
     const root = path.resolve(this.root);
     let dir = path.resolve(this.toAbsolute(relDir));

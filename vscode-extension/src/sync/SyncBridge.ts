@@ -15,6 +15,7 @@
 // fake, sem precisar do VS Code nem de um plugin real.
 
 import { computeFullLayout, resolveDataModelPathForDiskChange, type DataModelEntry, type MountPoint } from "../mapping/projectMapping.js";
+import { isInsideExcludedPackageFolder } from "../mapping/wallyPackageFolders.js";
 import { isValidClassName, type ScriptClassName } from "../protocol.js";
 import { posixDirname, type DiskIO } from "./DiskIO.js";
 import type { Logger } from "../util/logger.js";
@@ -26,6 +27,16 @@ export interface Transport {
 
 /** Callback para notificar a camada de ativação sobre uma escrita rejeitada. */
 export type OnWriteRejectedCallback = (message: { diskPath: string; error: string }) => void;
+
+/**
+ * Callback para notificar a camada de ativação sobre um CONFLITO genuíno
+ * detectado durante a reconciliação sob demanda ("Refresh Sync"): disco e
+ * Studio divergiram AMBOS do último conteúdo sincronizado (ancestral comum) e
+ * têm conteúdos diferentes entre si. Nenhum lado é sobrescrito
+ * automaticamente — a resolução de conflito legível é M5. Aqui só avisamos
+ * para o usuário resolver manualmente.
+ */
+export type OnSyncConflictCallback = (message: { diskPath: string; uuid: string }) => void;
 
 /** Registro mínimo que o SyncBridge mantém por uuid: path/className atuais, informados pelo plugin. */
 interface ScriptEntry {
@@ -60,11 +71,41 @@ export class SyncBridge {
     private readonly diskIO: DiskIO,
     private readonly logger: Logger,
     private onWriteRejected?: OnWriteRejectedCallback,
+    private onSyncConflict?: OnSyncConflictCallback,
   ) {}
 
   /** Define um callback para ser chamado quando uma escrita for rejeitada. */
   setOnWriteRejected(callback: OnWriteRejectedCallback): void {
     this.onWriteRejected = callback;
+  }
+
+  /** Define um callback para ser chamado quando a reconciliação sob demanda detectar um conflito genuíno. */
+  setOnSyncConflict(callback: OnSyncConflictCallback): void {
+    this.onSyncConflict = callback;
+  }
+
+  /**
+   * Resolve o uuid do script materializado em `diskPath` (relativo à raiz do
+   * workspace de sincronização), ou `null` se não corresponder a nenhum
+   * script sincronizado conhecido. Usado pela camada de presença (M4) para
+   * saber "qual script o editor ativo representa" a partir do path do
+   * documento aberto — mesmo mapa reverso (`uuidByDiskPath`) que
+   * `handleLocalFileChange` já usa, exposto aqui só para leitura.
+   */
+  resolveUuidForDiskPath(diskPath: string): string | null {
+    return this.uuidByDiskPath.get(contentCacheKey(diskPath)) ?? null;
+  }
+
+  /**
+   * Direção inversa de `resolveUuidForDiskPath`: dado um uuid, o diskPath
+   * atualmente materializado para ele, ou `null` se ainda não foi
+   * materializado/uuid desconhecido. Usado pela camada de presença (M4,
+   * `FilePresenceDecorations`) para saber QUAL uri notificar o VS Code
+   * quando a presença de um uuid muda (o `FileDecorationProvider` precisa
+   * do Uri, não do uuid, para disparar `onDidChangeFileDecorations`).
+   */
+  resolveDiskPathForUuid(uuid: string): string | null {
+    return this.diskPathByUuid.get(uuid) ?? null;
   }
 
   // --------------------------------------------------------- layout (Rojo)
@@ -263,6 +304,17 @@ export class SyncBridge {
       this.logger.info("sourceChanged sem uuid válido, ignorado");
       return;
     }
+
+    // Pastas de pacotes Wally (Packages/ServerPackages/DevPackages) ficam de
+    // fora do live-edit-sync contínuo — ver docs/DECISIONS.md 2026-07-16.
+    // Discovery/identidade (uuid, listScripts) continuam normais; só a
+    // propagação de ATUALIZAÇÃO de conteúdo é ignorada aqui.
+    const instancePath = this.scripts.get(uuid)?.path ?? (typeof message.path === "string" ? message.path : undefined);
+    if (instancePath !== undefined && isInsideExcludedPackageFolder(instancePath)) {
+      this.logger.info(`sourceChanged '${instancePath}': dentro de pasta de pacotes Wally — ignorado (live-edit-sync não se aplica)`);
+      return;
+    }
+
     const source = typeof message.source === "string" ? message.source : "";
     await this.applyStudioContent(
       uuid,
@@ -441,6 +493,20 @@ export class SyncBridge {
 
     const knownUuid = this.uuidByDiskPath.get(key);
     if (knownUuid !== undefined) {
+      // Pastas de pacotes Wally: script JÁ EXISTE (uuid conhecido) — isto é
+      // uma ATUALIZAÇÃO de conteúdo existente, que fica de fora do
+      // live-edit-sync (ver docs/DECISIONS.md 2026-07-16). Note que a
+      // CRIAÇÃO de arquivo novo (branch abaixo, sem uuid conhecido) não
+      // passa por este early-return — continua funcionando normalmente
+      // mesmo dentro dessas pastas.
+      const instancePath = this.scripts.get(knownUuid)?.path ?? relDiskPath;
+      if (isInsideExcludedPackageFolder(instancePath)) {
+        this.logger.info(
+          `disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') dentro de pasta de pacotes Wally — atualização ignorada (live-edit-sync não se aplica)`,
+        );
+        return;
+      }
+
       this.contentCache.set(key, content);
       this.sourceCache.set(knownUuid, content);
       this.logger.info(`disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') mudou, enviando writeSource (atualizar)`);
@@ -496,5 +562,288 @@ export class SyncBridge {
     } catch (error) {
       this.logger.error(`disco → Studio: erro enviando '${relDiskPath}': ${(error as Error).message}`);
     }
+  }
+
+  // ------------------------------------------------- reconciliação sob demanda
+
+  /**
+   * "Refresh Sync": reconciliação bidirecional completa sob demanda. Sincroniza
+   * derivas que o watcher / conexão ao vivo tenham perdido — tipicamente quando
+   * um processo externo (script .bat/.ps1, ou outra ferramenta) editou um
+   * arquivo mapeado enquanto a extensão estava FECHADA. NÃO reimplementa a
+   * propagação: é só um novo ponto de entrada que dispara um MERGE DE 3 VIAS
+   * para todos os arquivos mapeados de uma vez, reaproveitando os mesmos
+   * caminhos de `handleLocalFileChange` (disco→Studio), `applyStudioContent`
+   * (Studio→disco, mesmo núcleo de `handleSourceChanged`) e a criação/pull
+   * inicial já existentes.
+   *
+   * O "ancestral comum" do merge de 3 vias é o `contentCache` (último conteúdo
+   * sincronizado por diskPath). Para cada uuid conhecido (união de
+   * `diskPathByUuid` com um `listScripts` fresco), comparamos o conteúdo ATUAL
+   * do disco (`disco`) e o `readSource` fresco do Studio (`studio`) contra esse
+   * ancestral (`cache`) — ver `reconcileUuidOnRefresh` para a tabela de
+   * decisão. Conflito genuíno (ambos os lados divergiram e diferem entre si)
+   * NÃO é resolvido automaticamente: só emite `onSyncConflict` para o usuário
+   * resolver (a resolução legível é M5).
+   */
+  async refreshSync(transport: Transport): Promise<void> {
+    this.logger.info("refreshSync: iniciando reconciliação de 3 vias sob demanda");
+
+    let response: Record<string, unknown>;
+    try {
+      response = await transport.request({ kind: "listScripts" });
+    } catch (error) {
+      this.logger.error(`refreshSync: listScripts falhou: ${(error as Error).message}`);
+      return;
+    }
+
+    const rawScripts = Array.isArray(response.scripts) ? (response.scripts as Array<Record<string, unknown>>) : [];
+    const pluginScripts = new Map<string, ScriptEntry>();
+    for (const item of rawScripts) {
+      const uuid = item?.uuid;
+      const path = item?.path;
+      const className = item?.className;
+      if (typeof uuid === "string" && uuid.length > 0 && typeof path === "string" && isValidClassName(className)) {
+        pluginScripts.set(uuid, { path, className });
+      } else {
+        this.logger.error(`refreshSync: entrada de listScripts inválida, ignorada: ${JSON.stringify(item).slice(0, 200)}`);
+      }
+    }
+    this.logger.info(`refreshSync: ${pluginScripts.size} script(s) reportado(s) pelo plugin`);
+
+    // Merge no `this.scripts` (fonte de verdade do layout) e recompute:
+    // atribui diskPath a scripts do Studio ainda não vistos localmente e move
+    // arquivos de scripts que mudaram de path enquanto a extensão estava
+    // fechada (mesmo motor de `scriptAdded`/`scriptMoved`).
+    let layoutChanged = false;
+    for (const [uuid, entry] of pluginScripts) {
+      const prev = this.scripts.get(uuid);
+      if (prev === undefined || prev.path !== entry.path || prev.className !== entry.className) {
+        this.scripts.set(uuid, entry);
+        layoutChanged = true;
+      }
+    }
+    if (layoutChanged) {
+      await this.recomputeAndApplyLayout("refreshSync: listScripts fresco");
+    }
+
+    // União de uuids: os já materializados localmente + os reportados agora.
+    const uuids = new Set<string>([...this.diskPathByUuid.keys(), ...pluginScripts.keys()]);
+    for (const uuid of uuids) {
+      await this.reconcileUuidOnRefresh(uuid, pluginScripts, transport);
+    }
+
+    // Arquivos que existem no disco mas não têm uuid conhecido (ex.: criados
+    // por processo externo enquanto a extensão estava fechada) — mesmo caminho
+    // de criação de `handleLocalFileChange`.
+    await this.reconcileDiskOnlyFiles(transport);
+
+    this.logger.info("refreshSync: reconciliação concluída");
+  }
+
+  /**
+   * Reconcilia um único uuid durante o "Refresh Sync". Tabela de decisão
+   * (com `cache` = `contentCache[diskPath]` = último conteúdo sincronizado):
+   *
+   * - uuid ausente do listScripts do plugin → deleção no Studio não é
+   *   auto-propagada nesta versão; arquivo local preservado (não-destrutivo).
+   * - sem ancestral (`cache` indefinido):
+   *     - sem arquivo no disco → recém-descoberto no Studio → pull.
+   *     - com arquivo no disco: iguais → registra baseline; diferentes →
+   *       conflito (sem ancestral não dá pra arbitrar).
+   * - com ancestral (`cache` definido):
+   *     - disco==cache && studio==cache → no-op.
+   *     - só disco mudou → disco→Studio (`handleLocalFileChange`).
+   *     - só studio mudou → Studio→disco (`applyStudioContent`).
+   *     - ambos mudaram e convergiram (disco==studio) → registra baseline.
+   *     - ambos mudaram e divergem → conflito.
+   *
+   * Pastas de pacotes Wally (`isInsideExcludedPackageFolder`, ver
+   * docs/DECISIONS.md 2026-07-16): qualquer ramo acima que faria um PUSH de
+   * atualização (só disco mudou, só Studio mudou) ou reportaria CONFLITO
+   * (com ou sem ancestral) é pulado silenciosamente (log info) para uuids
+   * dentro dessas pastas. O caso "sem ancestral, sem arquivo local" (pull de
+   * descoberta) e a convergência (registra baseline) continuam normais —
+   * não são push nem conflito.
+   */
+  private async reconcileUuidOnRefresh(
+    uuid: string,
+    pluginScripts: Map<string, ScriptEntry>,
+    transport: Transport,
+  ): Promise<void> {
+    const diskPath = this.diskPathByUuid.get(uuid);
+
+    if (!pluginScripts.has(uuid)) {
+      this.logger.warn(
+        `refreshSync: uuid '${uuid}' (${diskPath ?? this.displayPath(uuid)}) não está mais no listScripts do Studio — ` +
+          "arquivo local preservado; deleção no Studio não é propagada nesta versão",
+      );
+      return;
+    }
+
+    if (diskPath === undefined) {
+      this.logger.info(`refreshSync: uuid '${uuid}' (${this.displayPath(uuid)}) fora de qualquer ponto de montagem — ignorado`);
+      return;
+    }
+
+    // Pastas de pacotes Wally: "disco tem e Studio não tem ainda" continua
+    // funcionando normal (criação — tratada em reconcileDiskOnlyFiles, não
+    // aqui). O que fica de fora aqui é qualquer caso em que AMBOS os lados já
+    // existem e divergem — conflito genuíno ou push de atualização — ver
+    // docs/DECISIONS.md 2026-07-16.
+    const instancePath = pluginScripts.get(uuid)?.path ?? this.displayPath(uuid);
+    const excluded = isInsideExcludedPackageFolder(instancePath);
+
+    let studio: string;
+    try {
+      const readResponse = await transport.request({ kind: "readSource", uuid });
+      if (readResponse.ok === false) {
+        this.logger.error(`refreshSync: readSource '${this.displayPath(uuid)}' falhou: ${String(readResponse.error)}`);
+        return;
+      }
+      studio = typeof readResponse.source === "string" ? readResponse.source : "";
+    } catch (error) {
+      this.logger.error(`refreshSync: readSource '${this.displayPath(uuid)}' erro: ${(error as Error).message}`);
+      return;
+    }
+
+    let disco: string | null;
+    try {
+      disco = await this.diskIO.readFile(diskPath);
+    } catch (error) {
+      this.logger.error(`refreshSync: erro lendo '${diskPath}': ${(error as Error).message}`);
+      return;
+    }
+
+    const key = contentCacheKey(diskPath);
+    const cache = this.contentCache.get(key);
+
+    if (cache === undefined) {
+      // Sem ancestral comum: um dos casos de existência assimétrica.
+      if (disco === null) {
+        this.logger.info(`refreshSync: '${this.displayPath(uuid)}' descoberto no Studio (sem arquivo local) → puxando`);
+        await this.applyStudioContent(uuid, studio, "refreshSync: descoberto no Studio");
+        return;
+      }
+      if (disco === studio) {
+        this.logger.info(`refreshSync: '${diskPath}' já idêntico ao Studio (sem ancestral) → registrando baseline`);
+        this.seedBaseline(uuid, key, disco);
+        return;
+      }
+      if (excluded) {
+        this.logger.info(
+          `refreshSync: '${diskPath}' (${instancePath}) dentro de pasta de pacotes Wally — divergência (sem ancestral) ignorada silenciosamente`,
+        );
+        return;
+      }
+      this.reportConflict(uuid, diskPath);
+      return;
+    }
+
+    if (disco === null) {
+      // Arquivo removido do disco externamente. Deleção não é propagada nesta
+      // versão (mesma semântica de `handleLocalFileChange`) — não-destrutivo.
+      this.logger.warn(
+        `refreshSync: '${diskPath}' (${this.displayPath(uuid)}) foi removido do disco externamente — ` +
+          "deleção não é propagada nesta versão; ignorado",
+      );
+      return;
+    }
+
+    const discoChanged = disco !== cache;
+    const studioChanged = studio !== cache;
+
+    if (!discoChanged && !studioChanged) {
+      return; // caso 2: nada mudou
+    }
+    if (discoChanged && !studioChanged) {
+      if (excluded) {
+        this.logger.info(
+          `refreshSync: '${diskPath}' (${instancePath}) dentro de pasta de pacotes Wally — mudança só no disco ignorada (sem push ao Studio)`,
+        );
+        return;
+      }
+      this.logger.info(`refreshSync: '${diskPath}' mudou só no disco → propagando ao Studio`);
+      await this.handleLocalFileChange(diskPath, transport);
+      return;
+    }
+    if (!discoChanged && studioChanged) {
+      if (excluded) {
+        this.logger.info(
+          `refreshSync: '${instancePath}' dentro de pasta de pacotes Wally — mudança só no Studio ignorada (sem push ao disco)`,
+        );
+        return;
+      }
+      this.logger.info(`refreshSync: '${this.displayPath(uuid)}' mudou só no Studio → propagando ao disco`);
+      await this.applyStudioContent(uuid, studio, "refreshSync: só Studio mudou");
+      return;
+    }
+    // Ambos mudaram.
+    if (disco === studio) {
+      this.logger.info(`refreshSync: '${diskPath}' convergiu (disco == Studio) → atualizando baseline`);
+      this.seedBaseline(uuid, key, disco);
+      return;
+    }
+    if (excluded) {
+      this.logger.info(
+        `refreshSync: '${diskPath}' (${instancePath}) dentro de pasta de pacotes Wally — divergência ignorada silenciosamente (sem push, sem conflito reportado)`,
+      );
+      return;
+    }
+    this.reportConflict(uuid, diskPath);
+  }
+
+  /**
+   * Varre os arquivos sob cada ponto de montagem procurando arquivos que não
+   * têm uuid conhecido (não estão em `uuidByDiskPath`) e seguem a convenção
+   * Rojo — trata cada um como criação nova via `handleLocalFileChange` (mesmo
+   * caminho disco→Studio de criação já existente). Cobre o caso de um processo
+   * externo ter criado um arquivo enquanto a extensão estava fechada.
+   */
+  private async reconcileDiskOnlyFiles(transport: Transport): Promise<void> {
+    const seen = new Set<string>();
+    for (const mount of this.mountPoints) {
+      let files: string[];
+      try {
+        files = await this.diskIO.listFiles(mount.diskPath);
+      } catch (error) {
+        this.logger.error(`refreshSync: erro listando arquivos em '${mount.diskPath}': ${(error as Error).message}`);
+        continue;
+      }
+      for (const relPath of files) {
+        const key = contentCacheKey(relPath);
+        if (seen.has(key)) {
+          continue; // mounts podem se sobrepor/aninhar — não processa duas vezes
+        }
+        seen.add(key);
+        if (this.uuidByDiskPath.has(key)) {
+          continue; // já rastreado por algum uuid
+        }
+        if (resolveDataModelPathForDiskChange(relPath, this.mountPoints) === null) {
+          continue; // não segue a convenção Rojo (ex.: .json, .txt) — não é script
+        }
+        this.logger.info(`refreshSync: '${relPath}' existe no disco sem uuid conhecido → tratando como criação nova`);
+        await this.handleLocalFileChange(relPath, transport);
+      }
+    }
+  }
+
+  /** Registra `content` como o novo ancestral sincronizado, sem tocar disco nem rede (casos de convergência). */
+  private seedBaseline(uuid: string, key: string, content: string): void {
+    this.contentCache.set(key, content);
+    this.sourceCache.set(uuid, content);
+  }
+
+  /**
+   * Conflito genuíno: NÃO sobrescreve nenhum lado e NÃO mexe no ancestral
+   * (`contentCache`) — assim, quando o usuário resolver salvando um dos lados,
+   * aquela edição ainda diverge do ancestral e propaga normalmente. Só avisa.
+   */
+  private reportConflict(uuid: string, diskPath: string): void {
+    this.logger.warn(
+      `refreshSync: CONFLITO em '${diskPath}' (${this.displayPath(uuid)}) — disco e Studio divergiram ambos do último ` +
+        "conteúdo sincronizado e diferem entre si; nenhum lado foi sobrescrito, resolva manualmente",
+    );
+    this.onSyncConflict?.({ diskPath, uuid });
   }
 }

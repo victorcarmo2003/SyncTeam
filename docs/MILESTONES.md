@@ -429,10 +429,69 @@ Ferramenta de teste: mesma dupla de contas/Studios já usada no M0/M2 —
 
 ## M4 — Presença
 
-- [ ] Cursor/seleção/arquivo ativo publicados em `Sessions/<id>/Presence`.
-- [ ] VS Code renderiza cursores coloridos com nome, seleções e badge ● no
-      explorer (porta da extensão do RojoCoop).
-- [ ] Latência de presença aceitável para uso real (alvo: ≤ ~2s, um pulso).
+- [x] `[Implementado 2026-07-15, lado do plugin; rojo build + lune run
+      limpos; NÃO testado em Studio real]` Cursor/seleção/arquivo ativo
+      publicados em `Sessions/<id>/Presence`. Módulo novo
+      `plugin/src/TeamCreatePresence.luau`: passthrough puro (plugin nunca lê
+      cursor do editor do Studio, só retransmite o que a extensão manda via
+      `presenceUpdate`) + observação de outras sessões no mesmo ciclo de poll
+      de `TeamCreateLease.checkLeaseDrift`, emitindo
+      `presenceChanged`/`presenceLeft`. Ver `docs/PROJECT_STATUS.md` (seção
+      "M4, lado do plugin...") e `.claude/agent-memory/luau-dev.md` para
+      decisões de design.
+- [x] `[Implementado 2026-07-15, lado da extensão; tsc/vitest(100/100)/esbuild
+      limpos; NÃO testado em VS Code real nem Studio real]` VS Code renderiza
+      cursores coloridos com nome, seleções e badge ● no explorer. Badge do
+      Explorer é porte direto de `FilePresenceDecorations.ts` do RojoCoop;
+      cursor/seleção coloridos DENTRO do editor (`RemoteCursorDecorations.ts`)
+      são implementação nova (RojoCoop nunca validou isso, só o badge) via
+      `TextEditorDecorationType`. `PresencePublisher`/`PresenceTracker` novos
+      publicam o cursor do dev LOCAL (`vscode.window.onDidChange*`) e mantêm
+      o estado dos remotos. Ver `.claude/agent-memory/ui-dev.md`.
+- [ ] **Teste real ainda pendente — e mais pesado que M1-M3**: diferente das
+      fatias anteriores, isso NÃO dá pra validar só com o harness Node
+      (`run-node-harness.ts` não tem `vscode.window`/editor ativo/seleção —
+      presença só existe de verdade dentro de um VS Code real). Precisa de 2
+      janelas de VS Code Extension Development Host reais (uma por dev),
+      cada uma conectada a um Studio diferente, pra confirmar: latência
+      ponta-a-ponta (alvo ≤ ~2s), cursor/seleção do outro aparecendo
+      corretamente, badge do Explorer, e limpeza ao trocar de arquivo/fechar
+      editor/desconectar (`presenceLeft`).
+
+### M4.5 — Painel de status do plugin (Vide), fora do escopo formal do M4 mas construído na mesma janela
+
+Não é critério de aceite original do M4 — surgiu de um pedido do usuário
+("decidir uma interface" pro plugin) depois que a lib **Vide** entrou no
+projeto via Wally. Substitui os 3 botões de toolbar antigos por 1 painel
+(`DockWidgetPluginGui`).
+
+- [x] `[Implementado 2026-07-15; rojo build + lune run limpos; NÃO testado em
+      Studio real]` Toolbar reduzida a 1 toggle; painel com porta editável,
+      CONNECT/DISCONNECT, engrenagem→configurações ("mostrar notificações"
+      real, resto "em breve"), tabela USER|INFO (bolinha só no líder, INFO =
+      editando/vendo/ocioso) e toast interno (`Logger.notify`, sempre loga no
+      Output independente da preferência). Ver `docs/PROJECT_STATUS.md`
+      (nota "painel de status do plugin (Vide)...") e
+      `.claude/agent-memory/ui-dev.md` (seção "M4.5") para detalhe completo
+- [x] `[Verificado 2026-07-15]` **2 bugs reais encontrados no primeiro
+      teste, corrigidos, painel confirmado funcionando pelo usuário em
+      Studio real**: (1) `StatusPanel.build` rodava fora do escopo de
+      `vide.root()`; (2) `Enum.AutomaticCanvasSize` não existe (é
+      `Enum.AutomaticSize`). Detalhe completo em `docs/DECISIONS.md`
+      (entradas "M4.5: painel Vide não montava...").
+- [x] `[Implementado 2026-07-15; build/lint/test limpos; NÃO testado em
+      Studio real]` 3 melhorias pedidas pelo usuário após ver o painel
+      funcionando: botão CONNECT com 3 estados (laranja "CONECTANDO..."
+      estável durante reconexão, resolve o flicker azul/vermelho
+      reportado); popup de erro virou `ScreenGui` real em
+      `game:GetService("CoreGui")` (mesmo padrão do Rojo, confirmado por
+      pesquisa) com botão ✕ e auto-some em 5s; comando "Refresh Sync"
+      (`syncteam.refreshSync`, extensão) — reconciliação de 3 vias sob
+      demanda usando `contentCache` como ancestral comum, cobre deriva que
+      o watcher perdeu (edição externa com a extensão fechada), detecta
+      conflito genuíno sem sobrescrever nenhum lado. Ver
+      `docs/PROJECT_STATUS.md` (nota "painel confirmado + 3 melhorias...")
+      e `.claude/agent-memory/{ui-dev,extension-dev}.md` para detalhe.
 
 ## M5 — Empacotamento e hardening
 

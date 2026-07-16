@@ -190,7 +190,13 @@ local function getOrCreate(parent, className, name)
 		canonical.Value = maxNumeric
 	end
 
-	log(("reconciliada(s) %d duplicata(s) de %s '%s' sob %s"):format(
+	-- M4.5: toast-worthy (Logger.notify, não Logger.log) — reconciliar
+	-- duplicatas é sinal de uma corrida real de replicação do Team Create
+	-- (ver cabeçalho do arquivo), não um evento rotineiro; ajuda o usuário a
+	-- perceber que algo estranho (mas autocorrigido) aconteceu. Continua
+	-- logando no Output incondicionalmente (Logger.notify sempre faz isso,
+	-- ver Logger.luau) — só a exibição do toast depende da preferência.
+	Logger.notify(("reconciliada(s) %d duplicata(s) de %s '%s' sob %s"):format(
 		#candidates - 1,
 		className,
 		name,

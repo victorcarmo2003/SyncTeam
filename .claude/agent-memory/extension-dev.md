@@ -332,3 +332,481 @@ extensão:
 - Validei manualmente rodando o harness de verdade contra
   `spikes/m1-test-project` com `SYNCTEAM_LOG_FILE=./scratch-test.log`: as
   mesmas linhas aparecem no console E no arquivo, idênticas.
+
+## Refresh Sync — reconciliação de 3 vias sob demanda (2026-07-15)
+
+Comando `syncteam.refreshSync` que faz um merge de 3 vias bidirecional para
+TODOS os arquivos mapeados de uma vez, pegando deriva que o watcher/conexão ao
+vivo perdeu (cenário-alvo: processo externo — `.bat`/`.ps1`/Claude Code —
+editou/criou arquivo mapeado com a extensão FECHADA; a sincronização inicial é
+Studio-autoritária e sobrescreveria a edição externa).
+
+- **Ancestral comum = `contentCache` do SyncBridge** (chaveado por diskPath
+  minúsculo = último conteúdo sincronizado). NÃO é uma estrutura nova — reusei
+  a que já existia para dedupe de eco. Isso é o que torna o merge de 3 vias
+  possível sem persistir nada em disco.
+- **`SyncBridge.refreshSync(transport)`** é só um NOVO PONTO DE ENTRADA, não
+  reimplementa propagação: reusa `handleLocalFileChange` (disco→Studio),
+  `applyStudioContent` (Studio→disco, mesmo núcleo de `handleSourceChanged`) e
+  `recomputeAndApplyLayout` (materializar/mover). Fluxo: (1) `listScripts`
+  fresco → merge em `this.scripts` + recompute (dá diskPath a scripts do Studio
+  ainda não vistos e move os que mudaram de path enquanto fechado); (2) para
+  cada uuid na UNIÃO de `diskPathByUuid` com o listScripts fresco,
+  `reconcileUuidOnRefresh`; (3) `reconcileDiskOnlyFiles` varre `listFiles` de
+  cada mount e trata arquivos sem uuid como criação nova.
+- **Tabela de decisão** (`cache`=contentCache[diskPath], `disco`=readFile,
+  `studio`=readSource fresco): sem ancestral (`cache` undefined) → disco null =
+  pull (assimétrico B); disco==studio = registra baseline; divergem = CONFLITO
+  (sem ancestral não dá pra arbitrar). Com ancestral → disco==cache&&studio==
+  cache no-op; só disco mudou = disco→Studio; só studio mudou = Studio→disco;
+  ambos mudaram e convergiram = registra baseline (`seedBaseline`, sem escrever);
+  ambos divergem = CONFLITO.
+- **Conflito NÃO é resolvido** (resolução legível é M5): `reportConflict` só
+  loga warn + chama `onSyncConflict({diskPath, uuid})`, e crucialmente NÃO mexe
+  no `contentCache` (deixa o ancestral velho pra que a resolução manual — salvar
+  um lado — ainda divirja do ancestral e propague normal).
+- **`DiskIO.listFiles(relDir)`** foi ADICIONADO à interface (+ NodeDiskIO via
+  readdir recursivo com `withFileTypes`, ENOENT→[]; + VscodeDiskIO via
+  `readDirectory` recursivo). Necessário porque o caso "arquivo só no disco,
+  uuid nunca visto" exige enumerar o disco — o watcher não cobre (o evento
+  aconteceu com a extensão fechada). Varredura é escopada por mount.diskPath
+  (não a raiz toda) pra não pentear `.git`/`node_modules`; e filtrada por
+  `resolveDataModelPathForDiskChange !== null` pra não logar cada `.json`/`.md`.
+  Qualquer novo test-double de DiskIO precisa implementar `listFiles`
+  (atualizei o `CountingDiskIO` do syncBridge.test.ts, delega ao inner).
+- **Callback `onSyncConflict`**: mesmo padrão de `onWriteRejected`
+  (SyncBridge campo+setter → SyncTeamService `setOnSyncConflict` → extension.ts).
+  Em `extension.ts`, o comando coleta os conflitos do run atual num array
+  module-level (`refreshConflicts`) que o callback alimenta, e ao final mostra
+  UMA mensagem resumo via `showWarningMessage` listando os arquivos (em vez de
+  um popup por conflito). Salvaguarda: se um conflito vier fora de um run do
+  comando (`refreshConflicts === null`), mostra aviso avulso. Guarda
+  `refreshInProgress` evita runs concorrentes.
+- **Decisões em casos NÃO especificados pela tarefa** (documentar se virarem
+  bug): (a) uuid em `diskPathByUuid` mas AUSENTE do listScripts fresco (script
+  deletado no Studio enquanto fechado) → NÃO deleta o arquivo local
+  (não-destrutivo), só loga warn; deleção Studio→disco não é propagada nesta
+  versão. (b) arquivo removido do disco externamente mas com `cache` presente →
+  também não-destrutivo, só loga (deleção disco→Studio já não era propagada
+  desde o M2). (c) `cache` undefined mas os dois lados existem e divergem →
+  tratado como conflito (safe).
+- **Guarda no comando**: `service.isClientConnected()` (novo passthrough em
+  SyncTeamService → `SyncServer.isClientConnected`) antes de disparar — senão o
+  `listScripts` interno falha com "nenhum plugin conectado". Sem plugin/sem
+  serviço/já em andamento → mensagem clara, não roda.
+- **Status bar NÃO foi adicionada** — é domínio do `ui-dev` (regra de
+  workflow); implementei só o comando (Command Palette via package.json
+  `contributes.commands`, que é ponto de integração, não UI visual). Sinalizar
+  ao orquestrador se quiser um atalho na status bar / ícone / progress
+  notification durante o refresh.
+- **Setup de teste do merge**: `runInitialSync` com `transport.sources` pré-
+  populado dá o baseline `disco==Studio==cache`; depois `writeTmp` (escreve no
+  tmpdir direto, bypassando a ponte) simula edição externa de disco e
+  `transport.sources.set` simula edição do Studio. Provar que o baseline foi
+  atualizado no caso "convergiram" (caso 5): segundo refresh com só o Studio
+  voltando pro valor antigo vira caso 4 e escreve — se o baseline não tivesse
+  movido, seria conflito. 28 testes no syncBridge.test.ts (era 20), 108 no
+  total. `tsc`/`vitest`/`esbuild` limpos.
+
+## Heartbeat WS ping/pong + notificações de conexão (2026-07-15)
+
+Bug do usuário: após "Reload Window" do VS Code (mata o processo da extensão,
+derruba o servidor WS SEM mandar frame de close), o painel do plugin no Studio
+ficava mostrando "conectado" por tempo indefinido, porque a queda só era
+detectada pelos eventos `Closed`/`Error` do WebStreamClient — que não disparam
+num kill abrupto. Fix definitivo: heartbeat ativo nos dois lados.
+
+### CONTRATO ping/pong que o lado Luau (luau-dev) PRECISA espelhar
+
+- **Aditivo ao protocolo, SEM bump de `PROTOCOL_VERSION`** (mesmo precedente de
+  `leaseChanged`/`presenceUpdate`). Dois `kind` novos em `protocol.ts`:
+  `PingMessage {kind:"ping"}` (extensão→plugin) e `PongMessage {kind:"pong"}`
+  (plugin→extensão). Ambos sem `requestId`/ack — são espontâneos.
+- **Extensão→plugin**: o `SyncServer` manda `{"kind":"ping"}` a cada
+  **5000ms** (`DEFAULT_HEARTBEAT_INTERVAL_MS`) enquanto houver plugin conectado
+  (começa logo após aceitar o `hello`).
+- **Plugin→extensão (a implementar pelo luau-dev)**: ao receber `{kind:"ping"}`
+  no `MessageReceived`, responder com `{"kind":"pong"}` (via
+  `client:Send(HttpService:JSONEncode({kind="pong"}))`). Qualquer outra
+  mensagem do plugin também conta como sinal de vida para a extensão — o pong é
+  só a resposta barata dedicada quando não há mais nada a dizer.
+- **Detecção do lado da extensão (já implementada)**: se NENHUMA mensagem (pong
+  OU qualquer outra) chegar do plugin em **15000ms**
+  (`DEFAULT_HEARTBEAT_TIMEOUT_MS` = 3x o intervalo — tolera até 2 pings
+  perdidos sem falso positivo), a extensão trata como morto: `socket.terminate()`
+  → dispara o handler de `close` → `onClientDisconnected` → `ConnectionState`
+  vira desconectada, MESMO que o TCP nunca tenha avisado. É exatamente o
+  requisito "fecha a conexão do lado do servidor e atualiza estado sem depender
+  do socket avisar".
+- **Detecção do lado do plugin (a implementar pelo luau-dev, é o que conserta o
+  BUG relatado)**: o plugin deve considerar a extensão morta se não receber
+  nenhum `ping` (nem outra mensagem) da extensão dentro de um timeout análogo
+  (sugestão: mesmo 3x do intervalo que a extensão usa = ~15s, ou 2-3 pings
+  perdidos). Com pings a cada 5s, o painel do Studio detecta a queda em ~15s em
+  vez de "indefinido". Sem isso do lado Luau, o bug do painel continua — o meu
+  lado só GARANTE que os pings chegam de 5 em 5s para o plugin poder contar.
+
+### Onde ficou o código (extensão)
+
+- `src/sync/HeartbeatMonitor.ts` — módulo PURO (sem `ws`/`vscode`), testável com
+  timers fake. `start()`/`recordActivity()`/`stop()`/`isRunning()`; construtor
+  recebe `intervalMs`/`timeoutMs`/`sendPing`/`onTimeout`/`now?`/`onDeadLog?`.
+  Relógio (`now`) injetável só para robustez de teste; na prática usa `Date.now`
+  (que o `vi.useFakeTimers()` do vitest também controla). Comparação de timeout é
+  estritamente `>` — silêncio == timeoutMs ainda manda ping; estoura no tick
+  seguinte (por isso a detecção real acontece em ~4x o intervalo, não 3x — ok,
+  dá margem). `tick()` chama `stop()` ANTES de `onTimeout()` pra evitar
+  reentrância (onTimeout fecha o socket → handler de close chama `stop()` de
+  novo, idempotente).
+- `src/sync/SyncServer.ts` — construtor mudou de 3º param posicional
+  `requestTimeoutMs` para um objeto `SyncServerOptions`
+  (`{requestTimeoutMs?, heartbeatIntervalMs?, heartbeatTimeoutMs?}`). Nenhum
+  caller passava o 3º param posicional, então foi seguro
+  (`new SyncServer(port, logger)` continua igual). `startHeartbeat(socket)`
+  criado em `handleHello` no sucesso; `recordActivity()` chamado no TOPO do
+  handler de `message` (antes até do parse — qualquer frame conta); `pong`
+  engolido (não vai pro `onSpontaneous`, evita "kind desconhecido"); `ping`
+  vindo do plugin (fora do contrato) responde `pong` por robustez. Heartbeat
+  parado/nulo em `close` e em `stop()`.
+- **Pegadinha que confirmei lendo o fluxo**: `SyncServer.stop()` zera
+  `this.client = null` logo após `client.close()`, e o handler de `close` tem
+  guard `if (this.client === socket)`. Consequência: numa parada DELIBERADA do
+  servidor (stop/restart/setPort) o `onClientDisconnected` NÃO dispara. Só
+  dispara em desconexão-surpresa (peer fechou, ou `terminate()` do heartbeat).
+  Isso é o que deixa a notificação "plugin desconectou" ser precisa (sem ruído
+  ao parar o servidor de propósito) — usei isso de propósito.
+
+### Notificações visíveis (Pedido 2)
+
+- Reaproveitei o padrão de callback `setOnX` já estabelecido (não inventei
+  mecanismo novo): 3 callbacks novos em `SyncTeamService` —
+  `setOnPluginConnected` / `setOnPluginDisconnected` / `setOnProtocolError`.
+  `extension.ts` liga cada um a `showInformationMessage` (conectou) /
+  `showWarningMessage` (desconectou) / `showErrorMessage` (protocolo
+  incompatível). Os dois primeiros disparam dos handlers
+  `onClientConnected`/`onClientDisconnected` do `SyncServer` (sinal preciso:
+  eventos reais de socket, não start/stop do servidor — ver pegadinha acima).
+  O protocolo-error é um caminho novo em `SyncServer.handleHello`: no mismatch
+  de `protocolVersion` chama `handlers.onProtocolError(msg)` além do log/close
+  1002 que já existiam.
+- **Decisão de UX**: notifico em TODA conexão real (não só a "primeira") —
+  reconexão após queda também mostra "conectado", o que é útil (confirma
+  recuperação). Desconexão só notifica em queda-surpresa. Escolhi
+  `showWarningMessage` (não error) para desconexão porque é recuperável e o
+  servidor continua no ar esperando reconexão.
+
+### Testes (127 no total, +9)
+
+- `test/heartbeatMonitor.test.ts` (6, timers fake): silêncio→timeout; pong/
+  atividade mantém vivo; `stop()` cancela; `start()` idempotente; recordActivity
+  fora do ciclo é no-op; `onDeadLog` com o silêncio medido.
+- `test/syncServer.test.ts` (3, socket ws REAL em 127.0.0.1 = "plugin fake",
+  timers reais curtos 30ms/90ms): plugin que ignora pings é desconectado sem
+  frame de close (`isClientConnected()` vira false); pong mantém vivo + ping é
+  enviado + pong não vira espontâneo; protocolVersion incompatível dispara
+  `onProtocolError` e fecha 1002. Helper `getFreePort()` via `net` (efêmera +
+  close) porque o `SyncServer` recebe porta fixa e não expõe a atribuída.
+- `npm run lint` (tsc) limpo, `npm test` 127/127, `npm run build` gera os dois
+  bundles (`dist/extension.js`, `dist/run-node-harness.js`).
+- **Não testado em Studio real**: o round-trip do heartbeat depende do lado
+  Luau responder `pong` E implementar a própria detecção de ping ausente — isso
+  é tarefa do luau-dev (o contrato acima é o que ele precisa seguir). Só validei
+  o lado da extensão com plugin fake.
+
+## Rejeição de 2ª conexão avisa o motivo por MENSAGEM antes do close (2026-07-15)
+
+Contexto: `WebStreamClient` do plugin NÃO consegue ler o close code nem o reason
+de um close (evento `Closed()` do Luau não tem parâmetro — doc oficial,
+`.claude/research/2026-07-15-webstreamclient-close-code.md`). Então o
+`socket.close(1013, "...")` que já rejeitava a 2ª conexão em `handleConnection`
+não dava NENHUM aviso legível ao plugin — só um retry loop genérico.
+
+- **Fix em `SyncServer.handleConnection`** (bloco de rejeição de 2º cliente):
+  ANTES de `socket.close(1013, ...)`, mando uma mensagem de aplicação de verdade
+  `{kind:"connectionRejected", reason:"port_in_use"}` (que `MessageReceived`
+  recebe normalmente — esse canal funciona, diferente do close). Uso o CALLBACK
+  do `send()` da lib `ws` (assinatura confirmada no
+  `node_modules/@types/ws/index.d.ts`: `send(data, cb?: (err?: Error) => void)`)
+  para só chamar `socket.close()` DEPOIS que o envio confirmar — evita a corrida
+  em que `close` engole o frame antes de ele sair. `err` é logado como erro se
+  presente, mas o close acontece de qualquer jeito.
+- **`connectionRejected` é ADITIVA ao protocolo, SEM bump de `PROTOCOL_VERSION`**
+  (mesmo precedente de `ping`/`leaseChanged`/`presenceUpdate`). Documentada como
+  `ConnectionRejectedMessage` em `protocol.ts`. `reason` é STRING (não booleano)
+  de propósito — pode crescer (ex.: um dia rejeição por versão incompatível
+  poderia reusar o mesmo formato), mas HOJE o único valor é `"port_in_use"` e
+  NÃO mexi no fluxo separado de rejeição por `protocolVersion` (que continua
+  fechando 1002 + `onProtocolError`, sem mensagem `connectionRejected`).
+- **Teste** (`syncServer.test.ts`, "segunda conexão recebe connectionRejected
+  ANTES do close", agora 4 testes no arquivo, 128 no total): 1º plugin conecta
+  e vira dono; 2º plugin ws real registra a ORDEM dos eventos num array
+  (`["message","close"]`) e confirma `reason==="port_in_use"`, `closeCode===1013`,
+  e que o 1º plugin continua conectado. **Pegadinha que me mordeu**: anexei os
+  listeners de `message`/`close` DEPOIS de `await openClient` e o teste falhou
+  (`rejected` null) — o frame de rejeição chega cedo demais e se perde se o
+  listener não estiver anexado. Corrigido construindo o `new WebSocket(...)`
+  direto e anexando `message`/`close` na CONSTRUÇÃO (antes de "open"). Vale para
+  qualquer teste futuro que dependa de uma mensagem que o servidor manda
+  imediatamente na conexão.
+- **Verificação**: `npm run lint` (tsc) limpo, `npm test` 128/128, `npm run build`
+  gera os dois bundles (`dist/extension.js`, `dist/run-node-harness.js`).
+- **Contrato para o luau-dev** (não implementado aqui, sinalizar ao
+  orquestrador): o plugin pode tratar `{kind:"connectionRejected",
+  reason:"port_in_use"}` chegando em `MessageReceived` como "porta já tem outro
+  plugin" e mostrar isso ao usuário no painel, em vez do retry silencioso. É o
+  único jeito de o plugin saber o motivo — o close não carrega nada.
+
+## Comandos start/stop/restart/setPort agora dão feedback visível (2026-07-15)
+
+Bug do usuário: rodar `SyncTeam: Iniciar servidor` pelo Command Palette não
+confirmava NADA visível (sucesso OU falha só iam para o Output channel), então
+o usuário não sabia se o servidor subiu, falhou (ex.: `EADDRINUSE`/porta em uso)
+ou travou.
+
+- **Onde a mensageria vive: DENTRO do `SyncController`, roteada por
+  `host.info`/`host.error`** — NÃO nos handlers de comando em `extension.ts`.
+  Motivo decisivo é testabilidade: os testes vitest não tocam `vscode`, então a
+  única forma de asserir "mostrou info com a porta certa / mostrou error com o
+  motivo" é um FakeHost capturando `info`/`error`. Handlers de comando em
+  `extension.ts` chamam `vscode.window.showX` direto e seriam intestáveis.
+  Segui o precedente que já existia (o `host.info` das mensagens idempotentes já
+  passava por aqui exatamente por isso).
+- **`SyncControllerHost` ganhou `error(message)`** (par do `info` já existente;
+  `extension.ts` liga a `showErrorMessage`). E **`startService` mudou de
+  `Promise<boolean>` para `Promise<StartServiceResult>`** (`{ ok: boolean;
+  reason?: string }`) — o `boolean` perdia o MOTIVO da falha, que o usuário
+  precisa ver. Os 4 pontos de `return` em `extension.ts::startService` agora
+  devolvem `reason` legível: sem `default.project.json`, sem ponto de montagem,
+  e o `catch` do `service.start()` (que é onde `EADDRINUSE` aparece) →
+  `erro ao abrir a porta N — <message>`.
+- **As assinaturas PÚBLICAS de `start/stop/restart/setPort` continuam
+  `Promise<void>`** (a tarefa pediu para não mudá-las sem necessidade). Só
+  adicionei um `options?: { announce?: boolean }` opcional ao `start` — ver
+  abaixo.
+- **`announce` existe por causa do autostart**: se a mensageria fosse
+  incondicional em `start()`, o autostart (roda a cada abertura de workspace,
+  já que `activationEvents` é `workspaceContains:**/default.project.json`)
+  poparia "servidor iniciado na porta N" TODA vez — spam. Então
+  `extension.ts` chama `controller.start({ announce: false })` no autostart
+  (silencioso em sucesso E falha, idêntico ao comportamento anterior); os
+  comandos usam o default `announce: true`. Decisão consciente: **falha de
+  autostart continua só no log**, não popa — se algum dia quiserem surfaçar
+  falha de autostart (mesma classe do bug original), é um `announce` de dois
+  campos (announceSuccess/announceFailure) ou similar; deixei fora de escopo.
+- **`doStart(announce)` é o núcleo compartilhado** por start/restart/setPort:
+  lê `getConfiguredPort()`, chama o host, atualiza `running`, emite estado e (se
+  announce) mostra info-sucesso-com-porta ou error-falha-com-motivo. Tem
+  `try/catch` em volta do `host.startService` mesmo o contrato dizendo que ele
+  nunca lança — a tarefa exigia que "qualquer exceção de start()" virasse
+  feedback, e a cadeia de comando não pode terminar numa Promise rejeitada
+  borbulhando pro `registerCommand` (que a engoliria sem UI). Exceção → falha
+  anunciada, `start()` resolve normalmente.
+- **`restart` mostra só o resultado do START** (um popup "iniciado na porta N"),
+  não "parado" + "iniciado" (dois popups = ruído). `setPort` válido →
+  `setConfiguredPort` + `restart` → mesmo popup, agora com a porta NOVA; se o
+  restart falhar (porta nova ocupada), mostra o error — a cadeia do setPort
+  nunca termina em silêncio. `setPort` cancelado/ inválido (`parsePortInput`
+  === null) continua no-op silencioso (correto: usuário desistiu).
+- **Mensagem idempotente de start ganhou a porta**: era "o servidor já está
+  rodando.", agora "...na porta N." (o controller tem `this.currentPort`). Stop
+  idempotente ("já está parado.") ficou igual.
+- **Teste**: `test/syncController.test.ts` NOVO (13 testes), FakeHost
+  implementando `SyncControllerHost` com arrays `infos`/`errors` +
+  `nextStartResult`/`startThrows` configuráveis + contadores
+  (`startCalls`/`stopCalls`/`setPortCalls`) para asserir idempotência. Cobre:
+  start sucesso (info+porta), start falha (error+motivo), start exceção (resolve
+  sem rejeitar), start já-rodando (não rechama startService), stop sucesso/já-
+  parado, restart sucesso/falha, setPort válido/restart-falha/cancelado, e os
+  dois caminhos de `announce:false` (autostart silencioso em sucesso e falha).
+- **Verificação**: `npm run lint` (tsc) limpo, `npm test` 141/141 (era 128,
+  +13), `npm run build` gera os dois bundles (`dist/extension.js`,
+  `dist/run-node-harness.js`). **Não testado em VS Code real** — só a lógica do
+  controller com FakeHost; a fiação `host.info`/`host.error` →
+  `showInformationMessage`/`showErrorMessage` em `extension.ts` é trivial e não
+  coberta por teste (nenhum teste toca `vscode`, limitação de sempre).
+
+## `syncteam.multiSync` — N Studios na mesma porta/extensão (2026-07-15)
+
+Feature pedida pelo usuário: cenário de 1 dev com 2 contas Roblox/2 Studios na
+MESMA máquina testando multiplayer, sincronizando os dois com 1 VS Code só (em
+vez de precisar de 2 janelas de VS Code em portas diferentes). Setting novo
+`syncteam.multiSync` (boolean, default `false`) — com o default, o
+comportamento é EXATAMENTE o de antes (2º cliente rejeitado com
+`connectionRejected`/`port_in_use`), confirmado pelos 4 testes de heartbeat/
+rejeição pré-existentes continuando a passar sem alteração nenhuma.
+
+- **`SyncServer.ts`**: `this.client: WebSocket | null` → `this.clients: Set<WebSocket>`
+  + `this.heartbeats: Map<WebSocket, HeartbeatMonitor>` (cada plugin tem seu
+  PRÓPRIO monitor de heartbeat — importante: `sendPing`/`onTimeout` fecham
+  sobre O SOCKET ESPECÍFICO, nunca broadcast; um plugin lento/morto não afeta
+  o relógio de silêncio dos outros). `isClientConnected()` = `openClients().length > 0`;
+  `getConnectedCount()` novo (passthrough até `SyncTeamService.getConnectedCount()`,
+  não fiado em nenhuma UI ainda — ver decisão de escopo abaixo).
+- **`handleConnection`**: a rejeição do 2º cliente agora é `if (!this.multiSync && this.openClients().length > 0)`
+  — com `multiSync=true` simplesmente não entra nesse bloco e segue o fluxo
+  normal de hello para qualquer número de conexões.
+- **Broadcast de saída (`send()`)**: mudou de "manda pro `this.client`" para
+  "manda pra TODOS os `openClients()`". Funciona igual com 1 ou N clientes —
+  **não precisou de nenhum `if (multiSync)` no `send()`**, porque com
+  `multiSync=false` o Set nunca tem mais de 1 elemento mesmo (a rejeição em
+  `handleConnection` garante isso antes de qualquer hello). Isso cobre
+  `request()` e `sendSpontaneous()` de graça, sem duplicar lógica.
+- **Pegadinha real que peguei DURANTE a implementação (não estava no desenho
+  original)**: o `sendPing` do heartbeat e a resposta a um `ping` vindo do
+  plugin (`message.kind === "ping"` no handler de `message`) usavam
+  `this.send(...)` — que agora é broadcast! Isso faria CADA heartbeat/pong
+  vazar para TODOS os clientes conectados (ping de um plugin sendo mandado
+  também pro outro, resposta de pong indo pros dois). Corrigido: ambos usam
+  `socket.send(...)` DIRETO no socket específico (com guard
+  `socket.readyState === socket.OPEN`), nunca `this.send`. `this.send` (via
+  `request`/`sendSpontaneous`) continua sendo o único caminho de broadcast
+  de verdade — reservado para mensagens que fazem sentido pra todos os
+  Studios (writeSource, presenceUpdate encaminhado), nunca para eco 1:1 como
+  ping/pong.
+- **`request()` — primeira resposta vence**: NENHUMA mudança de código foi
+  necessária além do broadcast em `send()`. `resolvePending` já deletava a
+  entrada do `pending` map ao resolver — uma 2ª resposta com o mesmo
+  `requestId` (de um 2º plugin respondendo à mesma requisição broadcast) não
+  encontra mais a entrada, `resolvePending` retorna `false`, e a mensagem cai
+  no fallback `handlers?.onSpontaneous(message)`. Isso é seguro: os `kind`s de
+  resposta (`scriptList`/`sourceContent`/`writeAck`) não são tratados no
+  `switch` de `SyncTeamService.routeSpontaneous`, então caem no `default` e só
+  geram um log informativo "kind desconhecido ignorado" — nenhum erro, nenhum
+  crash. Testado explicitamente (`syncServer.test.ts`, "request() broadcast...
+  resolve na PRIMEIRA resposta e ignora a 2ª sem erro") fazendo o 2º cliente
+  responder com delay de 30ms de propósito.
+- **Desconexão de 1 cliente entre N**: o handler de `close` só chama
+  `rejectAllPending` quando `this.clients.size === 0` DEPOIS de remover o
+  socket que caiu — se outros plugins continuam conectados, uma requisição
+  pendente pode ainda ser respondida por eles (ou estoura no timeout normal).
+  `onClientDisconnected` ainda dispara por conexão individual (não é
+  "resetado" globalmente) — ver decisão de escopo abaixo sobre
+  `SyncTeamService` reagir a isso por conexão, não por servidor.
+- **Dedupe de espontânea duplicada (`SyncTeamService.routeSpontaneous`)**:
+  novo campo `multiSync: boolean` no construtor (default `false`, ÚLTIMO
+  parâmetro — todo call site existente que não passa continua com o
+  comportamento de sempre). Guarda simples (`lastSpontaneousSignature`/
+  `lastSpontaneousAt`, SEM histórico, "simples e barato" como pedido):
+  `computeSpontaneousSignature(message)` extrai só os campos relevantes por
+  `kind` (`sourceChanged`→uuid+source, `scriptAdded`→uuid+path+className,
+  etc.; fallback `JSON.stringify` genérico pra `kind` não listado) —
+  DELIBERADAMENTE não usa `JSON.stringify(message)` inteiro pra tudo, porque
+  campos informativos como `origin`/`via` em `sourceChanged` poderiam variar
+  entre os 2 Studios reportando o MESMO evento e mascarar uma duplicata real.
+  Janela: **800ms** (escolhida dentro do range sugerido 500ms-1s). Só ativo
+  quando `this.multiSync` é `true` — com o default, `routeSpontaneous` nem
+  entra no bloco de checagem, então NENHUMA mudança de comportamento pro caso
+  default (confirmado por teste dedicado comparando multiSync=true vs false
+  com a MESMA sequência de mensagens).
+- **`getConnectedCount()`**: adicionei em `SyncServer` e `SyncTeamService`
+  (passthrough simples) pensando no comentário da tarefa sobre
+  `ConnectionState.connected: boolean` virar `connectedCount: number` no
+  futuro. **Decisão deliberada de NÃO mexer em `ConnectionState`/`SyncController`
+  agora** — mudar o tipo exposto pro `ui-dev` sem necessidade concreta desta
+  fatia (nenhum consumidor pede isso ainda) é risco desnecessário; deixei só
+  o método novo disponível para quem quiser consumir depois. Sinalizar ao
+  `ui-dev`/orquestrador se quiserem "N Studios conectados" na status bar.
+- **Item 5 da tarefa (clientId nos logs) — implementado PARCIALMENTE por
+  decisão consciente**: o log de conexão aceita (`handleHello`) agora inclui
+  `clientId=...` e a contagem atual de plugins conectados. NÃO propaguei
+  `clientId` para dentro de cada mensagem espontânea individual roteada em
+  `SyncTeamService` (`sourceChanged`/`scriptAdded`/etc.) porque o protocolo
+  não carrega "qual socket originou" nessas mensagens — só o socket sabe, e
+  `SyncServer.handlers.onSpontaneous(message)` não repassa a origem. Adicionar
+  isso exigiria mudar a assinatura de `onSpontaneous` (2º parâmetro com
+  metadado da conexão) — fora de escopo desta fatia por ser mudança maior de
+  contrato; documentado aqui para quem quiser puxar depois.
+- **`package.json`**: `syncteam.multiSync` (boolean, default `false`) em
+  `contributes.configuration`. `extension.ts::startService` lê a config uma
+  vez no início (mesmo padrão de `syncteam.port`/`autoStart` — mudar a config
+  exige stop+start/restart pra ter efeito) e passa pro `SyncServer` (opção
+  `multiSync`) E pro `SyncTeamService` (5º parâmetro construtor).
+- **Testes**: `syncServer.test.ts` ganhou `describe("SyncServer — multiSync")`
+  (4 testes nos, 8 no total do arquivo): 2 conectam sem rejeição +
+  `getConnectedCount()`; broadcast de `sendSpontaneous` chega nos 2;
+  `request()` resolve na 1ª resposta e a 2ª (atrasada de propósito) cai em
+  `onSpontaneous` sem erro; desconectar 1 não afeta o outro
+  (`getConnectedCount()` cai pra 1, `isClientConnected()` continua `true`).
+  `syncTeamService.test.ts` ganhou `describe(".. — dedupe multiSync")` (4
+  testes): duplicata idêntica é descartada com `multiSync=true`; a MESMA
+  duplicata NÃO é descartada com `multiSync=false` (prova de não-regressão);
+  uuids diferentes não dedupem; mesmo uuid com conteúdo DIFERENTE
+  (`sourceChanged`) não dedupe. **150 testes no total** (era 141, +9).
+- **Verificação**: `npm run lint` (tsc) limpo, `npm test` 150/150, `npm run build`
+  gera os dois bundles. **Não testado com 2 Studios reais** — só a lógica com
+  ws real (2 clientes fake) e fakes de `SyncBridge`/logger; validação de
+  verdade (2 contas Roblox no mesmo VS Code) fica pro roteiro manual em
+  `docs/PROJECT_STATUS.md` se o usuário quiser confirmar antes do M5.
+- **Nenhuma das decisões do desenho original precisou de desvio** — os 3
+  pontos que a tarefa marcou como "pare e sinalize se não bater" (broadcast
+  de saída, `request()` primeira-resposta-vence, dedupe de espontânea) todos
+  encaixaram de forma limpa na estrutura existente; a única surpresa foi a
+  pegadinha do ping/pong vazando por broadcast (documentada acima), que não
+  era uma decisão de desenho, só um bug que eu mesmo teria introduzido se não
+  tivesse revisado todo uso de `this.send`.
+
+## Exclusão de pastas de pacotes Wally do live-edit-sync (2026-07-16)
+
+Tarefa em paralelo com `luau-dev` (que fez o lado plugin em `Config.luau`/
+`SourceWatcher.luau`/`init.server.luau`, ver `docs/DECISIONS.md` mesma data).
+Motivo: dois devs com `Packages/` locais divergentes (wally.lock desatualizado)
+não podem empurrar Source de pacote vendorizado um pro outro via Team Create.
+
+- **Módulo puro novo**: `src/mapping/wallyPackageFolders.ts`
+  (`isExcludedPackageFolderName`/`isInsideExcludedPackageFolder`), mesmo
+  padrão de `rojoPathMapping.ts` (sem I/O, sem `vscode`). Contrato de nomes
+  EXATO combinado com o luau-dev: `"Packages"`, `"ServerPackages"`,
+  `"DevPackages"`, case-sensitive, segmento INTEIRO do path (nunca
+  substring — `"MyPackagesFolder"` não conta, mas `"src/Packages"` conta
+  porque `"Packages"` é um segmento exato ali).
+- **Distinção crítica que guiou toda a implementação: CRIAÇÃO sempre passa,
+  só ATUALIZAÇÃO de conteúdo já existente é bloqueada.** Isso significa que o
+  check nunca vai no início de uma função genérica — sempre DEPOIS de saber
+  que o script/arquivo já tinha uuid conhecido (update), nunca no ramo de
+  "uuid ainda não visto" (create). Os 3 pontos de integração em
+  `SyncBridge.ts`:
+  1. `handleSourceChanged` (Studio→disco, mensagem espontânea de verdade,
+     não é a leitura inicial de `runInitialSync`/`scriptAdded`): early-return
+     ANTES de `applyStudioContent`, checando `this.scripts.get(uuid)?.path`
+     (fallback pro `message.path` informativo se por algum motivo o uuid
+     ainda não estiver em `this.scripts`).
+  2. `handleLocalFileChange`, SÓ dentro do ramo `knownUuid !== undefined`
+     (update): early-return antes de tocar `contentCache`/mandar
+     `writeSource`. O ramo de baixo (uuid desconhecido = criação) fica
+     intocado — segue funcionando normal dentro dessas pastas, porque é
+     assim que um pacote novo aparece no Studio pela primeira vez.
+  3. `reconcileUuidOnRefresh` (Refresh Sync/merge de 3 vias) — o mais
+     delicado dos três porque tem 5+ ramos. Calculei `excluded` uma vez logo
+     depois de confirmar `diskPath !== undefined` (usando
+     `pluginScripts.get(uuid)?.path`, o listScripts FRESCO, não o antigo
+     `this.scripts`) e só apliquei o skip nos ramos que fazem PUSH (só disco
+     mudou → skip; só Studio mudou → skip) ou reportam CONFLITO (com ou sem
+     ancestral no `contentCache` → skip, sem chamar `onSyncConflict`, log
+     `info` em vez de `warn`). Os ramos "descoberto só no Studio, sem arquivo
+     local → pull" e "convergiram → atualiza baseline" ficaram SEM check —
+     não são push nem conflito, são descoberta/bookkeeping que a tarefa
+     pediu para preservar. `reconcileDiskOnlyFiles` (arquivo só em disco,
+     uuid nunca visto → cria) também ficou sem check nenhum, mesmo raciocínio
+     do item 2.
+- **Decisão consciente ao pular update em pasta excluída**: NÃO atualizo
+  `contentCache` no early-return (nem em `handleSourceChanged` nem em
+  `handleLocalFileChange`) — não haveria ganho (o conteúdo não foi de fato
+  sincronizado) e deixar o cache "congelado" no último valor realmente
+  sincronizado é o que faz `reconcileUuidOnRefresh` continuar vendo a
+  divergência do jeito certo numa reconciliação futura (se um dia a exclusão
+  for removida/ajustada, o histórico de divergência não se perde
+  silenciosamente).
+- **Testes**: `test/wallyPackageFolders.test.ts` (13, função pura — nomes
+  exatos, substring não conta, segmento em qualquer posição, path vazio,
+  funciona igual para diskPath com extensão). `test/syncBridge.test.ts` ganhou
+  um `describe` dedicado (3 testes: skip de `sourceChanged`, skip de update
+  local, criação local dentro de `DevPackages` continua funcionando) mais um
+  sub-`describe` dentro do bloco de `refreshSync` (4 testes: só disco mudou
+  ignorado, só Studio mudou ignorado, conflito genuíno SEM `onSyncConflict`
+  disparado, criação nova via `reconcileDiskOnlyFiles` continua funcionando).
+  179 testes no total (era 172). `npx tsc --noEmit` limpo, `npx vitest run
+  --pool=threads` 179/179 (pool forks quebra neste ambiente, sempre
+  `--pool=threads`), `npm run build` gera os dois bundles sem erro.
+- **Não testado em Studio real** — mesma limitação do lado luau-dev; fica
+  `[Hipótese]` até round-trip real (instalar pacote Wally de verdade, editar
+  pelos dois lados, confirmar que nada vaza).

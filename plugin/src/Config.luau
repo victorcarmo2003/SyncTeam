@@ -13,7 +13,7 @@ local Config = {}
 -- Escolhida nova (não reutiliza 34901/34902, usadas pelos spikes M0/M0.5) só
 -- para não colidir se algum spike antigo ainda estiver instalado/rodando ao
 -- mesmo tempo que o plugin de produto.
-Config.DEFAULT_PORT = 34980
+Config.DEFAULT_PORT = 1400
 
 -- Chave de plugin:GetSetting/SetSetting para permitir porta configurável sem
 -- reescrever código (regra de "porta configurável com default fixo" de
@@ -21,6 +21,13 @@ Config.DEFAULT_PORT = 34980
 -- UI para setar isso — usuário avançado pode chamar
 -- plugin:SetSetting("SyncTeam_WsPort", <porta>) pelo Command Bar do Studio.
 Config.PORT_SETTING_KEY = "SyncTeam_WsPort"
+
+-- Chave de plugin:GetSetting/SetSetting para a única opção real das
+-- configurações do painel de status (M4.5, plugin/src/ui/): "Mostrar
+-- notificações" — controla só se o TOAST aparece (Toast.luau); o log no
+-- Output nunca é condicionado a isso (Logger.notify sempre loga, ver
+-- Logger.luau). Default true (ligado) quando a setting nunca foi tocada.
+Config.NOTIFICATIONS_SETTING_KEY = "SyncTeam_ShowNotifications"
 
 -- Lista de portas candidatas usada SÓ quando não há nenhuma porta
 -- explicitamente persistida em plugin:GetSetting(PORT_SETTING_KEY) (nem por
@@ -32,7 +39,7 @@ Config.PORT_SETTING_KEY = "SyncTeam_WsPort"
 -- docs/PROJECT_STATUS.md). Em uso normal de produção (1 dev, 1 extensão) só
 -- a primeira porta desta lista chega a importar; a segunda nunca é
 -- alcançada porque a primeira tentativa já conecta.
-Config.CANDIDATE_PORTS = { 34980, 34981 }
+Config.CANDIDATE_PORTS = { 1400, 1401 }
 
 -- Janela curta (segundos) usada só para o heurístico de "rejeição
 -- provável" da auto-descoberta de porta (init.server.luau, runConnection):
@@ -60,6 +67,23 @@ Config.POLL_INTERVAL_SECONDS = 0.5
 
 Config.RECONNECT_SECONDS = 3
 
+-- Detecção de conexão morta por AUSÊNCIA de mensagens (init.server.luau,
+-- runConnection). Garantia independente dos eventos Closed/Error do
+-- WebStreamClient, que podem NÃO disparar quando o servidor WS da extensão
+-- morre sem enviar frame de close (ex.: "Reload Window" do VS Code mata o
+-- processo da extensão). A extensão manda `{kind:"ping"}` a cada 5s enquanto
+-- conectada (vscode-extension HeartbeatMonitor.ts) e ela mesma derruba a
+-- conexão se ficar 15s sem receber NENHUMA mensagem do plugin. Do lado do
+-- plugin: se passar este intervalo sem receber NENHUMA mensagem (nem o ping
+-- periódico, nem qualquer outra), a conexão é tratada como morta e forçamos
+-- reconexão. Escolhido 20s (4 intervalos de ping) em vez de 15s: dá 1 ping de
+-- folga sobre o timeout da extensão, evitando um teardown falso por um único
+-- ping atrasado/perdido, ao custo de no máximo ~5s a mais exibindo "conectado"
+-- após uma queda real — aceitável (o bug original era ficar "conectado" por
+-- MUITO mais que isso). Só o plugin RESPONDE ao ping (pong); nunca origina
+-- ping próprio — a ausência do ping da extensão é o único sinal usado aqui.
+Config.DEAD_CONNECTION_TIMEOUT_SECONDS = 20
+
 -- Handshake versionado (M1: começou em 1). Bump para 2 no M2 (breaking change
 -- deliberado, docs/MILESTONES.md): readSource/writeSource passam a endereçar
 -- por UUID (ScriptRegistry) em vez de path; writeSource sem `uuid` continua
@@ -67,6 +91,45 @@ Config.RECONNECT_SECONDS = 3
 -- scriptMoved. Extensão decide o que fazer em mismatch de versão.
 Config.PROTOCOL_VERSION = 2
 Config.PLUGIN_VERSION = "0.2.0"
+
+-- Nomes de pasta que marcam árvore de dependências vendorizadas por Wally
+-- (https://wally.sh) — convenção padrão: `Packages/` é a mais comum, mas
+-- projetos com dependências separadas por lado (server/client/dev) também
+-- usam `ServerPackages`/`DevPackages`. Risco de arquitetura (2026-07-16,
+-- aprovado pelo usuário, ver docs/DECISIONS.md): dois devs podem ter
+-- `wally.lock`/pastas `Packages/` locais divergentes (versão desatualizada
+-- de um lado); se o SyncTeam tratasse esses ModuleScripts como qualquer
+-- outro, o Source do pacote vendorizado desatualizado de um dev poderia ser
+-- empurrado ao Team Create compartilhado, alterando silenciosamente a
+-- dependência de TODOS os devs. Usado por Config.isInsideExcludedPackageFolder
+-- para excluir esses scripts do LIVE EDIT SYNC (watch de mudança de Source +
+-- arbitragem de lease) nos dois sentidos — mas NÃO do discovery/identidade
+-- (ScriptRegistry/listScripts continuam normais, para o "Refresh Sync" da
+-- extensão poder detectar "esse pacote já existe, não duplicar"; criação de
+-- instância nova continua funcionando igual, só depois de criada é que ela
+-- entra em "modo vendorizado").
+Config.SYNC_EXCLUDED_FOLDER_NAMES = {
+	Packages = true,
+	ServerPackages = true,
+	DevPackages = true,
+}
+
+-- true se `instance` estiver, em qualquer profundidade, dentro de uma pasta
+-- cujo Name é exatamente um dos SYNC_EXCLUDED_FOLDER_NAMES (sobe
+-- instance.Parent até a raiz observada/game). Usado para pular a instância
+-- APENAS do polling de mudança de Source e da arbitragem de lease — nunca do
+-- registro de identidade/listScripts/criação (ver comentário acima e
+-- docs/DECISIONS.md 2026-07-16).
+function Config.isInsideExcludedPackageFolder(instance)
+	local current = instance and instance.Parent
+	while current ~= nil do
+		if Config.SYNC_EXCLUDED_FOLDER_NAMES[current.Name] then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
 
 -- Containers observados recursivamente por Script/LocalScript/ModuleScript.
 -- Decisão M1 (docs/MILESTONES.md): plugin "burro"/genérico, lista fixa; a
@@ -108,6 +171,20 @@ function Config.resolveCandidatePorts(pluginObject)
 		return { math.floor(value) }, true
 	end
 	return Config.CANDIDATE_PORTS, false
+end
+
+-- Preferência efetiva de "Mostrar notificações" (M4.5): setting do plugin se
+-- presente e booleana, senão default true. Só GetSetting pode devolver nil
+-- (nunca setado) ou um valor de tipo errado (schema corrompido/versão
+-- antiga) — os dois caem no default, nunca erram.
+function Config.resolveNotificationsEnabled(pluginObject)
+	local ok, value = pcall(function()
+		return pluginObject:GetSetting(Config.NOTIFICATIONS_SETTING_KEY)
+	end)
+	if ok and type(value) == "boolean" then
+		return value
+	end
+	return true
 end
 
 return Config

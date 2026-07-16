@@ -580,6 +580,26 @@ local function checkLeaseDrift()
 	end)
 end
 
+-- ---------------------------------------------------------- leitura p/ UI (M4.5)
+--
+-- Read-only, pedido pelo painel de status do plugin (plugin/src/ui/): "quem
+-- está editando o quê agora" — não muda nada do ciclo de arbitragem acima,
+-- só itera Leases/<uuid> já concedidas. Reusa readLease (mesmo parser da
+-- leaderTick). ensureContainers() garante leasesFolder mesmo se chamado
+-- antes de qualquer start() (painel pode renderizar antes da eleição ligar).
+function TeamCreateLease.forEachLease(callback)
+	ensureContainers()
+	for _, folder in ipairs(leasesFolder:GetChildren()) do
+		if not folder:IsA("Folder") then
+			continue
+		end
+		local lease = readLease(folder)
+		if lease ~= nil and lease.ownerClientId ~= "" then
+			callback(folder.Name, lease.ownerClientId)
+		end
+	end
+end
+
 -- ------------------------------------------------------------ start/stop
 
 -- Roda seu PRÓPRIO task.spawn a cada PULSE_INTERVAL_SECONDS (decisão 2 do

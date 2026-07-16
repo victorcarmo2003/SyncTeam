@@ -18,6 +18,20 @@ if [ -z "$ROJO_BIN" ]; then
 	exit 1
 fi
 
+# M4.5: plugin/Packages/ (dependência Wally da lib Vide, usada pelo painel de
+# status) é gitignorada, igual a node_modules/ — precisa ser regerada aqui
+# sempre que ausente (checkout limpo, ou depois de mudar plugin/wally.toml).
+# `wally install` é idempotente/rápido quando já está tudo no lugar, então
+# rodar sempre é mais seguro do que só checar `-d Packages` (não detectaria
+# uma versão desatualizada se wally.toml mudou).
+WALLY_BIN="$(ls "$HOME"/.rokit/tool-storage/*/wally/*/wally.exe 2>/dev/null | sort -V | tail -n1)"
+if [ -z "$WALLY_BIN" ]; then
+	echo "erro: wally.exe não encontrado em ~/.rokit/tool-storage/*/wally/*/ — ajuste WALLY_BIN manualmente" >&2
+	exit 1
+fi
+echo "== wally install ($WALLY_BIN) =="
+(cd "$PLUGIN_DIR" && "$WALLY_BIN" install)
+
 echo "== rojo build ($ROJO_BIN) =="
 (cd "$PLUGIN_DIR" && "$ROJO_BIN" build -o "$PLUGIN_NAME")
 

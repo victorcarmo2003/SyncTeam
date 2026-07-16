@@ -7,3 +7,8 @@ out/
 *.log
 Tools/logs/*
 !Tools/logs/.gitkeep
+
+# Config/estado local de ferramentas de IA (não é conteúdo do SyncTeam)
+.caveman/
+.codex/
+AGENTS.md

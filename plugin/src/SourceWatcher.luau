@@ -121,6 +121,14 @@ end
 -- ------------------------------------------------------------- detecção
 
 local function checkSourceChanged(instance, via)
+	-- Pastas vendorizadas (Packages/ServerPackages/DevPackages, ver Config.luau
+	-- 2026-07-16): nunca puxar Studio->disco uma edição nelas. Retorna ANTES de
+	-- tocar lastSourceByInstance (nenhum estado de dedupe é criado para essas
+	-- instâncias) — discovery/identidade (ScriptRegistry, watchScript) continua
+	-- normal, só a detecção de mudança de Source é pulada aqui.
+	if Config.isInsideExcludedPackageFolder(instance) then
+		return
+	end
 	local current = instance.Source
 	if current == lastSourceByInstance[instance] then
 		return

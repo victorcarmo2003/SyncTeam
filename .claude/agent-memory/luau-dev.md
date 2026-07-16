@@ -3,6 +3,55 @@
 Aprendizados de API do Studio e pegadinhas de Luau encontrados no projeto.
 Atualize ao final de cada tarefa; mantenha curto e acionável.
 
+## Exclusão de pastas Wally (`Packages`/`ServerPackages`/`DevPackages`) do live edit sync, 2026-07-16
+
+- **Risco de arquitetura aprovado pelo usuário, não experimental**: plugin
+  tratava scripts vendorizados via Wally igual a qualquer outro — risco real
+  de empurrar Source de pacote desatualizado de um dev pro Team Create
+  compartilhado. Ver docs/DECISIONS.md 2026-07-16 para motivação/escopo
+  completo.
+- **`Config.SYNC_EXCLUDED_FOLDER_NAMES`** (`plugin/src/Config.luau`): tabela
+  `{Packages, ServerPackages, DevPackages}`. **
+  `Config.isInsideExcludedPackageFolder(instance)`**: sobe `instance.Parent`
+  até a raiz, `true` se algum ancestral tiver `Name` na lista. Não depende de
+  posição (raiz dos watched roots ou aninhado mais fundo).
+- **Dois pontos de enforcement, escolhidos deliberadamente para não misturar
+  discovery com watch/lease**:
+  1. `SourceWatcher.checkSourceChanged` (mesmo arquivo, mesma função usada
+     tanto pelo sinal fast-path quanto pelo polling garantido) — early
+     `return` logo no topo, ANTES de tocar `lastSourceByInstance`. Isso
+     bloqueia o sentido Studio→disco (nunca emite `sourceChanged` para script
+     vendorizado editado direto no Explorer/editor do Studio).
+  2. `init.server.luau` `handleWriteSource`, modo ATUALIZAÇÃO (`message.uuid
+     ~= nil`) — checagem logo após resolver a Instance por uuid, ANTES de
+     `TeamCreateLease.ensureIntent`/`canWrite`. Bloqueia o sentido
+     disco→Studio (writeAck `ok=false` com erro claro) e, como consequência
+     natural de retornar antes de `ensureIntent`, também nunca arbitra lease
+     para esses uuids (nunca ganham intent, nunca aparecem em `Leases/<uuid>`).
+- **Deliberadamente NÃO tocado**: `ScriptRegistry` (resolveOrAllocate/
+  forEach/getUuid) e `SourceWatcher.listScripts()` continuam normais para
+  scripts vendorizados — a extensão precisa continuar vendo a EXISTÊNCIA
+  deles via `listScripts`/uuid para o "Refresh Sync" não duplicar um pacote
+  já instalado. Modo CRIAÇÃO do `writeSource` (sem uuid) também não passa
+  pela checagem — é assim que um pacote novo chega ao Studio pela 1ª vez; só
+  DEPOIS de criado (uuid já alocado) é que a checagem de modo ATUALIZAÇÃO
+  passa a bloquear edições nele.
+- **Não precisou tocar `TeamCreateLease.checkLeaseDrift`**: como
+  `ensureIntent` nunca é chamado para uuids vendorizados, `getOwner(uuid)`
+  sempre devolve `nil` pra eles — `checkLeaseDrift` continua rodando sobre
+  todo o `ScriptRegistry` (não distingue vendorizado), mas nunca emite
+  `leaseChanged` de verdade para esses uuids (fica só na baseline "sem
+  dono"). Simplificação deliberada: evita uma dependência nova de
+  `TeamCreateLease` → `Config` só para replicar a mesma checagem que já é
+  garantida indiretamente pelo bloqueio em `init.server.luau`.
+- Validado só por `rojo build` + `lune run` (`Config.luau`, `SourceWatcher.luau`,
+  `init.server.luau`) — sem erro de sintaxe. **Nada testado em Studio real
+  nesta tarefa** — roteiro pendente: instalar pacote Wally real, editar
+  `Packages/<pacote>/init.luau` pelo Explorer (confirmar nenhum
+  `sourceChanged`), e um `writeSource` de atualização via extensão contra
+  esse uuid (confirmar `writeAck {ok=false}`). Fica `[Hipótese]` até o
+  usuário rodar isso com Studio real.
+
 - Uso validado de `CreateWebStreamClient` (RojoCoop
   `plugin/src/ApiContext.lua:230-290`): criar com pcall, eventos
   `MessageReceived`/`Closed`/`Error`, converter URL http→ws.
@@ -763,3 +812,372 @@ Atualize ao final de cada tarefa; mantenha curto e acionável.
   fecha rápido o suficiente (e sem nenhuma mensagem trafegada) pra essa
   janela nunca dar falso-negativo/falso-positivo. Roteiro manual em
   `docs/PROJECT_STATUS.md` (seção "auto-descoberta de porta").
+
+## M4 — Presença: publicar e observar cursor/seleção/arquivo ativo (`plugin/`), 2026-07-15
+
+- **Módulo novo `plugin/src/TeamCreatePresence.luau`**: passthrough puro de
+  dados opacos vindos da extensão VS Code — o plugin NUNCA lê cursor de uma
+  Instance de Script no Studio (decisão já fechada na tarefa,
+  `docs/MILESTONES.md` M4). Espelha a estrutura de `TeamCreateLease.luau`
+  quase 1:1: schema/ensure, `init(onMessage)`, `start()`/`stop()` com token de
+  geração, ciclo próprio de `task.spawn` a `Config.POLL_INTERVAL_SECONDS`
+  (mesma cadência de `checkLeaseDrift`, não `PULSE_INTERVAL_SECONDS` — mesma
+  justificativa: sinal de UX quer a responsividade da UI de sincronização,
+  não a cadência de heartbeat/eleição).
+- **Schema**: `Sessions/<clientId>/Presence/` (`ActiveScriptUuid: StringValue`
+  `""=nenhum`, `CursorLine`/`CursorColumn`/`SelectionStartLine`/
+  `SelectionStartColumn`: `IntValue` `-1=null`). Nomes e sentinelas EXATOS
+  fechados com `ui-dev` — não mudar sem registrar em DECISIONS.md e avisar o
+  outro lado. Subpasta owned exclusivamente pela própria sessão (mesmo padrão
+  de `LeaseIntents/<uuid>` em `TeamCreateLease`) — nenhuma race de criação
+  cross-Studio possível, então o `getOrCreate` local (não-reconciliador, só
+  `FindFirstChild`→`Instance.new`) é suficiente, sem precisar do
+  `getOrCreate` com reconciliação de duplicatas de `TeamCreateSchema.luau`.
+- **Escrita da própria presença é IMEDIATA ao receber `presenceUpdate`**, não
+  passa pelo ciclo de poll — só a OBSERVAÇÃO de outras sessões usa o ciclo
+  (`checkPresenceDrift`). Assimetria deliberada: escrever é só "gravar o que
+  me mandaram" (mesmo espírito de `writeSource`), não há arbitragem entre
+  Studios como em leases (que por isso tem ciclo de decisão do líder
+  separado).
+- **Escrita protegida por `pcall`** (`updateOwnPresence`): os 4 campos
+  numéricos vêm de mensagem JSON externa não confiável — `IntValue.Value`
+  exige um valor íntegro; um float fracionário do lado JS (bug ou não)
+  lançaria erro em vez de degradar. Primeira vez neste projeto que dado
+  numérico vindo direto de fora (não gerado localmente) é escrito num
+  `IntValue` — todos os outros `IntValue` do schema (`Pulse`,
+  `RequestSequence`, `JoinSequence`, `LeaderTerm`) são sempre incrementados/
+  atribuídos localmente, nunca recebem valor bruto de mensagem. Regra a levar
+  adiante: qualquer FUTURO campo numérico de protocolo escrito direto num
+  `IntValue`/`IntValue`-like deveria seguir o mesmo cuidado de `pcall`.
+- **Dedupe por chave composta (string concatenada dos 5 campos)**, não por
+  tabela — Lua compara tabelas por referência, não por valor, então uma
+  tabela nova a cada leitura nunca seria `==` à anterior mesmo com os mesmos
+  campos. Chave: `uuid|cursorLine|cursorColumn|selStartLine|selStartCol`
+  (sentinelas crus, antes de converter pra `null`) — mesmo princípio do
+  `NO_OWNER_KEY` de `TeamCreateLease.checkLeaseDrift`, estendido a múltiplos
+  campos via concatenação simples em vez de introduzir alguma lib de
+  comparação estrutural.
+- **`presenceLeft` tem DOIS gatilhos, não um só** — decisão de design que a
+  tarefa deixava implícita, não 100% explícita: (a) a sessão observada ZEROU
+  a própria presença (`ActiveScriptUuid` virou `""`) — detectado dentro do
+  loop principal de `checkPresenceDrift`, mesma passada que detectaria um
+  `presenceChanged`; (b) a sessão SUMIU inteira de `Sessions/` (Folder
+  destruído, via `stop()` síncrono do dev remoto — medido em ~3s no M3.1 — ou
+  via `cleanupStaleSessions` do líder após 20s) — detectado numa segunda
+  passada comparando o snapshot da rodada (`seenThisCycle`) contra
+  `lastPresenceByClientId`. **Não reimplementei nenhuma checagem própria de
+  staleness/Pulse de sessão aqui** — confio inteiramente no ciclo de vida já
+  existente da sessão (`TeamCreateElection`) para o Folder eventualmente
+  desaparecer; mesmo espírito de `checkLeaseDrift`, que também não duplica
+  staleness de sessão (RojoCoop fazia essa checagem dupla em
+  `__readLiveIntents`; decisão deliberada de não duplicar, aqui e lá).
+- **Baseline na primeira observação de um `clientId`** (mesmo princípio já
+  decidido e documentado para `leaseChanged` em `TeamCreateLease`): só grava,
+  nunca emite — evita rajada de mensagens para presença já existente no
+  momento em que este Studio conecta. Aplica-se tanto a `presenceChanged`
+  quanto a `presenceLeft`.
+- **`describeClient` duplicado** (não reusa `TeamCreateLease.describeClient`)
+  para não criar dependência cruzada entre os dois módulos só por ~5 linhas
+  de lookup de `Username` — mesmo raciocínio já registrado em DECISIONS.md
+  (2026-07-04) para `ScriptRegistry.reconcile`/`findRegistryEntryFor`.
+- **Deletar a chave ATUAL de uma tabela durante a própria iteração de
+  `pairs` sobre ela é seguro em Lua** (só inserir chaves NOVAS durante a
+  travessia é comportamento indefinido) — usado no loop de "sessão sumiu"
+  (`for clientId in lastPresenceByClientId do ... lastPresenceByClientId[clientId] = nil ... end`).
+  Diferente do cuidado de snapshot em `ScriptRegistry.forEach` (que existe
+  porque ali o callback do CHAMADOR podia remover uma chave DIFERENTE da que
+  estava sendo iterada) — aqui só a própria chave da iteração corrente é
+  removida, então não precisou de snapshot.
+- **Pegadinha de validação do `lune run` neste módulo especificamente**: como
+  `TeamCreatePresence.luau` não usa `HttpService`/nenhum `game:GetService`
+  (não gera GUID nenhum — presença não tem `LeaseId`/`IntentId` equivalente),
+  o primeiro global do Roblox tocado no arquivo é `script` (na linha
+  `require(script.Parent.Config)`), não `game`. O erro esperado no `lune run`
+  saiu como `attempt to index nil with 'Parent'` em vez do
+  `attempt to index nil with 'GetService'` visto em todo outro módulo do
+  plugin (que sempre tem `local HttpService = game:GetService(...)` como
+  primeira linha real). Mesma categoria de erro esperado (primeira linha que
+  toca um global inexistente no sandbox do `lune`, prova que tudo antes
+  parseou sem erro de sintaxe) — só a propriedade indexada muda
+  (`.Parent` de `script` vs. `.GetService` de `game`). Registrar para não
+  confundir uma sessão futura que espere sempre literalmente "GetService" no
+  texto do erro.
+- **Integração em `init.server.luau`**: `require(script.TeamCreatePresence)`
+  junto dos outros; dispatch de `presenceUpdate` em `handleMessage` (sem
+  ack/requestId, espontânea — chama só `TeamCreatePresence.updateOwnPresence`
+  e retorna); `TeamCreatePresence.init(sendMessage)` + `.start()` em `start()`
+  DEPOIS de `TeamCreateElection.start()` (mesma dependência de
+  `getSessionFolder()`/`getClientId()` que `TeamCreateLease` já tinha);
+  `TeamCreatePresence.stop()` em `stop()` ao lado de `TeamCreateLease.stop()`,
+  antes de `TeamCreateElection.stop()` (mesma disciplina "parar o que depende
+  antes do que é dependido", ordem não estritamente necessária aqui já que
+  `stop()` só limpa memória, mas mantém consistência com o resto do arquivo).
+- **Validado só por `rojo build` + `lune run`** em `TeamCreatePresence.luau`
+  (novo) e `init.server.luau` — sem erro de sintaxe, erro esperado só na
+  primeira linha que toca `script`/`game` (ver nuance acima). **Nada testado
+  em Studio real nesta tarefa** — não é escopo pedido (o lado espelhado da
+  extensão, que consome `presenceChanged`/`presenceLeft` e envia
+  `presenceUpdate`, é trabalho paralelo do `ui-dev`; teste real combinado com
+  2 Studios fica para quando os dois lados existirem juntos, mesmo padrão já
+  seguido em M3.3). Sem roteiro manual isolado desta fatia por esse motivo —
+  quando o `ui-dev` terminar, o roteiro combinado deve cobrir: (1) mover
+  cursor/seleção no VS Code de A aparece em B em ~2s (alvo de latência do M4,
+  `docs/MILESTONES.md`); (2) trocar de arquivo ativo em A limpa a presença
+  antiga e publica a nova; (3) fechar o editor/arquivo em A emite
+  `presenceLeft` em B; (4) fechar o Studio de A (ou a extensão) emite
+  `presenceLeft` em B mesmo sem `presenceUpdate` explícito de limpeza (via o
+  gatilho "sessão sumiu").
+
+## Heartbeat WS: `pong` + detecção de conexão morta por silêncio (`plugin/`), 2026-07-15
+
+- **Bug real que motivou (reportado pelo usuário)**: após "Reload Window" do
+  VS Code, o processo da extensão morre SEM enviar frame de close WS, e o
+  painel do plugin ficava mostrando "conectado" (botão DISCONNECT) por muito
+  tempo — porque a detecção de queda dependia só de `Closed`/`Error` do
+  `WebStreamClient`, que podem NÃO disparar quando o servidor morre sem avisar.
+  Mesma classe de "sinal não confiável, precisa de caminho garantido" já vista
+  em `Source.Changed`/`scriptRemoved`/heartbeat de sessão — aqui o caminho
+  garantido é o SILÊNCIO (ausência de mensagens), não polling de uma
+  propriedade.
+- **Lado extensão (já feito por `extension-dev`, 127 testes)**: manda
+  `{kind:"ping"}` a cada 5s enquanto conectada; se ela mesma ficar 15s sem
+  receber NENHUMA mensagem do plugin, derruba a conexão (`socket.terminate()`).
+- **Item 1 — responder ping**: `handleMessage` em `init.server.luau` ganhou
+  `elseif message.kind == "ping"` → `sendMessage({ kind = "pong" })`,
+  imediatamente, no MESMO dispatch de `writeSource`/`readSource`/
+  `presenceUpdate`. Sem `requestId`, sem estado — é só liveness. Mensagens
+  `ping`/`pong` são ADITIVAS: **NÃO bumpei `PROTOCOL_VERSION`** (continua 2),
+  conforme a tarefa.
+- **Item 2 — timeout escolhido: `Config.DEAD_CONNECTION_TIMEOUT_SECONDS = 20`
+  (não 15).** A extensão pinga a cada 5s e se auto-derruba a 15s; escolhi 20s
+  (= 4 intervalos de ping) do lado do plugin para dar 1 ping de folga sobre o
+  timeout da extensão — evita teardown falso por UM único ping atrasado/
+  perdido, ao custo de no máximo ~5s a mais exibindo "conectado" após uma
+  queda real (irrelevante perto do bug original, que era "muito tempo"). A
+  tarefa deixava a escolha entre "15s ou um pouco mais de folga" aberta e
+  pediu para documentar — está no comentário longo da constante em
+  `Config.luau` também.
+- **Onde/como reaproveitei o rastreamento de "última mensagem recebida"**:
+  `runConnection` já tinha `local receivedAnyMessage = false` (booleano, usado
+  pelo heurístico de auto-descoberta de porta e pela estabilização) e
+  `connectedAt = os.clock()`. **Estendi** — não dupliquei — adicionando
+  `local lastMessageAt = connectedAt` (o QUANDO, além do SE) e, no ÚNICO ponto
+  que já marcava atividade (o handler de `MessageReceived`), passei a setar
+  também `lastMessageAt = os.clock()` ao lado do `receivedAnyMessage = true`
+  que já existia. Como o dispatch inteiro (inclusive o novo `ping`) passa por
+  esse mesmo handler, **receber `ping` conta automaticamente como atividade**
+  (item 3) — nada é filtrado da contagem de vida. Inicializei `lastMessageAt`
+  em `connectedAt` (não em 0) para que o silêncio conte desde a abertura da
+  conexão, não desde a época Unix.
+- **Onde a checagem roda**: dentro do loop interno "conectado"
+  (`while ... and not closed do task.wait(0.5)`), logo após o `task.wait(0.5)`
+  que já existia — mesma cadência de 0.5s, sem thread nova. Se
+  `os.clock() - lastMessageAt >= DEAD_CONNECTION_TIMEOUT_SECONDS`, loga e faz
+  **só `closed = true`** — EXATAMENTE o que os handlers de `Closed`/`Error` já
+  fazem. Isso cai no MESMO teardown (disconnect das conexões + `newClient:Close()`
+  já existentes logo abaixo do loop) e no MESMO ciclo de reconexão, que por sua
+  vez já repõe o painel em `"connecting"` sozinho (`PluginUI.setConnectionStatus`
+  não foi duplicado). Não usei `continue`: deixar a iteração corrente terminar
+  inócua e o `while` encerrar na próxima checagem de condição é o timing
+  IDÊNTICO ao de um `Closed` que dispara durante o `task.wait` — mais fiel ao
+  caminho existente e evita a pegadinha de `continue` pular declaração de local.
+- **Efeito colateral desejável (não pedido, mas coerente)**: como uma conexão
+  que recebeu pings tem `hasStabilizedOnce == true`, o teardown por silêncio
+  cai no toast já existente `"conexão com a extensão VS Code perdida; tentando
+  reconectar..."` (Logger.notify) — o usuário é avisado da queda em vez de só
+  ver o botão mudar de cor. Se a conexão nunca recebeu nada (silêncio total 20s
+  sem nenhum ping/mensagem), `hasStabilizedOnce` fica false e não há toast —
+  também correto (é o cenário "nunca conectou de verdade").
+- **Validado só por `rojo build` + `lune run`** em `Config.luau` e
+  `init.server.luau` — `Config.luau` roda até o fim sem erro (uso de `game` só
+  dentro de função não invocada); `init.server.luau` erra na linha 45
+  (`game:GetService`), a 1ª que toca `game`, provando que todo o código novo
+  (bem abaixo) parseou sem erro de sintaxe. **Não testado em Studio real nesta
+  tarefa (pendente)** — roteiro para o usuário: (1) conectar plugin+extensão,
+  confirmar painel "conectado"; (2) dar "Reload Window" no VS Code; (3)
+  confirmar que em ~20s o log emite "sem mensagens da extensão há 20s..." e o
+  painel volta a "connecting"/reconecta, SEM depender de `Closed`/`Error`
+  terem disparado. `[Hipótese]` até esse ciclo real: que 20s nunca dá
+  falso-positivo com a extensão viva (depende de o ping de 5s chegar com
+  folga) e que o teardown por `closed=true` + `newClient:Close()` de fato
+  libera o cliente para a reconexão na mesma porta.
+
+## Rejeição de porta por sinal explícito `connectionRejected` (`plugin/`), 2026-07-15
+
+- **Motivação**: `WebStreamClient.Closed` não tem parâmetro nenhum (close code
+  nem reason) — confirmado pela pesquisa
+  `.claude/research/2026-07-15-webstreamclient-close-code.md`. Então o plugin
+  nunca sabe pelo protocolo WS que uma queda foi "porta ocupada por outro
+  Studio". Fix cross-time: a extensão passou a mandar uma MENSAGEM DE
+  APLICAÇÃO `{kind:"connectionRejected", reason:"port_in_use"}` (chega no
+  `MessageReceived` normal) ANTES de fechar o WS de um 2º cliente rejeitado.
+- **Onde encaixei a lógica de candidatas/heurística de rejeição** (o que a
+  tarefa pediu para registrar): tudo vive em `plugin/src/init.server.luau`,
+  função `runConnection`. A heurística de tempo é `local probablyRejected =
+  (not receivedAnyMessage) and aliveSeconds <
+  Config.PROBABLE_REJECTION_WINDOW_SECONDS and #ports > 1`, logo DEPOIS do
+  teardown do cliente (disconnect das conexões + `newClient:Close()`), ANTES do
+  `if probablyRejected then` que avança de candidata (`(index % #ports) + 1`,
+  atraso `CANDIDATE_RETRY_DELAY_SECONDS`) vs. o `else` de reconexão normal
+  (`RECONNECT_SECONDS`). Não removi essa heurística — ADICIONEI o sinal
+  explícito como caminho confirmado: `local rejected = connectionRejected or
+  ((not receivedAnyMessage) and aliveSeconds < ...janela)` e `probablyRejected
+  = rejected and #ports > 1`. A heurística de tempo virou o FALLBACK para
+  extensão antiga sem o fix.
+- **Pegadinha central que só o código (não a pesquisa) revelou**:
+  `connectionRejected` chega como MENSAGEM, então o handler de
+  `MessageReceived` seta `receivedAnyMessage = true`. Isso tem DOIS efeitos
+  ruins se não tratado: (a) quebraria o critério `not receivedAnyMessage` da
+  heurística de tempo (por isso o sinal explícito dispensa esse critério); e
+  PIOR (b) `stabilized = receivedAnyMessage or ...` viraria true → o bloco `if
+  not persistedAutoPort and stabilized` faria `SetSetting(PORT_SETTING_KEY,
+  port)` **PERSISTINDO a porta OCUPADA como porta descoberta** — bug real
+  evitado. Fix: `stabilized` ganhou guarda `not connectionRejected and (...)`.
+  Também guardei `hasStabilizedOnce` com `and not connectionRejected` (senão o
+  toast genérico "conexão perdida" dispararia junto com o toast específico de
+  porta ocupada). **Regra geral**: qualquer sinal que a extensão mande como
+  mensagem de aplicação para SINALIZAR uma queda iminente precisa ser excluído
+  explicitamente de toda contagem de "a conexão funcionou" (`stabilized`,
+  `hasStabilizedOnce`, persistência de porta) — receber a mensagem não é a
+  conexão estar viva.
+- **Flags module-level (não locals de `runConnection`)** porque `handleMessage`
+  é função module-level (dispatch genérico) e não enxerga os locals do loop:
+  `connectionRejected` (setada em `handleMessage`, lida em `runConnection`,
+  RESETADA `= false` no topo de cada iteração do loop de `runConnection` antes
+  de conectar o `MessageReceived` — senão vaza rejeição de tentativa
+  anterior), `activePort` (porta em curso, setada no topo do loop, usada só
+  para o texto do toast), `lastRejectedPortToasted` (dedupe).
+- **Texto EXATO do toast** (`Logger.notify`, não `Logger.log` — vira toast
+  visível via `PluginUI.notify`): `("porta %d já está em uso por outro
+  Studio"):format(activePort or 0)`. Chamado na branch `elseif message.kind ==
+  "connectionRejected"` de `handleMessage`.
+- **Dedupe do toast por porta** (decisão minha, NÃO pedida na tarefa —
+  flagged ao orquestrador): o Toast (`plugin/src/ui/Toast.luau`) é
+  single-instance e um novo `show()` reinicia texto+tween+timer de 5s. Sem
+  dedup, uma porta EXPLÍCITA ocupada reconecta a cada `RECONNECT_SECONDS` (3s <
+  5s de hold) → `connectionRejected` a cada ciclo → toast permanente que o ✕
+  não consegue fechar (volta em 3s). `lastRejectedPortToasted` guarda a última
+  porta toastada; toast só se `~= activePort`, senão só `log`. Reset `= nil`
+  em `stop()` e quando uma conexão real estabiliza (bloco `if stabilized and
+  not shownConnected`) — para que reencontrar a mesma porta ocupada depois
+  volte a avisar. Mesma disciplina anti-spam já registrada para
+  `outageToasted`/`hasStabilizedOnce`.
+- **Comportamento por cenário**: porta explícita (`#ports==1`) +
+  `connectionRejected` → `probablyRejected` false (exige `#ports>1`) →
+  reconexão normal `RECONNECT_SECONDS` na MESMA porta, mas agora com o toast
+  já explicando o motivo (item 2 da tarefa: usuário decide trocar de porta no
+  painel). Lista de candidatas (`#ports>1`) + `connectionRejected` →
+  `probablyRejected` true → avança direto pra próxima candidata (mesmo caminho
+  da heurística de tempo), sem esperar a janela de 3s.
+- **`reason` só tem "port_in_use" definido hoje** — a flag/toast assumem esse
+  motivo. Se surgir outro `reason` (ex.: mismatch de versão), avançar
+  candidatas não faria sentido: revisitar a branch para ramificar por `reason`
+  antes de generalizar.
+- **Validado só por `rojo build` (7.7.0 cacheado) + `lune run`** em
+  `init.server.luau` — build EXIT 0; `lune run` erra em `init.server:45`
+  (`game:GetService`, 1ª linha que toca `game`), provando que TODO o arquivo
+  compilou sem erro de sintaxe (Luau compila o chunk inteiro antes de
+  executar). Nenhum outro arquivo tocado. **Não testado em Studio real
+  (pendente)** — roteiro para 2 Studios reais na mesma máquina/porta: (1)
+  Studio A conecta numa porta; (2) Studio B tenta a MESMA porta explícita →
+  confirmar toast "porta N já está em uso por outro Studio" UMA vez + log de
+  rejeição repetida nos ciclos seguintes, botão nunca pisca "connected", porta
+  ocupada NUNCA é persistida; (3) com lista de candidatas, B pula direto pra
+  próxima porta livre em vez de esperar a janela de 3s. `[Hipótese]` até isso.
+
+## Investigação de "Too many WebStreamClients" reportado pelo usuário, 2026-07-15
+
+- **Bug relatado**: Studio preso em loop `falha ao criar cliente WS (Too many
+  WebStreamClients active...)`, usuário relatou que acontecia
+  "especificamente ao usar portas diferentes". Suspeita inicial: vazamento
+  novo introduzido pelo branch de avanço rápido via `connectionRejected` ou
+  pelo timeout de heartbeat (`DEAD_CONNECTION_TIMEOUT_SECONDS`), ambos
+  adicionados na mesma sessão.
+- **Investigação (releitura completa de `runConnection`, linha a linha,
+  rastreando a ÚNICA chamada de `CreateWebStreamClient` do projeto inteiro
+  contra TODO caminho de saída do loop "conectado")**: **nenhum bug de lógica
+  encontrado.** O teardown (`for connection in connections do
+  connection:Disconnect() end` + `pcall(newClient:Close())`, linhas ~506-513)
+  roda de forma INCONDICIONAL logo após o `while` "conectado" terminar,
+  qualquer que seja o motivo (`Closed`/`Error` nativo, timeout de heartbeat
+  setando só `closed=true`, ou queda por `connectionRejected` que também passa
+  pelo `Closed` nativo do protocolo) — e esse teardown SEMPRE roda antes de
+  qualquer possibilidade de looping (criar cliente novo) ou `return`. O branch
+  de avanço de candidata (heurística de tempo OU `connectionRejected`
+  confirmado) só decide o PRÓXIMO índice/delay DEPOIS do teardown já ter
+  fechado o cliente atual — nunca antes. `stop()` fecha o `client` (var
+  module-level) de forma síncrona independente da coroutine de
+  `runConnection`; se essa coroutine acordar depois, ela só faz um
+  `Close()` redundante em objeto já fechado, sempre dentro de `pcall` — não é
+  vazamento, é no-op inofensivo.
+- **Conclusão/hipótese mais provável, não uma correção de código**: o
+  travamento real observado é explicado por ACÚMULO de reloads repetidos do
+  plugin durante uma sessão de teste (build+deploy manual do
+  `Tools/build-and-deploy-plugin.sh`, facilmente 10+ vezes numa sessão),
+  somado ao ciclo de auto-descoberta de porta (que já existia antes desta
+  sessão, `Config.CANDIDATE_PORTS`) gerando MAIS tentativas de conexão (logo
+  mais objetos `WebStreamClient` criados e fechados) por sessão de teste do
+  que um uso normal de produto — não uma condição de corrida nova introduzida
+  pelos dois recursos desta sessão (heartbeat/`connectionRejected`). **Não
+  apliquei nenhum fix** porque nenhum caminho de código com vazamento real foi
+  encontrado — inventar uma mudança sem bug identificado só arriscaria
+  regressão. Se o sintoma reaparecer especificamente após MUITOS reloads
+  seguidos em curto espaço de tempo (não após uso normal), é consistente com
+  esta hipótese (latência do próprio Studio para finalizar a liberação interna
+  do socket, fora do controle do código Luau, que já fecha tudo
+  sincronicamente do lado dele). `[Hipótese]` — não há como confirmar sem
+  reproduzir de novo com contagem exata de reloads/tentativas, e a regra do
+  projeto proíbe pesquisar internals do Studio sem research salvo. Ação
+  recomendada ao usuário: reabrir o Studio (já feito a pedido do orquestrador)
+  libera os 6 clientes presos; se reaparecer fora de um cenário de MUITOS
+  reloads em sequência, revisitar esta conclusão.
+- Nenhum arquivo alterado nesta investigação (não havia bug para corrigir) —
+  `rojo build`/`lune run` não re-executados por não haver diff.
+
+## Troca de porta pelo painel matava a própria conexão (reentrância de FocusLost), 2026-07-16
+
+- **Bug real com log**: trocar a porta no painel (1401->1405) conectava com
+  sucesso (`conectado em ws://127.0.0.1:1405`) e ~40ms depois rodava um
+  `stop()` COMPLETO da MESMA sessão recém-criada (mesmo clientId), matando a
+  conexão. **Causa raiz CONFIRMADA por leitura** (não refutada): o único guard
+  contra repetição de troca era `newPort ~= state.port()` DENTRO de
+  `PortRow.FocusLost` (`ui/StatusPanel.luau`), mas ele NÃO é seguro contra
+  reentrância — `state.port()` (=`portSource` em `PluginUI.luau`) só é
+  atualizado de forma ASSÍNCRONA por `PluginUI.setPort`, chamado dentro de
+  `runConnection` (já no novo `start()`, linha ~369). `FocusLost` de `TextBox`
+  tem quirk conhecido de disparar mais de uma vez pro mesmo Enter/perda de
+  foco; o 2º disparo lê `state.port()` AINDA ANTIGO (1401) contra
+  `portBox.Text` já NOVO (1405), passa pelo guard e dispara um 2º
+  `onPortChange` -> 2º `stop()+start()` -> o `stop()` mata a sessão/conexão que
+  o 1º `start()` acabou de criar. Guard baseado em estado atualizado
+  assincronamente nunca serve como proteção de reentrância de evento síncrono.
+- **Fix (só em `init.server.luau`, callback `onPortChange`)**: duas camadas
+  module-level complementares. (a) `portChangeInFlight` — enquanto o
+  `stop()+start()` de uma troca ainda roda (start() pode yieldar internamente),
+  uma 2ª chamada é ignorada (protege reentrância por yield). (b) dedupe por
+  VALOR+TEMPO (`lastPortChangeValue`/`lastPortChangeAt`,
+  `PORT_CHANGE_DEDUPE_SECONDS = 1`) — 2ª chamada com o MESMO `newPort` em <1s é
+  ignorada mesmo depois da flag baixar, cobrindo a janela entre `start()`
+  retornar (flag=false) e `runConnection` de fato chamar `setPort` (exatamente
+  quando o guard do PortRow falha). `lastPortChangeAt` é REINICIADO no FIM do
+  `stop()+start()` para a janela contar a partir daí.
+- **Pegadinha resolvida no fix**: `stop()`/`start()` originalmente NÃO estavam
+  em pcall. Se algum deles lançasse, `portChangeInFlight` ficaria travado em
+  `true` PARA SEMPRE (bug pior que o corrigido — bloquearia toda troca de porta
+  futura). Envolvi `stop()+start()` num pcall só para GARANTIR que a flag
+  sempre baixa; o erro continua logado, não engolido. Mesma disciplina aplicada
+  ao early-return de falha de `SetSetting` (libera a flag antes de sair).
+- **NÃO toquei em `ui/StatusPanel.luau`**: o `PortRow` fica como está; a
+  correção é do lado do dono da lógica de conexão (`init.server.luau`), que é
+  quem tem o estado module-level para deduplicar. Notei um efeito cosmético
+  secundário no PortRow (`portBox.Text = tostring(state.port())` pode reverter
+  brevemente para a porta antiga se `setPort` ainda não rodou), mas se
+  autocorrige no próximo refresh reativo e não é o bug reportado — deixado como
+  está.
+- Validado por `rojo build` (limpo, `Built project to ...rbxm`) + `lune run`
+  em `init.server.luau` (para na linha 45 `game:GetService`, o marcador
+  esperado de "parseou/executou sem erro de sintaxe"). **Não testado em Studio
+  real nesta tarefa** — pendente do usuário: trocar a porta pelo painel e
+  confirmar que a conexão nova SOBREVIVE (nenhum `stop()` do clientId
+  recém-criado ~40ms depois), e que uma troca legítima subsequente (porta
+  diferente) ainda funciona apesar do dedupe.

@@ -47,6 +47,24 @@
 -- -> sendMessage -> (falha) -> log da falha via Logger.log -> sendMessage de
 -- novo -> ciclo sem saída natural (a cada tentativa gera uma nova mensagem de
 -- log sobre a tentativa anterior). Ver comentário em init.server.luau.
+--
+-- M4.5 (painel de status, plugin/src/ui/): adicionado `Logger.notify(...)`,
+-- uma segunda via de injeção (`Logger.initNotify`) paralela a `Logger.init`.
+-- Motivo de não reusar o mesmo callback de `sendMessage`/`Logger.init`: aquele
+-- é especificamente "encaminhar como {kind='log'} pela conexão WS" (canal de
+-- observabilidade de teste, ver cabeçalho acima); este é "isto é
+-- toast-worthy" (canal de UX dentro do próprio Studio, sem relação com WS).
+-- `Logger.notify(...)` SEMPRE faz exatamente o que `Logger.log(...)` já
+-- fazia (print + forward por WS, incondicional — spec da tarefa: "o log no
+-- Output NUNCA é condicionado" à preferência de notificação) e, ADICIONALMENTE,
+-- chama o callback de notify (se injetado) com o texto renderizado — quem
+-- injeta (PluginUI.notify, ver plugin/src/ui/PluginUI.luau) decide se anima
+-- um toast visível, olhando a preferência "Mostrar notificações"
+-- (Config.NOTIFICATIONS_SETTING_KEY) — essa decisão fica INTEIRAMENTE do lado
+-- de UI, nunca aqui. Só os poucos call-sites já identificados como "erro
+-- genuíno" (não evento rotineiro) foram trocados de `log(...)` para
+-- `notify(...)`: ver TeamCreateSchema.luau (reconciliação de duplicata) e
+-- init.server.luau (lease negada, falha de reconexão WS).
 
 local Logger = {}
 
@@ -56,11 +74,46 @@ local Logger = {}
 -- (e sempre que a conexão cair), Logger.log só faz o print — sem erro.
 local sendMessage = nil
 
+-- callback(text: string), injetado por Logger.initNotify (M4.5) — nil até
+-- init.server.luau chamar Logger.initNotify(PluginUI.notify), dentro de
+-- start() (mesmo lugar/ordem de Logger.init). Nesse intervalo, Logger.notify
+-- se comporta exatamente como Logger.log (só não há ninguém para avisar).
+local onNotify = nil
+
 -- Injeta o callback de envio espontâneo. Chamado por init.server.luau, no
 -- mesmo lugar/ordem em que já chama SourceWatcher.init(sendMessage)/
 -- TeamCreateLease.init(sendMessage), dentro de start().
 function Logger.init(onMessage)
 	sendMessage = onMessage
+end
+
+-- Injeta o callback de notificação visual (M4.5). Chamado por
+-- init.server.luau dentro de start(), ao lado de Logger.init.
+function Logger.initNotify(callback)
+	onNotify = callback
+end
+
+-- Núcleo compartilhado de Logger.log/Logger.notify: monta o prefixo, imprime
+-- (idêntico ao `print(prefix, ...)` de antes desta tarefa — Output do Studio
+-- inalterado), encaminha por WS se houver sendMessage injetado, e devolve o
+-- texto renderizado (para Logger.notify repassar ao callback de notify sem
+-- reconstruir a string).
+local function renderPrintAndForward(...)
+	local prefix = ("[SyncTeam %s]"):format(os.date("%H:%M:%S"))
+	print(prefix, ...)
+
+	local count = select("#", ...)
+	local text = prefix
+	for index = 1, count do
+		local value = select(index, ...)
+		text = text .. " " .. tostring(value)
+	end
+
+	if sendMessage ~= nil then
+		sendMessage({ kind = "log", text = text })
+	end
+
+	return text
 end
 
 -- Mesma assinatura/comportamento de todo `log(...)` que existia espalhado
@@ -70,21 +123,24 @@ end
 -- espontânea `{kind = "log", text = ...}` — melhor esforço, nunca lança erro
 -- nem enfileira nada.
 function Logger.log(...)
-	local prefix = ("[SyncTeam %s]"):format(os.date("%H:%M:%S"))
+	renderPrintAndForward(...)
+end
 
-	-- Chamada IDÊNTICA à que já existia em cada arquivo (print(prefix, ...)) —
-	-- garante que o Output do Studio continua exatamente igual a antes desta
-	-- tarefa.
-	print(prefix, ...)
-
-	if sendMessage ~= nil then
-		local count = select("#", ...)
-		local text = prefix
-		for index = 1, count do
-			local value = select(index, ...)
-			text = text .. " " .. tostring(value)
+-- Igual a Logger.log (mesmo print, mesmo forward por WS, SEMPRE — nunca
+-- condicionado a preferência nenhuma), e ADICIONALMENTE chama o callback de
+-- notify injetado (se houver) com o texto renderizado — melhor esforço,
+-- protegido por pcall (a UI pode falhar por qualquer motivo de Instance/
+-- Tween; uma falha ali nunca pode derrubar quem chamou Logger.notify no meio
+-- de lógica de coordenação real). Usar SÓ nos poucos pontos já identificados
+-- como "merece toast" (ver cabeçalho do arquivo) — todo o resto continua
+-- `Logger.log`.
+function Logger.notify(...)
+	local text = renderPrintAndForward(...)
+	if onNotify ~= nil then
+		local ok, err = pcall(onNotify, text)
+		if not ok then
+			print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), "falha ao notificar UI:", tostring(err))
 		end
-		sendMessage({ kind = "log", text = text })
 	end
 end
 
