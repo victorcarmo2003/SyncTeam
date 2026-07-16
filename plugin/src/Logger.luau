@@ -93,14 +93,17 @@ function Logger.initNotify(callback)
 	onNotify = callback
 end
 
--- Núcleo compartilhado de Logger.log/Logger.notify: monta o prefixo, imprime
--- (idêntico ao `print(prefix, ...)` de antes desta tarefa — Output do Studio
--- inalterado), encaminha por WS se houver sendMessage injetado, e devolve o
--- texto renderizado (para Logger.notify repassar ao callback de notify sem
--- reconstruir a string).
-local function renderPrintAndForward(...)
+-- Núcleo compartilhado de Logger.log/Logger.debug/Logger.notify: monta o
+-- prefixo, imprime CONDICIONALMENTE (`shouldPrint`, ver Logger.debug abaixo),
+-- encaminha por WS se houver sendMessage injetado (SEMPRE, print ou não — a
+-- observabilidade de teste automatizado nunca depende do que aparece no
+-- Output do Studio, ver Tools/README.md), e devolve o texto renderizado (para
+-- Logger.notify repassar ao callback de notify sem reconstruir a string).
+local function render(shouldPrint, ...)
 	local prefix = ("[SyncTeam %s]"):format(os.date("%H:%M:%S"))
-	print(prefix, ...)
+	if shouldPrint then
+		print(prefix, ...)
+	end
 
 	local count = select("#", ...)
 	local text = prefix
@@ -123,7 +126,20 @@ end
 -- espontânea `{kind = "log", text = ...}` — melhor esforço, nunca lança erro
 -- nem enfileira nada.
 function Logger.log(...)
-	renderPrintAndForward(...)
+	render(true, ...)
+end
+
+-- 2026-07-16 (consolidação de ruído de boot, pedido do usuário após teste
+-- real: rajada de ~7 linhas de subsistema a cada conexão). Mesmo forward por
+-- WS de Logger.log (Tools/README.md continua enxergando tudo, observabilidade
+-- de teste automatizado intacta), mas SEM `print()` — não aparece no Output
+-- do Studio. Uso: eventos de inicialização de subsistema que são informação
+-- ROTINEIRA (reconciliação de registry, ciclos internos iniciados/parados,
+-- tentativa otimista de conexão antes de estabilizar) — nunca para eventos
+-- que o usuário precisa perceber sem abrir um log externo (erro real, mudança
+-- de liderança, lease negada — esses continuam Logger.log/Logger.notify).
+function Logger.debug(...)
+	render(false, ...)
 end
 
 -- Igual a Logger.log (mesmo print, mesmo forward por WS, SEMPRE — nunca
@@ -135,7 +151,7 @@ end
 -- como "merece toast" (ver cabeçalho do arquivo) — todo o resto continua
 -- `Logger.log`.
 function Logger.notify(...)
-	local text = renderPrintAndForward(...)
+	local text = render(true, ...)
 	if onNotify ~= nil then
 		local ok, err = pcall(onNotify, text)
 		if not ok then

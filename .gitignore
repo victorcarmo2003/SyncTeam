@@ -4,6 +4,10 @@ node_modules/
 *.vsix
 dist/
 out/
+# dist-plugin/SyncTeam.rbxmx é rastreado de propósito (companion plugin pronto
+# pro colega usar sem precisar buildar) — exceção às regras acima.
+!dist-plugin/
+!dist-plugin/SyncTeam.rbxmx
 *.log
 Tools/logs/*
 !Tools/logs/.gitkeep

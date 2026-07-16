@@ -11,6 +11,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN_DIR="$REPO_ROOT/plugin"
 PLUGINS_FOLDER="/c/Users/hakor/AppData/Local/Roblox/Plugins"
 PLUGIN_NAME="SyncTeam.rbxm"
+DIST_DIR="$REPO_ROOT/dist-plugin"
+DIST_NAME="SyncTeam.rbxmx"
 
 ROJO_BIN="$(ls "$HOME"/.rokit/tool-storage/rojo-rbx/rojo/*/rojo.exe 2>/dev/null | sort -V | tail -n1)"
 if [ -z "$ROJO_BIN" ]; then
@@ -38,5 +40,12 @@ echo "== rojo build ($ROJO_BIN) =="
 echo "== implantando em $PLUGINS_FOLDER =="
 rm -f "$PLUGINS_FOLDER/$PLUGIN_NAME"
 cp "$PLUGIN_DIR/$PLUGIN_NAME" "$PLUGINS_FOLDER/$PLUGIN_NAME"
+
+# Companion plugin em XML (.rbxmx), commitado em dist-plugin/ — pra quem
+# clonar o repo já ter um plugin pronto pra instalar manualmente (arrastar
+# pra pasta de Plugins do Studio), sem precisar de rojo/wally instalados.
+echo "== gerando companion em $DIST_DIR/$DIST_NAME =="
+mkdir -p "$DIST_DIR"
+(cd "$PLUGIN_DIR" && "$ROJO_BIN" build -o "$DIST_DIR/$DIST_NAME")
 
 echo "OK — plugin implantado. Studios abertos devem detectar o refresh automaticamente (auto-start já embutido no plugin)."

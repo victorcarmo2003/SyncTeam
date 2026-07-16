@@ -16,6 +16,8 @@ $PluginDir = Join-Path $RepoRoot "plugin"
 
 $PluginsFolder = Join-Path $env:LOCALAPPDATA "Roblox\Plugins"
 $PluginName = "SyncTeam.rbxm"
+$DistDir = Join-Path $RepoRoot "dist-plugin"
+$DistName = "SyncTeam.rbxmx"
 
 function Find-LatestExecutable {
     param(
@@ -121,6 +123,27 @@ Copy-Item `
     -Path $BuiltPlugin `
     -Destination $DeployedPlugin `
     -Force
+
+# Companion plugin em XML (.rbxmx), commitado em dist-plugin/ - pra quem
+# clonar o repo ja ter um plugin pronto pra instalar manualmente (arrastar
+# pra pasta de Plugins do Studio), sem precisar de rojo/wally instalados.
+Write-Host "== gerando companion em $DistDir\$DistName =="
+
+if (-not (Test-Path $DistDir)) {
+    New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
+}
+
+Push-Location $PluginDir
+try {
+    & $RojoExecutable.FullName build -o (Join-Path $DistDir $DistName)
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "rojo build (companion) falhou com código $LASTEXITCODE"
+    }
+}
+finally {
+    Pop-Location
+}
 
 Write-Host ""
 Write-Host "OK - plugin implantado."

@@ -1,6 +1,41 @@
 # Status do projeto
 
-Última atualização: 2026-07-16 (aviso visual de lease alheia no VS Code — metade que faltava do lease-UX)
+Última atualização: 2026-07-16 (autostart opt-in + consolidação de log de boot, plugin)
+
+## Nota de sessão (2026-07-16, mais recente) — autostart opt-in + log de boot consolidado (plugin)
+
+Usuário testou o painel M4.5 em Studio real e trouxe 3 pedidos (ver
+`docs/DECISIONS.md` 2026-07-16 para o detalhe de cada um):
+
+1. **Investigar `stop()` sem log de Run/Play** — descartado o guard de
+   Run/Play e `onPortChange`/clique real como causa direta (leitura de
+   código); candidato mais plausível não confirmado: redeploy do plugin via
+   `Tools/build-and-deploy-plugin.ps1` disparando `plugin.Unloading`.
+   **Prioridade rebaixada pelo próprio usuário** durante a tarefa: confirmou
+   que o servidor da extensão estava desligado, o que já explica o ciclo
+   `conectado`/`erro WS 400 ConnectFail`/`reconectando` como esperado. Fica
+   `[Hipótese]`, sem instrumentação adicional (não pedida).
+2. **Autostart agora é opt-in, default DESLIGADO**: `Config.AUTOSTART_SETTING_KEY`
+   + `Config.resolveAutoStartEnabled` (`plugin/src/Config.luau`, default
+   `false`). Auto-start incondicional só volta a acontecer com
+   `plugin:SetSetting("SyncTeam_AutoStart", true)` manual (Command Bar, sem UI
+   dedicada ainda). Botão CONNECT do painel (M4.5) já cobre conexão manual.
+3. **Log de boot consolidado**: novo `Logger.debug(...)` (`plugin/src/Logger.luau`)
+   — forward por WS igual a `Logger.log`, mas sem `print()` no Output. ~7
+   linhas de subsistema por conexão (registry reconciliado, observação
+   iniciada, sessão criada, leases/presença ciclo iniciado, `conectado`
+   otimista, `iniciado. Conectando...`) rebaixadas para `Logger.debug`; uma
+   ÚNICA linha `Logger.log` nova aparece quando a conexão de fato estabiliza:
+   `"conectado em ws://... (N scripts observados)"` (via novo
+   `SourceWatcher.getWatchedCount()`).
+
+**Validado só por `rojo build` + `lune run`** nos 8 arquivos tocados — sem
+erro de sintaxe. **Nada testado em Studio real nesta tarefa** — roteiro
+pendente: reconectar com autostart desligado (confirmar que NÃO conecta
+sozinho e que o log `"autostart desligado; use o painel..."` aparece);
+`plugin:SetSetting("SyncTeam_AutoStart", true)` pelo Command Bar + reload
+(confirmar que volta a auto-conectar); e confirmar visualmente que o Output
+mostra só a linha consolidada de `"conectado"` em vez da rajada antiga.
 
 ## Nota de sessão (2026-07-16) — aviso visual de lease alheia no VS Code (lado Studio pendente)
 

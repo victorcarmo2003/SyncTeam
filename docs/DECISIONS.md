@@ -1,5 +1,176 @@
 # Decisões registradas
 
+## 2026-07-16 — Autostart passa a ser opt-in, default DESLIGADO
+
+**Mudança de comportamento padrão, pedida pelo usuário após teste real.** Até
+esta entrada, `plugin/src/init.server.luau` chamava `start(plugin)`
+incondicionalmente ao carregar (só sujeito ao guard de Run/Play) — o dev não
+tinha como optar por conectar manualmente. Novo padrão: `Config.AUTOSTART_SETTING_KEY
+= "SyncTeam_AutoStart"` + `Config.resolveAutoStartEnabled(pluginObject)`
+(`plugin/src/Config.luau`), default **false** (deliberadamente o OPOSTO de
+`Config.resolveNotificationsEnabled`, que é default true) — o comportamento
+padrão agora é o dev clicar em CONNECT no painel quando quiser sincronizar.
+Auto-start incondicional só volta a acontecer se alguém ligar a setting
+explicitamente via `plugin:SetSetting("SyncTeam_AutoStart", true)` pelo
+Command Bar (sem UI dedicada nesta fatia — mesmo padrão histórico de
+`PORT_SETTING_KEY` antes de ganhar campo no painel). O botão CONNECT do painel
+(M4.5) já cobria conexão manual antes desta mudança; nada novo precisou ser
+criado ali.
+
+## 2026-07-16 — Consolidação de log de boot (Logger.debug)
+
+**Ruído reportado pelo usuário**: cada conexão gerava uma rajada de ~7 linhas
+de subsistema no Output do Studio (`registry reconciliado`, `observação
+iniciada`, `sessão criada`, `leases: ciclo iniciado`, `presença: ciclo
+iniciado`, `conectado em ...`, `iniciado. Conectando...`), sem diferenciação
+de nível. Fix: novo `Logger.debug(...)` (`plugin/src/Logger.luau`) — mesmo
+forward por WS de `Logger.log` (observabilidade de teste automatizado via
+`Tools/README.md` continua intacta), mas **sem** `print()` no Output do
+Studio. As 7 linhas acima (em `ScriptRegistry.luau`, `SourceWatcher.luau`,
+`TeamCreateElection.luau`, `TeamCreateLease.luau`, `TeamCreatePresence.luau`,
+`init.server.luau`) foram rebaixadas para `Logger.debug`. Em troca, uma ÚNICA
+linha `Logger.log` nova aparece quando a conexão de fato **estabiliza**
+(dentro de `runConnection`, no mesmo ponto em que o botão vira "connected"):
+`"conectado em ws://... (N scripts observados)"` — contagem via
+`SourceWatcher.getWatchedCount()` (novo). O log antigo `conectado em %s`, que
+disparava OTIMISTICAMENTE assim que o `WebStreamClient` era criado (antes de
+saber se ia dar `ConnectFail`), também virou `Logger.debug` — ele descrevia
+uma tentativa, não uma conexão de fato estabelecida, e podia aparecer 3x
+seguidas mesmo sem nunca conectar de verdade (era um dos sintomas do log colado
+pelo usuário). Resultado: as únicas linhas visíveis relacionadas a conexão
+agora são "conectado em ... (N scripts)" (1x por conexão real), "desconectado;
+reconectando em Xs" (1x por queda, já existia) e as linhas raras de porta
+ocupada/candidatas esgotadas (já existiam, mantidas — não são ruído rotineiro).
+`erro WS <code> <msg>` também virou `Logger.debug` (era redundante com
+"desconectado; reconectando", que já é a linha visível da categoria
+"reconectando"). Mensagens de mudança de liderança (`sou o líder agora (term
+N)`) e o lado de `stop()` (`observação parada`, `sessão removida`, etc.) NÃO
+foram tocados — são eventos raros/relevantes de verdade, não ruído rotineiro
+de boot, e o lado de `stop()` em particular tem valor de diagnóstico (ver
+entrada abaixo).
+
+**Validado só por `rojo build` + `lune run`** nos 8 arquivos tocados
+(`Config.luau`, `Logger.luau`, `SourceWatcher.luau`, `ScriptRegistry.luau`,
+`TeamCreateElection.luau`, `TeamCreateLease.luau`, `TeamCreatePresence.luau`,
+`init.server.luau`) — sem erro de sintaxe. Roteiro de teste real pendente:
+conectar em Studio real e confirmar que o Output mostra só a linha consolidada
+de "conectado" (mais scripts observados) em vez da rajada antiga.
+
+## 2026-07-16 — Investigação do `stop()` sem log de Run/Play (prioridade rebaixada)
+
+Usuário reportou plugin "parando sozinho" (sequência completa `observação
+parada`/`leases: ciclo parado`/`presença: ciclo parado`/`sessão removida`/
+`parado.` no meio de um teste, sem a linha `"F8/F5 (Run/Play) detectado..."`
+que o guard de Run/Play sempre loga antes de chamar `stop()` — ver entrada
+acima de 2026-07-16 sobre esse guard). Investigação por leitura de código
+descartou: (a) o guard de Run/Play (confirmado ausente no log, único chamador
+que teria logado algo antes), (b) `onPortChange`/troca de porta (usuário não
+mexeu na porta), (c) clique real em DISCONNECT (nenhum caminho encontrado em
+`PluginUI.luau`/`StatusPanel.luau` onde o painel dispararia `Activated` do
+botão CONNECT/DISCONNECT sozinho — os únicos handlers de `Activated`
+encontrados são conexões estáticas de sinal, criadas 1x no mount, sem
+recriação/reentrância espúria localizada). Candidato mais plausível **não
+totalmente confirmado**: `plugin.Unloading:Connect(stop)` disparando por um
+REDEPLOY do plugin (`Tools/build-and-deploy-plugin.ps1`/`.sh` sobrescreve o
+arquivo em `%LOCALAPPDATA%\Roblox\Plugins`, o que o Studio detecta como
+reload — `plugin.Unloading` dispara para a instância antiga do script,
+independente de o Studio ter fechado) — isso bateria com o timing observado
+(shutdown completo e síncrono, sem log de motivo). **Prioridade rebaixada pelo
+usuário**: confirmou que o servidor da extensão VS Code estava desligado
+durante o teste, o que já explica o ciclo `conectado`→`erro WS 400
+ConnectFail`→`reconectando` como comportamento esperado (plugin tentando
+conectar sem ninguém escutando) — não é mais bug prioritário. Fica
+`[Hipótese]`, sem instrumentação adicionada nesta tarefa (não pedida); se
+reaparecer, a forma mais barata de confirmar é logar `debug.traceback()` (ou
+um marcador textual simples) no topo de `stop()` na próxima ocorrência.
+
+## 2026-07-16 — Silenciar "descartado (sem conexão): log" duplicado no boot
+
+Ajuste de verbosidade, não decisão de arquitetura. Usuário reportou ruído real
+(log colado do Output do Studio): nos primeiros segundos antes do WS conectar,
+toda linha de log normal do boot vinha seguida de uma linha extra `descartado
+(sem conexão): log`, dobrando a quantidade de linhas. Causa: `sendMessage`
+(`plugin/src/init.server.luau`) avisa "descartado" para QUALQUER `kind`
+descartado por falta de conexão — inclusive `kind == "log"`, que é o próprio
+`Logger.log` se auto-encaminhando pela conexão WS (ver `Logger.luau`); o
+conteúdo já apareceu no Output via `print()` dentro do próprio `Logger.log`,
+então avisar de novo que o encaminhamento falhou é redundante, não uma falha
+relevante. Fix: `sendMessage` só imprime o aviso "descartado (sem conexão):
+<kind>" quando `message.kind ~= "log"` — mensagens de protocolo reais
+(`scriptAdded`, `presenceUpdate`, etc.) continuam avisando normalmente quando
+descartadas por falta de conexão, porque isso ainda é informação útil para
+depurar por que algo não chegou na extensão. Comportamento de erro de envio
+real (`falha ao enviar: ...`) não foi alterado.
+
+## 2026-07-16 — Guard para não rodar sync durante F8 Run / F5 Play no Studio
+
+**[Verificado] via pesquisa de API** (não teste em Studio real, ver
+`.claude/research/2026-07-16-runservice-isstudio-isrunning-plugin-detect-test.md`):
+`RunService:IsStudio()` sozinho NÃO distingue edição normal do Team Create de
+um teste rodando dentro do próprio Studio — fica `true` nos dois casos. A API
+correta é `RunService:IsRunning()` (inverso de `IsEdit()`): edição normal =
+`IsRunning() == false`; F8 Run ou F5 Play = `IsRunning() == true`. Condição
+adotada em `plugin/src/init.server.luau` para "devo sincronizar":
+`RunService:IsStudio() and not RunService:IsRunning()`.
+
+**Onde foi plugado**: novo loop próprio em `init.server.luau`
+(`checkRunModeTransition`, `task.spawn` dedicado, polling a cada
+`Config.POLL_INTERVAL_SECONDS` — reaproveitado o mesmo intervalo já usado para
+o polling de Source, sem inventar timer novo) detecta a TRANSIÇÃO de edição
+para Run/Play (chama `stop()`) e de volta (chama `start(plugin)` de novo, só
+se foi este guard quem parou — flag `runGuardStoppedSync`). Checagem só no
+boot não bastaria: o dev pode apertar F8/F5 depois do plugin já estar
+conectado. O auto-start no fim do arquivo também ganhou a mesma checagem (não
+inicia automaticamente se o script carregar já em modo Run/Play).
+
+**Limitação conhecida, aceita, não resolvida**: quando o teste é PAUSADO, a
+doc oficial afirma que `IsRunning()` (e `IsEdit()`) ficam ambos `false` — ou
+seja, este guard pode falso-negativo (achar que voltou para edição normal
+enquanto o teste só está pausado) e retomar o sync indevidamente durante uma
+pausa de teste. Não há solução limpa documentada para isso (a pesquisa citada
+não encontrou confirmação de comportamento de plugin real nesse caso
+específico) — tratado como limitação conhecida, não uma tentativa de hack.
+
+**Validado só por `rojo build` + `lune run`** em `init.server.luau` — sem erro
+de sintaxe, erro esperado só na primeira linha que toca `game`. Nada testado
+em Studio real nesta tarefa (transição de fato ao apertar F8/F5, comportamento
+durante pause) — fica `[Hipótese]` quanto ao comportamento em runtime real até
+o usuário confirmar.
+
+## 2026-07-16 — Bug real corrigido: materialização inicial duplicava `.lua` já existente em `.luau` novo
+
+**[Verificado]** — confirmado testando com Wally de verdade em Studio, contra
+um place que já tinha pacotes instalados via `wally install` puro (extensão
+`.lua`, antes do SyncTeam existir no workspace). Causa raiz:
+`recomputeAndApplyLayout` (`vscode-extension/src/sync/SyncBridge.ts`) usa
+`computeLayout` (`rojoPathMapping.ts`), que por decisão de projeto SEMPRE
+escolhe extensão `.luau` na escrita — e a primeira materialização de um uuid
+ainda sem `diskPath` conhecido nunca checava se já existia em disco um `.lua`
+correspondente (mesmo diretório, mesmo nome-base) antes de decidir onde
+escrever. Resultado: uuid cujo script já tinha `Nome.lua`/`Nome.server.lua`
+etc. em disco (de uma instalação Wally anterior, fora do SyncTeam) ganhava um
+`.luau` extra ao lado — duplicata real do mesmo script em dois arquivos,
+deixando o `.lua` original órfão (não deletado, só abandonado).
+
+**Fix**: `SyncBridge.resolveInitialDiskPath` — chamado só na materialização
+INICIAL (`recomputeAndApplyLayout`, ramo `previous === undefined`, ou seja
+`diskPathByUuid.get(uuid) === undefined`). Antes de escrever no `diskPath`
+`.luau` computado, checa via `DiskIO.readFile` se o `.lua` equivalente
+(`diskPath.replace(/\.luau$/i, ".lua")`) já existe; se existir, reaproveita
+esse caminho como o `diskPath` do uuid em vez de criar o `.luau` novo. Se não
+existir, comportamento anterior é preservado (`.luau`, como sempre). Escopo
+deliberadamente restrito a essa primeira materialização — `moveOnDisk`/rename
+de scripts já sincronizados (`handleScriptMoved`) não foi alterado, é
+comportamento fora de escopo desta correção (regra geral "escrita sempre
+`.luau` para arquivos NOVOS de verdade" continua valendo).
+
+Testes: `vscode-extension/test/syncBridge.test.ts`, describe
+"materialização inicial reaproveita .lua pré-existente (2026-07-16)" — uuid
+novo com `.lua` pré-existente reaproveita sem criar `.luau` duplicado; uuid
+novo sem nada em disco continua materializando `.luau` normalmente (sem
+regressão). 181/181 testes (`npx vitest run --pool=threads`), `tsc --noEmit`
+e `npm run build` limpos.
+
 ## 2026-07-16 — Rejeitado: auto-editar `wally.toml` do colega ao detectar pacote novo replicado
 
 **Decisão pendente resolvida como "não fazer" por ora** (usuário pediu

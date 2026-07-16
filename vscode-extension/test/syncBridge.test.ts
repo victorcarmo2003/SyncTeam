@@ -181,6 +181,37 @@ describe("dedupe por cache de conteúdo", () => {
   });
 });
 
+describe("materialização inicial reaproveita .lua pré-existente (2026-07-16)", () => {
+  test("uuid novo com .lua já existente em disco reaproveita o .lua, sem criar .luau duplicado", async () => {
+    // Simula wally install puro (fora do SyncTeam) já tendo gravado o .lua
+    // ANTES da extensão conhecer esse uuid (extensão gravada por
+    // computeLayout para um Script é sempre "*.server.<ext>").
+    writeTmp("src/server/Main.server.lua", "-- conteúdo antigo do wally install");
+
+    const transport = new FakeTransport();
+    transport.scripts.push({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script" });
+    transport.sources.set("uuid-main", "print('novo conteúdo do Studio')");
+
+    await bridge.runInitialSync(transport);
+
+    expect(existsTmp("src/server/Main.server.luau")).toBe(false);
+    expect(existsTmp("src/server/Main.server.lua")).toBe(true);
+    expect(readTmp("src/server/Main.server.lua")).toBe("print('novo conteúdo do Studio')");
+    expect(bridge.resolveDiskPathForUuid("uuid-main")).toBe("src/server/Main.server.lua");
+  });
+
+  test("uuid novo sem nada em disco continua materializando .luau normalmente (sem regressão)", async () => {
+    const transport = new FakeTransport();
+    transport.scripts.push({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script" });
+    transport.sources.set("uuid-main", "print('oi')");
+
+    await bridge.runInitialSync(transport);
+
+    expect(existsTmp("src/server/Main.server.luau")).toBe(true);
+    expect(bridge.resolveDiskPathForUuid("uuid-main")).toBe("src/server/Main.server.luau");
+  });
+});
+
 describe("pastas de pacotes Wally — exclusão do live-edit-sync (2026-07-16)", () => {
   test("handleSourceChanged (Studio→disco) ignora ATUALIZAÇÃO de script já materializado dentro de Packages", async () => {
     const transport = new FakeTransport();

@@ -49,6 +49,20 @@ local log = Logger.log
 -- Caminho completo relativo a `game` (ex.: "ServerScriptService/Foo/Bar").
 -- nil se a instância não estiver (mais) sob `game` (ex.: destruída antes do
 -- Removing terminar de processar). Display-only a partir do M2 (ver cabeçalho).
+-- Adicionado 2026-07-16 (consolidação de log de boot, ver init.server.luau/
+-- Logger.luau): número de scripts atualmente observados, para compor a linha
+-- única "conectado" exibida ao usuário quando a conexão estabiliza. Leitura
+-- simples do tamanho de `watched` — sem custo além de percorrer a tabela (já
+-- feito de igual forma dentro de SourceWatcher.start() para o log de debug
+-- "observação iniciada").
+function SourceWatcher.getWatchedCount()
+	local count = 0
+	for _ in watched do
+		count += 1
+	end
+	return count
+end
+
 function SourceWatcher.pathFor(instance)
 	local parts = {}
 	local current = instance
@@ -427,7 +441,9 @@ function SourceWatcher.start()
 	for _ in watched do
 		count += 1
 	end
-	log(("observação iniciada (%d scripts encontrados nos containers observados)."):format(count))
+	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
+	-- continua encaminhado por WS, só não polui o Output a cada conexão.
+	Logger.debug(("observação iniciada (%d scripts encontrados nos containers observados)."):format(count))
 end
 
 function SourceWatcher.stop()

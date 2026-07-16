@@ -644,7 +644,9 @@ function TeamCreateLease.start()
 		end
 	end)
 
-	log("leases: ciclo iniciado.")
+	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
+	-- continua encaminhado por WS, só não polui o Output a cada conexão.
+	Logger.debug("leases: ciclo iniciado.")
 end
 
 -- Não precisa destruir LeaseIntents/Leases explicitamente: pastas de intent

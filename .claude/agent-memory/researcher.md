@@ -39,6 +39,19 @@ tarefa; mantenha curto e acionável.
   replies confirmado via `.json` do Discourse). `HttpService.yaml` (mesmo
   atalho) confirma limite oficial de "six total clients" para
   `CreateWebStreamClient` — bate com o que já está em `.claude/rules/luau.md`.
+- `reference/engine/classes/RunService.yaml` (mesmo atalho raw) tem a doc
+  verbatim de `IsStudio`/`IsRunning`/`IsEdit`/`IsClient`/`IsServer`. Achado
+  central (ver `.claude/research/2026-07-16-runservice-isstudio-isrunning-plugin-detect-test.md`):
+  `IsStudio()` é `true` tanto em Edição quanto durante Play/Run (F5/F8) DENTRO
+  do processo do Studio — não serve para distinguir os dois (confirmado por
+  doc oficial + múltiplos relatos de fórum). Quem distingue é
+  `IsRunning()`/`IsEdit()` (inversos entre si, exceto ambos `false` quando a
+  simulação está pausada — doc oficial). Padrão certo para plugin: `IsStudio()
+  and not IsRunning()` = edição normal. Única exceção documentada de
+  `IsStudio()` == `false` dentro de um fluxo iniciado do Studio: o SERVIDOR de
+  Team Test (não o cliente) — confirmado por staff (`tnavarts`) como
+  intencional, servidor de Team Test é "servidor live normal", não sessão de
+  Studio.
 - DevForum: buscar por `"UpdateSourceAsync" site:devforum.roblox.com` via
   WebSearch encontra vários bugs conhecidos (Drafts mode + script recém-criado,
   Live Scripting + CRLF, strings grandes estourando Team Create). Padrão:
@@ -122,6 +135,10 @@ tarefa; mantenha curto e acionável.
   `Player`s simulados, não serve para testar colaboração de EDIÇÃO via Team
   Create entre duas identidades reais — são features diferentes, não
   confundir ao responder perguntas sobre "testar Team Create sozinho".
+  Detalhe adicional confirmado 2026-07-16: o SERVIDOR de Team Test roda como
+  processo separado (não é "sessão de Studio" para efeitos de
+  `RunService:IsStudio()`, que retorna `false` nele) — só o cliente de Team
+  Test mantém `IsStudio() == true`.
 
 ## Achados que podem ser reaproveitados
 
@@ -198,3 +215,14 @@ tarefa; mantenha curto e acionável.
   separadamente no `default.project.json` do Rojo) — colocá-lo dentro é
   destruído na próxima `wally install`. Detalhe completo em
   `.claude/research/2026-07-16-wally-packages-manual-module.md`.
+- **`RunService:IsStudio()` NÃO distingue Edição de Play/Run (F5/F8) dentro
+  do Studio — é `true` nos dois.** A API correta é `RunService:IsRunning()`
+  (ou `IsEdit()`, seu inverso documentado): edição normal =
+  `IsStudio() and not IsRunning()`. As duas (`IsRunning`/`IsEdit`) só
+  divergem — ficando ambas `false` — quando a simulação está pausada
+  (doc oficial, sem confirmação de teste real de plugin encontrada — se
+  relevante, validar manualmente). Única exceção documentada de
+  `IsStudio() == false` num fluxo iniciado do Studio: servidor de Team Test
+  (staff confirma que não é "sessão de Studio"); o cliente de Team Test
+  continua `true`. Detalhe completo em
+  `.claude/research/2026-07-16-runservice-isstudio-isrunning-plugin-detect-test.md`.

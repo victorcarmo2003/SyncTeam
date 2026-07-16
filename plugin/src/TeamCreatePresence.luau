@@ -403,7 +403,9 @@ function TeamCreatePresence.start()
 		end
 	end)
 
-	log("presença: ciclo iniciado.")
+	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
+	-- continua encaminhado por WS, só não polui o Output a cada conexão.
+	Logger.debug("presença: ciclo iniciado.")
 end
 
 -- Não precisa destruir a própria Presence explicitamente: vive sob

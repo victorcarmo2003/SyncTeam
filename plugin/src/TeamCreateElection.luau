@@ -401,7 +401,9 @@ function TeamCreateElection.start(userIdParam)
 	announcedLeader = nil
 
 	ensureOwnSession()
-	log(("sessão criada clientId=%s userId=%d"):format(clientId, userId))
+	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
+	-- continua encaminhado por WS, só não polui o Output a cada conexão.
+	Logger.debug(("sessão criada clientId=%s userId=%d"):format(clientId, userId))
 
 	-- Username via Players:GetNameFromUserIdAsync (yield), então roda em
 	-- task.spawn separado — decisão 2 do cabeçalho. Reconfere token/enabled

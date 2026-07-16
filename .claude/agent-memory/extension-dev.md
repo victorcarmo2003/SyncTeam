@@ -810,3 +810,49 @@ não podem empurrar Source de pacote vendorizado um pro outro via Team Create.
 - **Não testado em Studio real** — mesma limitação do lado luau-dev; fica
   `[Hipótese]` até round-trip real (instalar pacote Wally de verdade, editar
   pelos dois lados, confirmar que nada vaza).
+
+## Materialização inicial duplicava `.lua` existente em `.luau` novo — bug real, corrigido (2026-07-16)
+
+Achado testando com Wally de verdade em Studio: um projeto que já tinha
+`wally install` puro rodado ANTES do SyncTeam existir no workspace (pacotes
+`.lua`) fazia a sincronização inicial criar um `.luau` NOVO do lado do `.lua`
+já existente — mesmo uuid, dois arquivos, `.lua` original abandonado.
+
+- **Causa raiz**: `recomputeAndApplyLayout`, ramo `previous === undefined`
+  (primeira materialização de um uuid, `diskPathByUuid.get(uuid)` ainda
+  indefinido) — usava direto o `diskPath` de `computeLayout` (sempre `.luau`,
+  regra de projeto) sem NUNCA checar se já existia um `.lua` correspondente
+  em disco para o MESMO instancePath.
+- **Fix**: método novo `SyncBridge.resolveInitialDiskPath(computedDiskPath)`
+  — deriva o candidato `.lua` por `computedDiskPath.replace(/\.luau$/i,
+  ".lua")` (funciona pros 3 casos: `Nome.lua`, `Nome.server.lua`,
+  `Nome.client.lua`, e pro `init.*` também, já que o `.replace` só troca o
+  sufixo de extensão, não olha o nome-base) e checa existência via
+  `this.diskIO.readFile(luaCandidate) !== null`. Se existir, retorna o
+  `.lua` como o diskPath a usar; senão, retorna o `.luau` computado
+  (comportamento antigo, sem regressão). Chamado APENAS no ramo
+  `previous === undefined` de `recomputeAndApplyLayout` — `moveOnDisk`/
+  `handleScriptMoved` (rename de scripts JÁ sincronizados) não foi tocado,
+  deliberadamente fora de escopo (pedido explícito da tarefa).
+- **Não precisou de método novo em `DiskIO`** — `readFile` retornando
+  `null` para arquivo inexistente (contrato já documentado na interface) já
+  era suficiente para "existe arquivo X?"; não precisei do `listFiles` que a
+  tarefa sugeria como alternativa.
+- **Pegadinha ao escrever o teste**: o candidato `.lua` para uma classe
+  `Script` é `Nome.server.lua` (troca só o `.luau` final por `.lua`,
+  preservando `.server`/`.client`), NÃO `Nome.lua` — errei isso na primeira
+  versão do teste e só percebi lendo `EXTENSION_BY_CLASS` em
+  `rojoPathMapping.ts` de novo (`Script` → ext `"server.luau"`, filename
+  final = `${baseName}.server.luau`). Qualquer teste futuro que monte o
+  candidato `.lua` manualmente por classe precisa lembrar disso.
+- **Testes**: `test/syncBridge.test.ts`, novo describe "materialização
+  inicial reaproveita .lua pré-existente (2026-07-16)" (2 testes: `.lua`
+  pré-existente é reaproveitado com o conteúdo novo do Studio, sem `.luau`
+  duplicado; sem nada em disco continua indo pro `.luau` normal). 181 testes
+  no total (era 179). `npx tsc --noEmit` limpo, `npx vitest run
+  --pool=threads` 181/181, `npm run build` gera os dois bundles sem erro.
+- **Registrado em `docs/DECISIONS.md`** (2026-07-16, topo do arquivo).
+- **Não testado em Studio real ainda** — só a lógica com `NodeDiskIO` real
+  em tmpdir (não fake em memória, mesma prática de sempre). Cenário completo
+  (rodar a extensão de verdade contra o projeto Wally real do usuário que
+  expôs o bug) fica pendente de confirmação com o usuário/roteiro manual.

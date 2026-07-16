@@ -29,6 +29,17 @@ Config.PORT_SETTING_KEY = "SyncTeam_WsPort"
 -- Logger.luau). Default true (ligado) quando a setting nunca foi tocada.
 Config.NOTIFICATIONS_SETTING_KEY = "SyncTeam_ShowNotifications"
 
+-- Chave de plugin:GetSetting/SetSetting para autostart (2026-07-16, pedido do
+-- usuário após teste real). Ao contrário de NOTIFICATIONS_SETTING_KEY
+-- (default true/ligado), o default AQUI é false/DESLIGADO — decisão
+-- deliberada: o comportamento anterior (auto-start incondicional ao carregar
+-- o plugin, ver init.server.luau) conectava sem o dev pedir; a partir de
+-- agora o dev decide quando conectar clicando em CONNECT no painel, e só quem
+-- ligar esta setting explicitamente (ainda sem UI dedicada nesta fatia —
+-- mesmo padrão de PORT_SETTING_KEY quando foi introduzida, usuário avançado
+-- via plugin:SetSetting(...) no Command Bar) volta a ter auto-start.
+Config.AUTOSTART_SETTING_KEY = "SyncTeam_AutoStart"
+
 -- Lista de portas candidatas usada SÓ quando não há nenhuma porta
 -- explicitamente persistida em plugin:GetSetting(PORT_SETTING_KEY) (nem por
 -- SetSetting manual, nem por uma descoberta automática de sessão anterior —
@@ -185,6 +196,23 @@ function Config.resolveNotificationsEnabled(pluginObject)
 		return value
 	end
 	return true
+end
+
+-- Preferência efetiva de autostart (2026-07-16): setting do plugin se
+-- presente e booleana, senão default FALSE (oposto de
+-- resolveNotificationsEnabled — ver comentário de AUTOSTART_SETTING_KEY
+-- acima). GetSetting pode devolver nil (nunca setado, o caso normal para
+-- todo mundo até que exista UI para isto) ou um valor de tipo errado —
+-- ambos caem no default desligado, nunca erram para o lado de conectar
+-- sozinho sem o dev pedir.
+function Config.resolveAutoStartEnabled(pluginObject)
+	local ok, value = pcall(function()
+		return pluginObject:GetSetting(Config.AUTOSTART_SETTING_KEY)
+	end)
+	if ok and type(value) == "boolean" then
+		return value
+	end
+	return false
 end
 
 return Config

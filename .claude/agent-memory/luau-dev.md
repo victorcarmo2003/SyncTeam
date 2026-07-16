@@ -3,6 +3,73 @@
 Aprendizados de API do Studio e pegadinhas de Luau encontrados no projeto.
 Atualize ao final de cada tarefa; mantenha curto e acionável.
 
+## Autostart opt-in + `Logger.debug` (consolidação de ruído de boot), 2026-07-16
+
+- **Padrão "default invertido" entre duas settings booleanas irmãs**:
+  `Config.resolveNotificationsEnabled` (default `true`) e o novo
+  `Config.resolveAutoStartEnabled` (default `false`) têm a MESMA forma de
+  função (`pcall(GetSetting)` -> se `boolean`, usa; senão, default) mas
+  defaults opostos por design — não é inconsistência, é intencional (uma é
+  "ligado a menos que o dev desligue", outra é "desligado a menos que o dev
+  ligue"). Ao adicionar uma nova setting booleana no projeto, sempre perguntar
+  explicitamente qual o default correto antes de copiar o padrão existente.
+- **`Logger.debug(...)` novo (`plugin/src/Logger.luau`)**: mesmo forward por
+  WS de `Logger.log` (a extensão/Tools continuam vendo tudo — observabilidade
+  de teste automatizado nunca foi tocada), só que sem `print()` no Output do
+  Studio. Não existe (ainda) um conceito real de "log level" no projeto — isto
+  é a MENOR mudança que resolve "usuário vê rajada de ruído no Output" sem
+  perder informação de diagnóstico (que continua acessível via WS/Tools). Se
+  o projeto precisar de mais níveis no futuro (ex.: um 3º nível "trace"), essa
+  função é o lugar natural de estender (parâmetro de nível em vez de
+  log/debug separados), mas não havia necessidade concreta ainda — YAGNI.
+- **Qual log virou o "consolidado" de conexão**: o antigo `log("conectado em
+  %s")` disparava OTIMISTICAMENTE assim que `CreateWebStreamClient` retornava
+  com sucesso — ANTES de saber se o handshake ia realmente vingar (podia
+  logar "conectado" e cair com `ConnectFail` 40ms depois, e repetir isso 3x
+  seguidas, exatamente o log colado pelo usuário nesta tarefa). Isso já era
+  reconhecido no comentário do código ("NÃO vira connected/vermelho aqui...
+  otimista") só que o LOG não seguia essa mesma disciplina até esta tarefa —
+  lição: quando um comentário já documenta "isto é otimista, o estado real é
+  mais adiante", o LOG ao lado da criação do objeto deveria seguir a MESMA
+  disciplina do estado visual, não só a UI. Fix: virou `Logger.debug`; o
+  `Logger.log` de verdade (`"conectado em ... (N scripts observados)"`) foi
+  movido para dentro do `if stabilized and not shownConnected then` (mesmo
+  ponto que já fazia `PluginUI.setConnectionStatus("connected")`).
+- **Novo `SourceWatcher.getWatchedCount()`**: getter trivial (conta o mapa
+  `watched` module-level) adicionado só para a linha de log consolidada poder
+  reportar quantos scripts estão sendo observados no momento da conexão
+  estabilizar, sem duplicar a lógica de contagem que já existia (inline)
+  dentro de `SourceWatcher.start()`.
+- **Investigação do `stop()` sem log de Run/Play (2026-07-16, prioridade
+  rebaixada pelo usuário no meio da tarefa)**: sequência completa de shutdown
+  (`observação parada`/`sessão removida`/`parado.`) apareceu no log real sem
+  a linha que o guard de Run/Play sempre loga ANTES de chamar `stop()` —
+  então o guard está excluído como causa (confirmado por leitura de código,
+  não só suposição). Também descartados por leitura de código:
+  `onPortChange` (usuário não mexeu na porta) e qualquer disparo espúrio de
+  `Activated` no botão CONNECT/DISCONNECT via `PluginUI.luau`/`StatusPanel.luau`
+  — todo `Activated`/`MouseEnter`/`MouseLeave` naqueles arquivos é uma conexão
+  de sinal ESTÁTICA, criada 1x dentro de `vide.mount`/`vide.create` (não
+  dentro de nenhum efeito reativo que rode de novo), e a árvore inteira
+  (`MainView`/`ConnectRow`) é construída 1x só — não há caminho óbvio de
+  recriação/reconexão espúria do botão. **Candidato mais plausível, não
+  confirmado**: `plugin.Unloading:Connect(stop)` disparando por REDEPLOY do
+  plugin (`Tools/build-and-deploy-plugin.ps1`/`.sh` sobrescreve o arquivo
+  instalado, o que o Studio trata como reload — `Unloading` dispara para a
+  instância antiga, independente de o Studio ter fechado; a suposição do
+  usuário de "não é isso, Studio não fechou" não cobre esse caso). **Não
+  investigado mais a fundo**: usuário confirmou que a causa raiz do ciclo de
+  reconexão observado era simplesmente o servidor da extensão estar desligado
+  (comportamento esperado, não bug) — tarefa despriorizada antes de eu
+  esgotar a investigação do `stop()` isolado; nenhuma instrumentação foi
+  adicionada (não pedida). Se reaparecer: instrumentar `stop()` com
+  `debug.traceback()` no topo é o próximo passo mais barato.
+- Validado só por `rojo build` + `lune run` nos 8 arquivos tocados
+  (`Config.luau`, `Logger.luau`, `SourceWatcher.luau`, `ScriptRegistry.luau`,
+  `TeamCreateElection.luau`, `TeamCreateLease.luau`, `TeamCreatePresence.luau`,
+  `init.server.luau`) — sem erro de sintaxe. **Nada testado em Studio real
+  nesta tarefa** — roteiro em `docs/PROJECT_STATUS.md` (seção mais recente).
+
 ## Exclusão de pastas Wally (`Packages`/`ServerPackages`/`DevPackages`) do live edit sync, 2026-07-16
 
 - **Risco de arquitetura aprovado pelo usuário, não experimental**: plugin
@@ -1181,3 +1248,91 @@ Atualize ao final de cada tarefa; mantenha curto e acionável.
   confirmar que a conexão nova SOBREVIVE (nenhum `stop()` do clientId
   recém-criado ~40ms depois), e que uma troca legítima subsequente (porta
   diferente) ainda funciona apesar do dedupe.
+
+## Limpeza de prints de debug + guard de Run/Play (F8/F5), 2026-07-16
+
+- **Auditoria de `print()` cru em `plugin/src/` (init.server.luau, Config.luau,
+  Logger.luau, SourceWatcher.luau, TeamCreateElection.luau,
+  TeamCreateLease.luau, TeamCreateSchema.luau, TeamCreatePresence.luau,
+  ScriptRegistry.luau, ui/*.luau): nada para remover.** `grep -rn "print("`
+  recursivo só achou 2 arquivos: `Logger.luau` (o próprio canal oficial de
+  log — `print(prefix, ...)` dentro de `renderPrintAndForward`, é o Logger em
+  si, não um debug esquecido) e `init.server.luau` (dois `print()` dentro de
+  `sendMessage`, já documentados no próprio arquivo desde 2026-07-07 como
+  exceção deliberada anti-recursão: se usassem `Logger.log`, uma falha de
+  envio disparia Logger.log -> sendMessage -> falha -> log via Logger.log ->
+  sendMessage de novo, sem saída natural do ciclo). Nenhum print achado sem
+  justificativa documentada — não houve conversão para `Logger.info` porque
+  não havia nada "órfão" carregando informação útil sem canal.
+- **Guard de Run/Play (F8 Run / F5 Play) em `plugin/src/init.server.luau`**:
+  confirmado por `.claude/research/2026-07-16-runservice-isstudio-isrunning-plugin-detect-test.md`
+  que `RunService:IsStudio()` sozinho NÃO distingue edição de teste (fica
+  `true` nos dois); condição correta = `RunService:IsStudio() and not
+  RunService:IsRunning()`. Implementado com um loop `task.spawn` PRÓPRIO
+  (independente de `enabled`/`currentToken`, porque precisa detectar o
+  retorno à edição mesmo desconectado) que faz polling a
+  `Config.POLL_INTERVAL_SECONDS` (reaproveitado, não criei timer novo) via
+  `checkRunModeTransition()`: ao detectar a transição edição->Run/Play,
+  chama `stop()` e marca `runGuardStoppedSync = true`; ao detectar a
+  transição de volta, só chama `start(plugin)` de novo SE foi este guard
+  quem parou (não reativa se o usuário tinha desconectado manualmente antes
+  do F8/F5). Estado inicial (`wasInRunOrPlayMode`) já nasce lendo
+  `RunService:IsRunning()` no load do módulo, e o auto-start no fim do
+  arquivo ganhou a mesma checagem (não inicia automaticamente se o script
+  carregar já em modo Run/Play — caso raro, ex. reinstalação do plugin com
+  teste já rodando). Loop desligado via `plugin.Unloading` (nova conexão,
+  flag `runModeMonitorEnabled = false`).
+- **Limitação conhecida e aceita, documentada em vez de "resolvida"**: doc
+  oficial diz que `IsRunning()`/`IsEdit()` ficam AMBOS `false` quando o teste
+  está PAUSADO — este guard pode falso-negativo e retomar o sync durante uma
+  pausa de teste (achando que voltou pra edição). Não tentei mitigar com
+  hack (ex.: monitorar Selection/outro evento) porque a pesquisa não
+  encontrou confirmação de comportamento real de plugin nesse caso
+  específico — registrado como limitação em docs/DECISIONS.md 2026-07-16,
+  não código defensivo especulativo.
+- Validado só por `rojo build` (limpo) + `lune run` em `init.server.luau`
+  (para na linha esperada `game:GetService`, sem erro de sintaxe antes
+  disso). **Nada testado em Studio real** — a transição de fato ao apertar
+  F8/F5 (stop()/start() disparando, timing do polling, e o caso de pause)
+  fica `[Hipótese]` até o usuário confirmar com Studio real. Sem roteiro
+  manual dedicado ainda escrito (tarefa não pediu, e a ação é só "apertar
+  F8/F5 com o plugin conectado e observar o Output/painel") — se o usuário
+  quiser, um roteiro simples é: (1) conectar normalmente, (2) apertar F8,
+  confirmar log "sync suspenso durante o teste" e painel indo para
+  desconectado, (3) parar o teste, confirmar log "retomando sync" e nova
+  reconexão automática.
+
+## Silenciar "descartado (sem conexão): log" duplicado no boot, 2026-07-16
+
+- **Ruído real reportado pelo usuário via log colado do Output**: nos
+  primeiros segundos antes do WS conectar, toda linha de log normal do boot
+  (`observação iniciada`, `sessão criada`, `leases: ciclo iniciado`,
+  `presença: ciclo iniciado`) vinha seguida de uma linha extra `descartado
+  (sem conexão): log` — dobrava a quantidade de linhas. Causa: `sendMessage`
+  em `plugin/src/init.server.luau` avisava "descartado" para QUALQUER `kind`
+  descartado por falta de conexão, inclusive `kind == "log"` — que é o
+  próprio `Logger.log` (`Logger.luau`, `renderPrintAndForward`) se
+  auto-encaminhando pela conexão WS. Como o conteúdo já apareceu no Output
+  via `print()` dentro do próprio `Logger.log`, o aviso "descartado" pra esse
+  `kind` era 100% redundante, nunca informação nova.
+- **Fix cirúrgico, um `if` a mais dentro do branch `client == nil` de
+  `sendMessage`**: só imprime `"descartado (sem conexão): <kind>"` quando
+  `message.kind ~= "log"`. Mensagens de protocolo reais (`scriptAdded`,
+  `presenceUpdate`, `leaseChanged`, etc.) continuam avisando normalmente
+  quando descartadas sem conexão — isso ainda é sinal útil pra depurar por
+  que algo não chegou na extensão. Não toquei no aviso de erro real (`falha
+  ao enviar: ...`, branch do `pcall` de `client:Send`) — continua idêntico
+  pra qualquer kind, é falha de verdade, não redundância.
+- **Por que não mexer em `Logger.luau`**: a causa não é o `Logger.log`
+  chamar `sendMessage` demais — é o `sendMessage` decidir logar sobre a
+  PRÓPRIA tentativa de encaminhamento de log. Resolver no ponto de origem
+  (`init.server.luau`) evita qualquer necessidade de `Logger.luau` saber que
+  está se auto-referenciando (o cuidado de recursão já documentado no
+  cabeçalho de `Logger.luau` — os dois `print()` de `sendMessage` são puros,
+  nunca `Logger.log` — continua intacto e não foi mexido).
+- Validado só por `rojo build` (limpo) + `lune run init.server.luau` (para na
+  linha esperada `attempt to index nil with 'GetService'`, sem erro de
+  sintaxe antes disso). **Nada testado em Studio real** — não precisa: é
+  puramente uma condição de `print`, sem lógica de rede/replicação nova pra
+  validar; o próprio usuário fecha o loop ao rodar o plugin de novo e ver o
+  Output limpo.

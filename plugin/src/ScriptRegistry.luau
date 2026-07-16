@@ -188,7 +188,10 @@ function ScriptRegistry.reconcile(isWatched)
 		uuidByInstance[instance] = folder.Name
 		reused += 1
 	end
-	log(("registry reconciliado: %d reaproveitados, %d removidos (obsoletos)."):format(reused, stale))
+	-- 2026-07-16: rebaixado para Logger.debug (ruído rotineiro de boot, ver
+	-- Logger.luau) — continua encaminhado por WS para observabilidade de
+	-- teste, só não aparece mais no Output do Studio a cada conexão.
+	Logger.debug(("registry reconciliado: %d reaproveitados, %d removidos (obsoletos)."):format(reused, stale))
 end
 
 -- Resolve o uuid de uma Instance observada, alocando um novo (e criando a

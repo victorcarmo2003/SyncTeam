@@ -165,9 +165,10 @@ export class SyncBridge {
       }
       const previous = this.diskPathByUuid.get(uuid);
       if (previous === undefined) {
-        this.registerDiskPath(uuid, diskPath);
+        const resolvedDiskPath = await this.resolveInitialDiskPath(diskPath);
+        this.registerDiskPath(uuid, resolvedDiskPath);
         if (this.sourceCache.has(uuid)) {
-          await this.writeToDisk(uuid, diskPath, this.sourceCache.get(uuid) as string, `novo path (${reason})`);
+          await this.writeToDisk(uuid, resolvedDiskPath, this.sourceCache.get(uuid) as string, `novo path (${reason})`);
         }
         continue;
       }
@@ -176,6 +177,41 @@ export class SyncBridge {
       }
       await this.moveOnDisk(uuid, previous, diskPath, reason);
     }
+  }
+
+  /**
+   * Materialização INICIAL de um uuid ainda sem `diskPath` conhecido:
+   * `computeLayout` sempre decide extensão `.luau` (regra do projeto), mas se
+   * já existir em disco um arquivo `.lua` correspondente (mesmo diretório,
+   * mesmo nome-base — típico de um `wally install` puro rodado ANTES do
+   * SyncTeam existir no workspace, ou de qualquer outra ferramenta que grave
+   * `.lua`), reaproveita esse caminho em vez de criar um `.luau` duplicado ao
+   * lado, o que deixaria o `.lua` original órfão. Bug real confirmado
+   * testando com Wally de verdade em Studio — ver docs/DECISIONS.md
+   * 2026-07-16. Escopo estritamente limitado à primeira materialização
+   * (chamado só quando `diskPathByUuid.get(uuid) === undefined`); rename/move
+   * de scripts já sincronizados (`moveOnDisk`) não passa por aqui.
+   */
+  private async resolveInitialDiskPath(computedDiskPath: string): Promise<string> {
+    const luaCandidate = computedDiskPath.replace(/\.luau$/i, ".lua");
+    if (luaCandidate === computedDiskPath) {
+      // Não deveria acontecer: computeLayout sempre produz `.luau`. Guarda
+      // defensiva caso essa premissa mude no futuro.
+      return computedDiskPath;
+    }
+    try {
+      const existing = await this.diskIO.readFile(luaCandidate);
+      if (existing !== null) {
+        this.logger.info(
+          `layout: '${luaCandidate}' já existe em disco (provável instalação Wally anterior ao SyncTeam) — ` +
+            `reaproveitando em vez de criar '${computedDiskPath}'`,
+        );
+        return luaCandidate;
+      }
+    } catch (error) {
+      this.logger.error(`layout: erro checando existência de '${luaCandidate}': ${(error as Error).message}`);
+    }
+    return computedDiskPath;
   }
 
   private async writeToDisk(uuid: string, diskPath: string, content: string, reason: string): Promise<void> {

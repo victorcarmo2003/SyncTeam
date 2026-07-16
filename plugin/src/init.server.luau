@@ -43,6 +43,7 @@
 -- Config.resolveCandidatePorts).
 
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 local StudioService = game:GetService("StudioService")
 
 local Config = require(script.Config)
@@ -56,6 +57,29 @@ local PluginUI = require(script.ui.PluginUI)
 local enabled = false
 local currentToken = 0
 local client = nil -- WebStreamClient conectado no momento (nil se desconectado)
+
+-- Guarda de modo Run/Play (F8 Run / F5 Play), 2026-07-16 — pesquisa em
+-- .claude/research/2026-07-16-runservice-isstudio-isrunning-plugin-detect-test.md.
+-- `RunService:IsStudio()` sozinho NÃO distingue edição normal do Team Create de
+-- um teste rodando dentro do próprio Studio (fica `true` nos dois casos) — a
+-- condição correta de "devo sincronizar" é `IsStudio() and not IsRunning()`.
+-- Checagem só no boot não basta: o dev pode apertar F8/F5 DEPOIS do plugin já
+-- estar conectado, então isso precisa de polling contínuo detectando a
+-- TRANSIÇÃO edição->teste (chama stop()) e teste->edição (chama start() de
+-- novo, só se este guard foi quem parou). Reaproveita
+-- Config.POLL_INTERVAL_SECONDS (mesmo intervalo já usado para o polling de
+-- Source) em vez de um timer novo dedicado — loop próprio, module-level,
+-- independente de `enabled`/`currentToken` (precisa rodar mesmo desconectado,
+-- para detectar o retorno à edição e poder chamar start() de novo).
+--
+-- Limitação conhecida, não resolvida (documentada na pesquisa e em
+-- docs/DECISIONS.md 2026-07-16): quando o teste é PAUSADO, a doc oficial
+-- afirma que `IsRunning()` (e `IsEdit()`) ficam ambos `false` — ou seja, este
+-- guard pode falso-negativo e achar que voltou para edição normal enquanto o
+-- teste só está pausado, retomando o sync indevidamente. Não há solução limpa
+-- documentada para isso; tratado como limitação aceita, não um hack.
+local wasInRunOrPlayMode = RunService:IsStudio() and RunService:IsRunning()
+local runGuardStoppedSync = false -- true quando ESTE guard (não o usuário) chamou stop() por causa do Run/Play
 
 -- Sinal EXPLÍCITO de rejeição de porta (2026-07-15): a extensão VS Code rejeita
 -- um 2º cliente na mesma porta mandando uma mensagem de aplicação
@@ -116,7 +140,16 @@ local notify = Logger.notify
 -- Formato do print mantido idêntico ao de antes desta tarefa.
 local function sendMessage(message)
 	if client == nil then
-		print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), "descartado (sem conexão):", tostring(message.kind))
+		-- kind == "log" é o próprio Logger.log tentando se auto-encaminhar
+		-- pela conexão WS (ver Logger.luau) — o conteúdo já apareceu no
+		-- Output via print() dentro de Logger.log; avisar "descartado" aqui
+		-- é só ruído duplicado, não uma falha real. Mensagens de protocolo de
+		-- verdade (scriptAdded, presenceUpdate, etc.) continuam avisando,
+		-- porque isso é informação útil para depurar por que algo não
+		-- chegou na extensão.
+		if message.kind ~= "log" then
+			print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), "descartado (sem conexão):", tostring(message.kind))
+		end
 		return
 	end
 	local ok, err = pcall(function()
@@ -455,7 +488,11 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 			closed = true
 		end))
 		table.insert(connections, newClient.Error:Connect(function(code, errorMessage)
-			log(("erro WS %s %s"):format(tostring(code), tostring(errorMessage)))
+			-- 2026-07-16: Logger.debug (ver Logger.luau) — um ConnectFail isolado
+			-- é ruído rotineiro do loop de reconexão (a linha visível de verdade
+			-- é "desconectado; reconectando em Xs" logo abaixo, categoria
+			-- "reconectando"); continua encaminhado por WS para diagnóstico.
+			Logger.debug(("erro WS %s %s"):format(tostring(code), tostring(errorMessage)))
 			closed = true
 		end))
 
@@ -465,7 +502,11 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 		-- mandar o hello é otimista (a conexão pode falhar logo em seguida com
 		-- ConnectFail). O botão só passa a vermelho quando a conexão
 		-- ESTABILIZA de fato (abaixo) — até lá fica laranja ("connecting").
-		log(("conectado em %s"):format(url))
+		-- 2026-07-16: rebaixado para Logger.debug — esta tentativa ainda não é
+		-- a categoria visível "conectado" (spec da tarefa: só 3 categorias de
+		-- status, uma linha por MUDANÇA real); a linha Logger.log de verdade
+		-- fica no ponto de estabilização abaixo (`shownConnected`).
+		Logger.debug(("conectado em %s"):format(url))
 
 		-- Vira "connected" (vermelho) só na 1ª vez que esta tentativa
 		-- estabiliza — não repete o setter a cada 0.5s.
@@ -524,6 +565,19 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 				-- toma depois) volte a notificar.
 				lastRejectedPortToasted = nil
 				PluginUI.setConnectionStatus("connected")
+				-- 2026-07-16 (consolidação de log de boot, item 3 da tarefa): ÚNICA
+				-- linha visível (Logger.log) da categoria "conectado" — substitui a
+				-- antiga rajada de ~7 linhas de subsistema (agora Logger.debug, ver
+				-- acima e nos módulos SourceWatcher/TeamCreateElection/
+				-- TeamCreateLease/TeamCreatePresence). Contagem de scripts vem de
+				-- SourceWatcher.getWatchedCount() (novo, mesmo dado que a antiga
+				-- linha "observação iniciada" já expunha, só lido sob demanda aqui
+				-- em vez de guardado). Não inclui líder/term aqui de propósito: a
+				-- eleição é assíncrona e pode não ter convergido ainda no instante
+				-- em que a conexão WS estabiliza — "sou o líder agora (term N)"
+				-- continua sendo logado separadamente por TeamCreateElection quando
+				-- de fato acontecer.
+				log(("conectado em %s (%d scripts observados)"):format(url, SourceWatcher.getWatchedCount()))
 			end
 
 			-- Persistir assim que estabilizar (não espera a conexão cair) para
@@ -714,12 +768,58 @@ local function start(pluginObject)
 	TeamCreatePresence.init(sendMessage)
 	TeamCreatePresence.start()
 	task.spawn(runConnection, myToken, ports, explicitPort, pluginObject)
+	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
+	-- continua encaminhado por WS, só não polui o Output a cada conexão. O
+	-- status visível de verdade ("conectado"/"reconectando"/"falha") é o
+	-- consolidado dentro de runConnection (ver comentários lá).
 	if explicitPort then
-		log(("iniciado. Conectando à porta %d..."):format(ports[1]))
+		Logger.debug(("iniciado. Conectando à porta %d..."):format(ports[1]))
 	else
-		log(("iniciado. Sem porta salva ainda; testando candidatas (%s)..."):format(table.concat(ports, ", ")))
+		Logger.debug(("iniciado. Sem porta salva ainda; testando candidatas (%s)..."):format(table.concat(ports, ", ")))
 	end
 end
+
+-- --------------------------------------------------- guarda de Run/Play (F8/F5)
+--
+-- Checa a transição de RunService:IsRunning() a cada Config.POLL_INTERVAL_SECONDS
+-- (ver comentário de wasInRunOrPlayMode acima). Loop próprio, roda pela vida
+-- inteira do plugin (desconectado por plugin.Unloading abaixo, junto dos
+-- outros).
+local runModeMonitorEnabled = true
+
+local function checkRunModeTransition()
+	local isInRunOrPlayMode = RunService:IsStudio() and RunService:IsRunning()
+
+	if isInRunOrPlayMode and not wasInRunOrPlayMode then
+		-- Transição edição -> Run/Play: suspende o sync se estava rodando.
+		wasInRunOrPlayMode = true
+		if enabled then
+			runGuardStoppedSync = true
+			log("F8/F5 (Run/Play) detectado; sync suspenso durante o teste.")
+			stop()
+		end
+	elseif not isInRunOrPlayMode and wasInRunOrPlayMode then
+		-- Transição Run/Play -> edição (ressalva: também dispara em falso se o
+		-- teste só foi PAUSADO, ver comentário de wasInRunOrPlayMode acima —
+		-- limitação conhecida, não resolvida).
+		wasInRunOrPlayMode = false
+		if runGuardStoppedSync then
+			runGuardStoppedSync = false
+			log("retorno ao modo de edição detectado; retomando sync.")
+			task.spawn(start, plugin)
+		end
+	end
+end
+
+task.spawn(function()
+	while runModeMonitorEnabled do
+		task.wait(Config.POLL_INTERVAL_SECONDS)
+		if not runModeMonitorEnabled then
+			break
+		end
+		checkRunModeTransition()
+	end
+end)
 
 -- ------------------------------------------------------------------- UI (M4.5)
 --
@@ -801,15 +901,45 @@ plugin.Unloading:Connect(stop)
 -- sessões; o painel em si (toolbar+widget) não precisa ser destruído, o
 -- Studio cuida disso ao descarregar o plugin.
 plugin.Unloading:Connect(PluginUI.stop)
+-- Encerra o loop do guard de Run/Play (acima) junto com o resto do ciclo de
+-- vida do plugin.
+plugin.Unloading:Connect(function()
+	runModeMonitorEnabled = false
+end)
 
-log("plugin carregado. Auto-start ao carregar; toolbar 'SyncTeam' alterna o painel de status.")
+log("plugin carregado. Toolbar 'SyncTeam' alterna o painel de status; use o botão CONNECT para conectar.")
 
 -- ------------------------------------------------------------ auto-start
 --
--- Mesmo padrão validado no M0.5 (.claude/agent-memory/luau-dev.md): o
--- Studio auto-executa o Script raiz do plugin ao (re)carregar — seja como
--- arquivo .lua solto na pasta de Plugins, seja como .rbxm buildado via
--- `rojo build` (o resultado final é sempre um Script normal na pasta de
--- Plugins, executado no load). start() tem guard de idempotência
--- (`if enabled then return end`) para tolerar reload/reinstalação duplicada.
-task.spawn(start, plugin)
+-- 2026-07-16 (pedido do usuário): autostart passou a ser OPT-IN, default
+-- DESLIGADO (Config.AUTOSTART_SETTING_KEY/resolveAutoStartEnabled, default
+-- false — oposto do padrão de NOTIFICATIONS_SETTING_KEY). Antes desta
+-- mudança, `start(plugin)` era chamado incondicionalmente aqui (só sujeito ao
+-- guard de Run/Play abaixo) — o dev não tinha como optar por conectar
+-- manualmente. Agora o dev decide quando conectar clicando em CONNECT no
+-- painel (onConnect acima já chama `task.spawn(start, plugin)`, mesmo
+-- caminho); só quem ligar Config.AUTOSTART_SETTING_KEY explicitamente (ainda
+-- sem UI dedicada nesta fatia, mesmo padrão de PORT_SETTING_KEY quando foi
+-- introduzida — usuário avançado via plugin:SetSetting(...) no Command Bar)
+-- volta a ter o comportamento antigo.
+--
+-- Mesmo padrão de carregamento validado no M0.5
+-- (.claude/agent-memory/luau-dev.md): o Studio auto-executa o Script raiz do
+-- plugin ao (re)carregar — seja como arquivo .lua solto na pasta de Plugins,
+-- seja como .rbxm buildado via `rojo build`. start() tem guard de
+-- idempotência (`if enabled then return end`) para tolerar reload/
+-- reinstalação duplicada, o que segue relevante mesmo com autostart opt-in
+-- (ex.: reload com a setting ligada).
+--
+-- Guarda de Run/Play (ver comentário de wasInRunOrPlayMode acima): só se
+-- aplica quando autostart está de fato ligado — se autostart estiver
+-- desligado (o novo default), não há nada para o guard fazer aqui; o dev usa
+-- o painel manualmente independente do modo Run/Play (o botão CONNECT em si
+-- não tem guard de Run/Play — fora de escopo desta tarefa).
+if not Config.resolveAutoStartEnabled(plugin) then
+	log("autostart desligado; use o painel (toggle na toolbar) pra conectar manualmente.")
+elseif RunService:IsStudio() and RunService:IsRunning() then
+	log("Studio em modo Run/Play (RunService:IsRunning()==true) no carregamento; sync não iniciado automaticamente.")
+else
+	task.spawn(start, plugin)
+end
