@@ -436,7 +436,10 @@ local function applyRequestSequenceAssignments(intents)
 		if assigned ~= nil and intent.values.RequestSequence.Value <= 0 then
 			intent.values.RequestSequence.Value = assigned
 			intent.requestSequence = assigned
-			log(("lease intentSequenced intentId=%s sequence=%d"):format(intent.intentId, assigned))
+			-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md):
+			-- rotineiro/alta frequência (dispara por script tocado, não só no
+			-- boot) -> Logger.debug. Continua encaminhado por WS.
+			Logger.debug(("lease intentSequenced intentId=%s sequence=%d"):format(intent.intentId, assigned))
 		end
 	end
 	rootValues.NextLeaseRequestSequence.Value = newNext
@@ -504,7 +507,10 @@ local function reconcileLeases(intents, leaderTerm)
 		values.RequestSequence.Value = winner.requestSequence
 
 		if ownerChanged or termChanged then
-			log(("lease concedida uuid=%s owner=%s term=%d requestSequence=%d"):format(
+			-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md):
+			-- rotineiro/alta frequência (troca de dono acontece a cada início
+			-- de edição de script diferente, não só no boot) -> Logger.debug.
+			Logger.debug(("lease concedida uuid=%s owner=%s term=%d requestSequence=%d"):format(
 				uuid,
 				winner.clientId,
 				leaderTerm,
@@ -518,7 +524,9 @@ local function reconcileLeases(intents, leaderTerm)
 	-- Sobrou em `existing` = uuid sem NENHUM intent vivo neste ciclo: libera
 	-- de verdade (spec M3.2, item 5).
 	for uuid, folder in existing do
-		log(("lease liberada uuid=%s (sem intents vivos)"):format(uuid))
+		-- 2026-07-20 (BUG 2, mesmo critério de "lease concedida" acima):
+		-- rotineiro/alta frequência -> Logger.debug.
+		Logger.debug(("lease liberada uuid=%s (sem intents vivos)"):format(uuid))
 		folder:Destroy()
 	end
 end
@@ -576,7 +584,10 @@ local function checkLeaseDrift()
 				ownerDisplayName = ownerDisplayName,
 			})
 		end
-		log(("leaseChanged uuid=%s owner=%s (%s)"):format(uuid, tostring(owner), ownerDisplayName))
+		-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md):
+		-- rotineiro/alta frequência (dispara por script tocado a cada troca de
+		-- dono, não só no boot) -> Logger.debug.
+		Logger.debug(("leaseChanged uuid=%s owner=%s (%s)"):format(uuid, tostring(owner), ownerDisplayName))
 	end)
 end
 

@@ -218,6 +218,77 @@ describe("SyncServer — heartbeat", () => {
   });
 });
 
+// stop() robustez (2026-07-20): bug relatado pelo usuário — ao fechar o VS
+// Code com o servidor ativo, o processo do extension host não morria e a
+// porta continuava em uso. Causa raiz confirmada lendo o código-fonte do
+// `ws` vendorizado (node_modules/ws): client.close() inicia um handshake
+// gracioso que só destrói o socket depois de até 30s (CLOSE_TIMEOUT interno)
+// se o peer nunca responder, e wss.close() (modo `port`) só chama o callback
+// quando NENHUMA conexão TCP residual continuar aberta. Testa exatamente o
+// cenário: um "plugin morto" conectado que nunca fecha nem responde, e
+// confirma que stop() ainda assim resolve rápido E a porta é liberada de
+// verdade pelo SO (outro processo consegue bindar nela imediatamente depois).
+describe("SyncServer — stop() robustez", () => {
+  test("stop() resolve rapidamente e libera a porta mesmo com o socket do plugin morto/sem resposta", async () => {
+    const port = await getFreePort();
+    const server = new SyncServer(port, createNullLogger());
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+    await server.start();
+
+    const client = await openClient(port);
+    client.send(JSON.stringify({ kind: "hello", protocolVersion: PROTOCOL_VERSION, role: "studio" }));
+    await waitFor(() => server.isClientConnected());
+
+    // Não chamamos client.close()/terminate() aqui de propósito: o socket
+    // fica "pendurado" exatamente como no cenário do bug relatado (plugin
+    // morto ou rede quebrada sem RST) — nenhum aviso de close chega, e o
+    // cliente nunca responde a nada.
+    const start = Date.now();
+    await server.stop();
+    const elapsed = Date.now() - start;
+    // Bem abaixo do CLOSE_TIMEOUT de 30000ms do `ws` — prova que não caiu no
+    // caminho antigo (client.close() esperando o handshake gracioso).
+    expect(elapsed).toBeLessThan(1000);
+
+    // A porta foi de fato liberada pelo SO: outro listener consegue bindar
+    // nela imediatamente, sem EADDRINUSE.
+    await new Promise<void>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once("error", reject);
+      probe.listen(port, "127.0.0.1", () => probe.close(() => resolve()));
+    });
+
+    client.terminate();
+  });
+
+  test("stop() com múltiplos sockets mortos (multiSync) também resolve rápido e libera a porta", async () => {
+    const port = await getFreePort();
+    const server = new SyncServer(port, createNullLogger(), { multiSync: true });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+    await server.start();
+
+    const first = await openClient(port);
+    const second = await openClient(port);
+    first.send(JSON.stringify({ kind: "hello", protocolVersion: PROTOCOL_VERSION, role: "studio", clientId: "A" }));
+    second.send(JSON.stringify({ kind: "hello", protocolVersion: PROTOCOL_VERSION, role: "studio", clientId: "B" }));
+    await waitFor(() => server.getConnectedCount() === 2);
+
+    // Os dois ficam mudos/pendurados — nenhum fecha de propósito.
+    const start = Date.now();
+    await server.stop();
+    expect(Date.now() - start).toBeLessThan(1000);
+
+    await new Promise<void>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once("error", reject);
+      probe.listen(port, "127.0.0.1", () => probe.close(() => resolve()));
+    });
+
+    first.terminate();
+    second.terminate();
+  });
+});
+
 // multiSync (2026-07-15): permite N plugins conectados na mesma porta. Testa
 // que (a) 2 clientes conectam ao mesmo tempo sem rejeição, (b) mensagens de
 // saída são BROADCAST para todos, (c) request() resolve na PRIMEIRA resposta

@@ -1,8 +1,102 @@
 # Status do projeto
 
-Última atualização: 2026-07-16 (autostart opt-in + consolidação de log de boot, plugin)
+Última atualização: 2026-07-20 (toggle real de auto-reconectar no painel do plugin)
 
-## Nota de sessão (2026-07-16, mais recente) — autostart opt-in + log de boot consolidado (plugin)
+## Nota de sessão (2026-07-20, mais recente) — toggle real de "Reconectar automaticamente" no painel (plugin)
+
+Pedido do usuário (`ui-dev`): expor `Config.AUTOSTART_SETTING_KEY` (existente
+desde 2026-07-16, só ligável via Command Bar) como toggle de verdade na tela
+de configurações do painel — mesmo mirror visual do toggle "Mostrar
+notificações" já existente (M4.5). Nenhuma setting nova, nenhuma mudança em
+`Config.CANDIDATE_PORTS`/detecção de porta/retry loop de `runConnection`
+(fora de escopo, já funcionavam).
+
+**Arquivos**: `plugin/src/ui/StatusPanel.luau` (`AutoReconnectToggle` +
+`SettingsRow("Reconectar automaticamente ao abrir a place", ...)`),
+`plugin/src/ui/PluginUI.luau` (`autoReconnectEnabledSource`, passthrough de
+`onAutoReconnectToggle`), `plugin/src/init.server.luau` (implementação real
+do callback), comentários de `Config.luau` atualizados. Detalhe completo da
+decisão de UX (ligar tenta conectar já respeitando guard de Run/Play;
+desligar só afeta o próximo load, não derruba sessão viva) em
+`docs/DECISIONS.md` 2026-07-20.
+
+`rojo build` + `lune run` limpos nos 4 arquivos tocados; buildado e
+implantado via `Tools/build-and-deploy-plugin.ps1`. **`[Hipótese]`**: teste
+real em Studio (toggle aparece, liga/desliga, reconecta na hora respeitando
+Run/Play) pendente de confirmação física do usuário — clique em painel de
+plugin não é automatizável via `Tools/`.
+
+## Nota de sessão (2026-07-20) — delete local (VS Code) agora propaga ao Studio
+
+Usuário reportou 2 sintomas: rename local criava module duplicado no colega;
+delete local não deletava a Instance no Studio. Causa raiz única (ver
+`docs/DECISIONS.md` 2026-07-20 para o detalhe completo): protocolo nunca teve
+mensagem de delete disco→Studio — era limitação de M2 documentada como "fica
+para depois" e nunca implementada; rename local é delete+create sem
+correlação, e a parte "deletar o antigo" nunca chegava ao Studio.
+
+Fix em paralelo (contrato de protocolo `deleteScript`→`writeAck` fechado
+antes de delegar, pra `extension-dev` e `luau-dev` não desencontrarem):
+- **Extensão** (`SyncBridge.ts`, `extension.ts`, `protocol.ts`): detecta
+  delete local, respeita exclusão Wally, manda `deleteScript`, limpa estado
+  no ack. Achado extra corrigido junto: `extension.ts` nunca assinava
+  `watcher.onDidDelete(...)` — sem isso, delete nem disparava a lógica.
+  186/186 testes, `tsc`/`esbuild` limpos.
+- **Plugin** (`init.server.luau`): `handleDeleteScript` resolve por uuid,
+  bloqueia pasta vendorizada, checa lease, `pcall(Destroy)`. Limpeza de
+  registry e propagação ao colega já são automáticas via o polling que já
+  existia (mesmo caminho de delete feito direto no Studio). `rojo build`+
+  `lune run` limpos, buildado e implantado.
+
+**Fora de escopo deliberado**: rename "de verdade" com preservação de UUID
+do lado do disco continua não implementado — delete+create sem correlação,
+mas sem mais duplicata/órfão. Nada testado em Studio real ainda — roteiro de
+4 cenários em `docs/DECISIONS.md` 2026-07-20, fica `[Hipótese]` até o
+usuário confirmar.
+
+## Nota de sessão (2026-07-20) — guard de Run/Play no botão CONNECT + ruído de uso contínuo (plugin)
+
+Usuário relatou o plugin "parecendo que estava executando em run-time (dando
+F8)". Ver `docs/DECISIONS.md` 2026-07-20 para o detalhe completo. Duas
+correções em `plugin/src/init.server.luau` + 4 outros módulos:
+
+1. **BUG 1 — botão CONNECT sem guard de Run/Play**: o autostart e o guard de
+   TRANSIÇÃO (`checkRunModeTransition`, 2026-07-16) já checavam
+   `RunService:IsStudio() and RunService:IsRunning()`, mas o botão CONNECT do
+   painel (`onConnect`) nunca teve guard nenhum — documentado como "fora de
+   escopo" na tarefa de 2026-07-16. Como autostart virou opt-in/default OFF na
+   mesma sessão de 2026-07-16, CONNECT manual passou a ser o fluxo normal, e
+   clicar nele já em Run/Play deixava o sync ativo o teste inteiro (o guard de
+   transição nunca via a transição, porque o sync já nascia dentro do
+   Run/Play). Fix: condição extraída para `isInRunOrPlayMode()` (função única,
+   sem mais duplicação) e aplicada em TODOS os pontos de entrada de `start()`
+   — `onConnect` (com toast `Logger.notify`, ação explícita do usuário),
+   `start()` (defesa em profundidade, só `Logger.log`), autostart e o guard de
+   transição (sem mudança de comportamento nesses dois, só sem duplicar a
+   condição).
+2. **BUG 2 — mais ruído rotineiro rebaixado a `Logger.debug`**: a
+   consolidação de 2026-07-16 só cobriu ruído de BOOT; usuário colou um trecho
+   do Output mostrando rajada de eventos POR-EVENTO durante uso normal (2
+   devs, ~2 min): lease concedida/liberada/leaseChanged/intentSequenced,
+   presenceChanged (a cada movimento de cursor)/presenceLeft, joinSequence
+   atribuído, sourceChanged, writeSource (update/create). Todos rebaixados
+   para `Logger.debug` (mesmo forward por WS, sem `print()`) nos 5 arquivos:
+   `TeamCreateLease.luau`, `TeamCreatePresence.luau`,
+   `TeamCreateElection.luau`, `SourceWatcher.luau`, `init.server.luau`.
+   Mudança de liderança, lease negada, erros, porta ocupada, sessão obsoleta e
+   as linhas do guard de F8/Play continuam `Logger.log` (raros/acionáveis).
+
+**Validado só por `rojo build` + `lune run`** nos 5 arquivos tocados — sem
+erro de sintaxe. Plugin buildado e implantado via
+`Tools/build-and-deploy-plugin.ps1` (`OK - plugin implantado`), pronto para
+teste. **Nada testado em Studio real nesta tarefa** — nenhum dos dois bugs
+pode ser exercitado sem apertar F8/F5 fisicamente no Studio (`Tools/`
+automatiza build/deploy/log, não input físico). Roteiro manual completo em
+`docs/DECISIONS.md` 2026-07-20 (dois cenários: CONNECT clicado já em Run/Play
+deve recusar com toast; Output limpo de rajadas durante uso normal de 2
+Studios). Fica `[Hipótese]` até o usuário confirmar.
+
+## Nota de sessão (2026-07-16) — autostart opt-in + log de boot consolidado (plugin)
 
 Usuário testou o painel M4.5 em Studio real e trouxe 3 pedidos (ver
 `docs/DECISIONS.md` 2026-07-16 para o detalhe de cada um):

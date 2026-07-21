@@ -856,3 +856,182 @@ já existente — mesmo uuid, dois arquivos, `.lua` original abandonado.
   em tmpdir (não fake em memória, mesma prática de sempre). Cenário completo
   (rodar a extensão de verdade contra o projeto Wally real do usuário que
   expôs o bug) fica pendente de confirmação com o usuário/roteiro manual.
+
+## Delete local não propagava ao Studio — `deleteScript` (2026-07-20)
+
+Bug real reportado pelo usuário: deletar um module no VS Code não destruía a
+Instance no Studio; sintoma colateral, rename local (delete+create sem
+correlação) virava DUPLICATA porque só a metade "criar" chegava ao plugin.
+Tarefa em paralelo com `luau-dev` implementando o lado do plugin contra o
+MESMO contrato de protocolo (definido de antemão pelo orquestrador, não por
+mim — não inventei variação).
+
+- **Contrato** (`protocol.ts`, aditivo, SEM bump de `PROTOCOL_VERSION`, mesmo
+  precedente de `ping`/`leaseChanged`): extensão→plugin `{kind:"deleteScript",
+  requestId, uuid}`; resposta reusa `writeAck` (`{kind:"writeAck", requestId,
+  ok, uuid?, error?}`) — funciona sem mudar `SyncServer.request()` porque a
+  correlação já é só por `requestId`, nunca por `kind`.
+- **`SyncBridge.handleLocalFileChange`**: o ramo `content === null` (arquivo
+  sumiu do disco) agora delega para um método novo,
+  `handleLocalFileRemoved(relDiskPath, key, transport)`, em vez de só logar e
+  sair. Lógica: sem `uuidByDiskPath.get(key)` → nada a fazer (nunca foi
+  sincronizado, só limpa `contentCache` como já fazia); com uuid conhecido →
+  checa `isInsideExcludedPackageFolder` (mesma exclusão de pacotes Wally que
+  o ramo de update já respeita) e, se não excluído, manda `deleteScript`. Ack
+  `ok=true`: limpa `scripts`/`sourceCache`/`unregisterDiskPath`/`contentCache`
+  (mesma limpeza de `handleScriptRemoved`, SEM chamar `diskIO.deleteFile` —
+  o arquivo já sumiu, foi isso que disparou o fluxo). Ack `ok=false`: **NÃO
+  limpa nada** (uuid continua rastreado — a instância pode não ter sido
+  removida no Studio de fato) e chama `onWriteRejected?.({diskPath, error})`
+  — **mesmo payload/shape que os outros 2 call sites de `onWriteRejected` já
+  usam** (`{diskPath: relDiskPath, error: errorMsg}`), decisão deliberada de
+  não inventar um campo novo tipo "operation: delete" porque o tipo
+  `OnWriteRejectedCallback` já é fixo e a UI (`ui-dev`, `extension.ts`) trata
+  isso genericamente como "uma escrita foi rejeitada, mostra a mensagem" —
+  não distingue create/update/delete hoje.
+- **Rename ainda não é "de verdade"** (fora de escopo, pedido explícito da
+  tarefa): delete+create local continuam sem correlação — o uuid antigo
+  morre (`deleteScript`) e um uuid novo nasce (`writeSource` modo criar) no
+  create subsequente. Isso já resolve o sintoma prático (duplicata some),
+  mas não preserva histórico/identidade do uuid através do rename.
+- **Achado importante que não estava no escopo original da tarefa**: o
+  `vscode.FileSystemWatcher` em `extension.ts` (linha ~379-406) só assinava
+  `onDidChange`/`onDidCreate` — **`onDidDelete` nunca foi registrado**. Sem
+  esse fio, `handleLocalFileChange` NUNCA seria chamado para uma deleção ao
+  vivo (o `readFile` retornando `null` só seria alcançável via
+  `refreshSync`/`reconcileDiskOnlyFiles`, que tem sua própria lógica
+  separada e deliberadamente não-destrutiva para "arquivo sumiu do disco" —
+  não chama `handleLocalFileChange` nesse caso). Sem corrigir isso, o fix em
+  `SyncBridge` ficaria morto para o fluxo principal (extensão aberta, editor
+  ativo). Adicionei `watcher.onDidDelete(scheduleNotify)` ao lado dos outros
+  dois (mesmo debounce, mesma função `scheduleNotify` — `relDiskPathFromUri`
+  é só cálculo de path, funciona igual para uma URI que já não existe mais).
+  **Sinalizado ao orquestrador**: essa lacuna existia desde que o watcher foi
+  escrito e não tinha relação com a causa raiz apontada na tarefa original —
+  vale conferir se algum outro handler de watcher (`onWill*`?) também tem
+  gaps parecidos no futuro.
+- **Deleção em lote (pasta com vários módulos)**: não precisou de nenhuma
+  mudança de arquitetura — `vscode.FileSystemWatcher` já entrega um evento
+  `onDidDelete` por ARQUIVO (não um evento agregado por pasta), e o debounce
+  em `extension.ts` já é `Map` chaveado por `relPath` individual, então N
+  arquivos deletados juntos viram N chamadas independentes de
+  `handleLocalFileChange`/`handleLocalFileRemoved`, cada uma resolvendo seu
+  próprio uuid. Confirmado com teste dedicado chamando
+  `handleLocalFileChange` duas vezes em sequência para dois arquivos
+  diferentes da mesma pasta.
+- **`FakeTransport` (`test/syncBridge.test.ts`) ganhou `case "deleteScript"`,
+  best-effort** (sempre `ok:true`, remove de `this.scripts`/`this.sources` só
+  se presente) — **pegadinha que me mordeu**: minha primeira versão exigia
+  que o uuid já estivesse em `transport.scripts` para confirmar `ok:true`,
+  mas testes que criam o script via `bridge.handleScriptAdded(...)` NUNCA
+  populam `transport.scripts` (esse array só é alimentado pelo modo "criar"
+  de `writeSource` no fake) — só o estado interno do `SyncBridge` é
+  atualizado. Isso fazia o ack vir `ok:false` por acidente e os testes de
+  sucesso falharem com "estado não foi limpo". Corrigido para não exigir
+  pré-existência, igual ao padrão solto que os outros `case` deste fake já
+  seguem (`readSource` também não valida contra `transport.scripts`).
+- **Testes**: novo `describe("deleção local (disco → Studio) — 2026-07-20")`
+  em `test/syncBridge.test.ts` (5 testes: sucesso limpa estado + manda
+  `deleteScript`; ack de falha NÃO limpa estado + aciona `onWriteRejected`;
+  path sem uuid conhecido não manda nada; dentro de pasta Wally é ignorado
+  sem mandar `deleteScript`; deleção em lote processa cada diskPath
+  independentemente). Helper novo `deleteTmp(relPath)` (espelha `writeTmp`,
+  via `fs.rmSync`). **186 testes no total** (era 181, +5). `npm run lint`
+  (tsc) limpo, `npm test` 186/186, `npm run build` gera os dois bundles.
+- **Não testado em Studio real** — depende do `luau-dev` ter implementado o
+  handler `deleteScript` do lado do plugin contra este mesmo contrato
+  (trabalho paralelo, mesma tarefa). Round-trip real (deletar no VS Code,
+  confirmar Instance destruída no Studio do colega via Team Create) fica
+  pendente de roteiro manual/2 Studios reais.
+
+## Bug real corrigido: `stop()`/`deactivate()` podia travar até 30s e deixar a porta em uso (2026-07-20)
+
+Bug relatado: fechar o VS Code com o servidor WS ativo não matava o processo
+do extension host — a porta continuava em uso (`EADDRINUSE` na próxima
+tentativa de start, ou a porta só sumia da listagem depois de matar o
+processo manualmente).
+
+**Causa raiz CONFIRMADA lendo o código-fonte real do `ws`, vendorizado em
+`vscode-extension/node_modules/ws`** (não pesquisa externa — a lib já está no
+repo, então isso não violou a regra de "não pesquisar API na web"; li
+`lib/websocket.js` e `lib/websocket-server.js` diretamente):
+
+- `WebSocket.close(code, data)` (`lib/websocket.js:302-340`) inicia um
+  handshake gracioso e, na última linha, chama `setCloseTimer(this)`
+  (`lib/websocket.js:1309-1314`), que arma `setTimeout(() =>
+  this._socket.destroy(), this._closeTimeout)` — o socket real só é destruído
+  à força depois de `closeTimeout` (default `CLOSE_TIMEOUT = 30000`,
+  `lib/constants.js:10`) SE o peer nunca responder ao close. Ou seja:
+  `client.close()` contra um peer morto/sem resposta pode levar até **30
+  segundos** até o socket ser de fato destruído.
+- `WebSocketServer.close(cb)` (`lib/websocket-server.js:169-215`), no modo em
+  que o server foi criado com `{port}` (nosso caso — `SyncServer.start()`),
+  cai no branch `else` (linha 201-214): delega para `server.close(() =>
+  emitClose(this))`, onde `server` é o `http.Server` interno do Node. O
+  `http.Server.close()`/`net.Server.close()` do Node **não fecha conexões
+  existentes** — só para de aceitar novas e espera TODAS as conexões TCP
+  ativas terminarem antes de emitir `'close'`. Então o callback de
+  `wss.close()` fica bloqueado até o socket "pendurado" acima ser destruído
+  — e `SyncServer.stop()` fazia `await new Promise(resolve => wss.close(()
+  => resolve()))`, then `deactivate()` = `return stopService()` = `await
+  service?.stop()`. Cadeia inteira presa por até 30s por causa de UM socket
+  morto — e se o VS Code não tiver (ou não aplicar, no cenário de
+  fechamento real de janela/app — ainda não 100% confirmado, ver pesquisa
+  abaixo) um kill forçado do processo após esse tempo, o Node fica de pé
+  com a porta bound indefinidamente.
+- **Fix em `SyncServer.stop()`** (`vscode-extension/src/sync/SyncServer.ts`):
+  (a) troca de `client.close()` por `socket.terminate()` — destrói o socket
+  NA HORA, sem esperar handshake, elimina o risco dos 30s. Iterar
+  `wss.clients` (rastreamento INTERNO do `ws`, populado em
+  `completeUpgrade()` para TODO socket que fez upgrade HTTP→WS, MESMO que
+  nunca tenha mandado `hello`) em vez do nosso `this.clients` privado (só
+  os que passaram pelo hello) — fecha também a lacuna de um socket
+  conectado mas nunca "aceito" pelo protocolo, que `this.clients` nunca
+  saberia. (b) timeout de segurança configurável (`stopSafetyTimeoutMs`,
+  default `DEFAULT_STOP_SAFETY_TIMEOUT_MS = 2000`) envolvendo `wss.close()`
+  via `Promise` com um `setTimeout` correndo em paralelo — se `wss.close()`
+  não chamar o callback dentro do prazo (qualquer razão residual não
+  prevista), resolve mesmo assim e loga erro; garante que `stop()` NUNCA
+  fica pendurado, mesmo que o `terminate()` não seja suficiente por algum
+  motivo futuro não mapeado.
+- **Por que `terminate()` é seguro aqui (sem trade-off real)**: o plugin
+  (`WebStreamClient`) não distingue um `close()` gracioso de um
+  `terminate()` abrupto de qualquer forma — `Closed()` no Luau não expõe
+  código nem motivo (doc oficial, já confirmado em
+  `.claude/research/2026-07-15-webstreamclient-close-code.md`). Não há
+  UX/protocolo perdido ao trocar para terminate() sempre em `stop()`.
+- **Ordem em `stop()` importa para preservar um invariante já documentado**:
+  `this.clients.clear()` continua acontecendo ANTES do `terminate()` (mesmo
+  que a ordem relativa não afete o resultado, já que o handler de `close`
+  do socket dispara assíncrono depois) — o guard `if
+  (!this.clients.has(socket)) return` no handler de `close` (`handleConnection`)
+  já garantia, mesmo antes deste fix, que `onClientDisconnected` NÃO dispara
+  numa parada deliberada (`stop`/`restart`/`setPort`), só em queda-surpresa.
+  Esse comportamento não mudou — só o MECANISMO de fechamento (terminate vs.
+  close) e a fonte dos sockets a fechar (`wss.clients` vs. `this.clients`).
+- **Testes novos** (`test/syncServer.test.ts`, describe "SyncServer — stop()
+  robustez", 2 testes, 188 no total — era 186): (1) um "plugin morto" conecta,
+  manda hello, e NUNCA responde/fecha nada — chama `server.stop()` direto
+  (sem esperar o heartbeat detectar a queda) e confirma `elapsed <
+  1000ms` (bem abaixo do `CLOSE_TIMEOUT` de 30000ms do `ws`) E que a porta
+  foi liberada de verdade (outro `net.createServer()` bind na mesma porta
+  imediatamente depois, sem `EADDRINUSE`). (2) mesmo cenário com 2 sockets
+  mortos em `multiSync=true`. `npm run lint` (tsc) limpo, `npm test`
+  188/188 (rodei 3x para checar flakiness da asserção de tempo — estável,
+  sempre ~749ms de suite completa do arquivo), `npm run build` gera os dois
+  bundles.
+- **O que fica `[Hipótese]`/não confirmado**: se o VS Code de fato aplica um
+  timeout automático que mataria o processo do extension host mesmo sem
+  este fix (o que explicaria por que o usuário via a porta ficar em uso por
+  tempo INDEFINIDO em vez de só ~30s) — delegado ao `researcher`
+  (`.claude/research/2026-07-20-vscode-deactivate-timeout-extension-host-kill.md`,
+  tarefa disparada em paralelo a esta). Isso não muda a correção em si (o
+  fix garante que `stop()` nunca depende de nenhum timeout do VS Code para
+  resolver rápido), só é contexto complementar do diagnóstico.
+- **Não testado em VS Code real** (fechar a janela de fato com o plugin
+  Studio conectado e matar o Studio no meio) — só testes automatizados com
+  socket `ws` real fingindo o plugin morto. Fica `[Hipótese]` quanto ao
+  comportamento exato em uso real até o usuário confirmar (fechar VS Code
+  com Studio aberto e conectado, matar o Studio à força, fechar o VS Code de
+  novo, verificar que a porta é liberada rapidamente/`netstat` não mostra
+  mais LISTENING nela).

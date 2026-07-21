@@ -166,7 +166,10 @@ local function checkSourceChanged(instance, via)
 			via = via,
 		})
 	end
-	log(("sourceChanged uuid=%s '%s' via %s (origin=%s)"):format(tostring(uuid), path, via, origin))
+	-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md): rotineiro/
+	-- alta frequência (dispara a cada edição de Source, tanto via sinal quanto
+	-- polling, não só no boot) -> Logger.debug.
+	Logger.debug(("sourceChanged uuid=%s '%s' via %s (origin=%s)"):format(tostring(uuid), path, via, origin))
 end
 
 -- Registra a observação de Source E resolve/aloca o uuid da Instance no

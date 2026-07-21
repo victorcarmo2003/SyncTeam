@@ -3,6 +3,133 @@
 Aprendizados de API do Studio e pegadinhas de Luau encontrados no projeto.
 Atualize ao final de cada tarefa; mantenha curto e acionável.
 
+## `deleteScript` — plugin destrói Instance ao receber delete do VS Code (contrato fechado com extension-dev), 2026-07-20
+
+- **Tarefa com contrato de protocolo JÁ FECHADO pelo orquestrador** (não
+  inventado aqui): requisição aditiva `{kind="deleteScript", requestId, uuid}`
+  (extensão -> plugin), resposta reusa `writeAck` (mesmo formato de
+  `writeSource`). Trabalho irmão no lado extensão feito em paralelo pelo
+  `extension-dev` na mesma sessão, mesmo contrato.
+- **`handleDeleteScript` (`plugin/src/init.server.luau`, entre
+  `handleWriteSource` e `handleReadSource`) é paralelo a `handleWriteSource`
+  modo ATUALIZAÇÃO, na mesma ordem de checagens**: resolve por
+  `SourceWatcher.resolveByUuid` -> bloqueia pasta vendorizada
+  (`Config.isInsideExcludedPackageFolder`, mesma mensagem de erro adaptada
+  para "delete bloqueado: ...") -> `TeamCreateLease.ensureIntent` +
+  `TeamCreateLease.canWrite` (mesmo padrão de lease negada com
+  `Logger.notify`) -> só então `pcall(function() instance:Destroy() end)`.
+  Decisão de checar lease antes de deletar (a tarefa deixava em aberto):
+  mantive a MESMA checagem que updates já fazem, por consistência e
+  segurança — evita um dev destruir um script que outro está com lease ativa
+  de edição no exato momento (a alternativa, permitir delete sem lease,
+  abriria um jeito de apagar trabalho em andamento de outro sem arbitragem
+  nenhuma).
+- **Deliberadamente NÃO limpa `ScriptRegistry` nem emite `scriptRemoved`
+  manualmente aqui** — o `checkRegistryDrift` que já existe desde o M2
+  (`SourceWatcher.luau`, ciclo de poll a cada `Config.POLL_INTERVAL_SECONDS`)
+  detecta a Instance destruída via `ScriptRegistry.isInstanceDestroyed`
+  (`Parent == nil` + confirmação por `pcall`, nunca `ObjectValue.Value ==
+  nil` — bug real documentado desde 2026-07-04) e emite `scriptRemoved`
+  sozinho, pelo MESMO caminho que já cobre delete feito direto no Explorer do
+  Studio — inclusive é o que propaga a remoção pro OUTRO dev via Team Create
+  (o `Destroy()` replica, o Studio remoto detecta pelo próprio polling, o
+  plugin dele manda `scriptRemoved` pra extensão dele). Duplicar essa lógica
+  aqui seria reinventar um caminho já validado.
+- **Log: mantive `Logger.log` (visível) pro sucesso E erro de delete**,
+  diferente de `writeSource` update/create que a MESMA sessão (tarefa irmã de
+  guard F8 + rebaixamento de ruído) acabou de rebaixar pra `Logger.debug` por
+  serem rotineiros/alta-frequência. Delete é raro e consequente (evento
+  destrutivo) — mesmo critério já estabelecido em 2026-07-20
+  ("rotineiro/alta frequência = debug; raro/acionável = log") aponta pro lado
+  oposto aqui.
+- **Registro no dispatch**: `elseif message.kind == "deleteScript" then
+  handleDeleteScript(message)`, com comentário de que é mensagem ADITIVA
+  (mesmo padrão de `ping` — não bumpa `Config.PROTOCOL_VERSION`).
+- **Validado só por `rojo build` (7.7.0 cacheado) + `lune run`** em
+  `init.server.luau` — build `EXIT 0`; `lune run` erra em `init.server:45`
+  (`game:GetService`, 1ª linha que toca `game`), confirmando que TODO o
+  arquivo (incluindo o handler novo) compilou sem erro de sintaxe. Plugin
+  buildado e implantado via `Tools/build-and-deploy-plugin.ps1` (`OK - plugin
+  implantado`). **Nada testado em Studio real nesta tarefa** — teste
+  ponta-a-ponta de verdade (delete local no VS Code -> instância some no
+  Studio -> `scriptRemoved` chega no colega via Team Create) depende do lado
+  da extensão (feito em paralelo pelo `extension-dev` na mesma sessão) e
+  idealmente dos 2 Studios reais + harness (`Tools/README.md`). Fica
+  `[Hipótese]` até o usuário validar. Roteiro sugerido (não escrito em
+  DECISIONS.md/PROJECT_STATUS.md por pedido explícito do orquestrador — ele
+  consolida a entrada depois de ler os dois agentes juntos): (1) via VS Code,
+  deletar um arquivo `.luau` de um script já sincronizado -> confirmar a
+  Instance correspondente é destruída no Studio dentro de ~0.5-1s, e o colega
+  (outro Studio+VS Code) recebe a remoção também; (2) repetir tentando
+  deletar um script dentro de `Packages/` -> confirmar bloqueio (`writeAck
+  ok=false`, "delete bloqueado..."); (3) repetir enquanto outro dev tem lease
+  ativa no mesmo script (edição recente, <8s) -> confirmar `writeAck
+  ok=false` "lease negada...".
+
+## Guard de Run/Play no botão CONNECT + mais ruído de uso contínuo rebaixado, 2026-07-20
+
+- **Lição de processo, a que mais vale reter**: quando um comentário no código
+  diz literalmente "X está fora de escopo desta tarefa" (aqui: "o botão
+  CONNECT em si não tem guard de Run/Play — fora de escopo desta tarefa",
+  deixado pela tarefa de 2026-07-16 que criou o guard de transição), esse
+  comentário é uma DÍVIDA TÉCNICA anotada, não uma decisão permanente — vale a
+  pena reler o contexto ao redor (aqui: a MESMA sessão de 2026-07-16 que
+  deixou esse comentário também tornou o autostart opt-in/default OFF,
+  mudando CONNECT manual de "atalho raro" pra "fluxo normal" — o que
+  invalidava a premissa implícita de "fora de escopo" sem que ninguém tivesse
+  voltado pra atualizar o comentário). Bug relatado pelo usuário ("plugin
+  parecia estar em run-time") bateu exatamente com esse gap.
+- **Padrão adotado para condição booleana duplicada em vários pontos de
+  entrada, com granularidade de resposta diferente por call-site**: extrair
+  para uma função pura module-level (`isInRunOrPlayMode()`, sem estado) e
+  aplicar em CADA ponto de entrada, não só num lugar central — porque cada
+  call-site precisava de uma RESPOSTA diferente à mesma condição:
+  `onConnect` (ação explícita do usuário) usa `Logger.notify` (toast,
+  feedback visível); `start()` (não sabe quem chamou) usa só `Logger.log`
+  como defesa em profundidade, no MESMO estilo da guarda de idempotência já
+  existente ali (`if enabled then ... return end` logo acima — a nova guarda
+  segue o padrão visual/posicional de "checagem de recusa antes de
+  `enabled = true`"). Alternativa rejeitada: centralizar a checagem só dentro
+  de `start()` e deixar todos os call-sites chamarem sem checar antes — mais
+  DRY, mas perderia a diferenciação de feedback (toast só faz sentido pra
+  quem sabe que foi o usuário que clicou).
+- **Pegadinha de nome ao extrair função com o mesmo nome de uma variável local
+  existente**: `checkRunModeTransition` já tinha `local isInRunOrPlayMode =
+  RunService:IsStudio() and RunService:IsRunning()` (variável, não função) —
+  ao extrair a mesma expressão para uma função module-level com esse nome,
+  a variável local teria colidido/sombreado a função dentro do próprio
+  escopo onde ela precisava ser CHAMADA. Renomeada para `nowInRunOrPlayMode`
+  (comunica também a semântica "valor observado agora", distinta de
+  `wasInRunOrPlayMode`, o estado anterior guardado module-level).
+- **Ruído de uso CONTÍNUO (não só boot) é uma categoria distinta do ruído de
+  boot já resolvido em 2026-07-16** — mesmo mecanismo (`Logger.debug`), mas
+  identificar OS locais certos exige olhar quais logs disparam por
+  EVENTO/EDIÇÃO (a cada tecla, a cada movimento de cursor, a cada troca de
+  dono de lease) em vez de só na conexão. Lista final desta tarefa: lease
+  concedida/liberada/leaseChanged/intentSequenced
+  (`TeamCreateLease.luau`), presenceChanged/presenceLeft — os DOIS gatilhos
+  de presenceLeft, "presença zerada" E "sessão removida"
+  (`TeamCreatePresence.luau`), joinSequence atribuído
+  (`TeamCreateElection.luau`), sourceChanged (`SourceWatcher.luau`),
+  writeSource update/create — só os caminhos de SUCESSO/detalhe, não os
+  early-returns de erro (uuid desconhecido, bloqueio de pasta vendorizada
+  seguem `Logger.log`) (`init.server.luau`). Critério usado, herdado de
+  2026-07-16: "rotineiro/alta frequência = debug; raro/acionável = log".
+  `presenceLeft` foi o caso mais ambíguo (o usuário explicitamente pediu
+  julgamento) — decidido como debug porque dispara também por TIMEOUT
+  (sessão some de `Sessions/` após `CLEANUP_AFTER_SECONDS`), não só por saída
+  real, então tratá-lo como "log" geraria falsos alarmes de "alguém saiu"
+  toda vez que uma sessão zumbi expirasse.
+- **Validado só por `rojo build` + `lune run`** nos 5 arquivos tocados
+  (`init.server.luau`, `TeamCreateLease.luau`, `TeamCreatePresence.luau`,
+  `TeamCreateElection.luau`, `SourceWatcher.luau`) — sem erro de sintaxe.
+  Plugin buildado e implantado via `Tools/build-and-deploy-plugin.ps1`.
+  **Nenhum dos dois bugs pôde ser exercitado nesta tarefa** — BUG 1 exige
+  apertar F8/F5 fisicamente dentro do Studio (ação física, fora do alcance de
+  `Tools/`); BUG 2 exige ler o Output real durante uso contínuo de 2 Studios.
+  Fica `[Hipótese]` até o usuário confirmar — roteiro em
+  `docs/DECISIONS.md`/`docs/PROJECT_STATUS.md`, entrada 2026-07-20.
+
 ## Autostart opt-in + `Logger.debug` (consolidação de ruído de boot), 2026-07-16
 
 - **Padrão "default invertido" entre duas settings booleanas irmãs**:

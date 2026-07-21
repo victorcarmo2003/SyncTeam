@@ -268,7 +268,10 @@ local function emitPresence(clientId, presence)
 		if sendMessage ~= nil then
 			sendMessage({ kind = "presenceLeft", clientId = clientId })
 		end
-		log(("presenceLeft clientId=%s (presença zerada)"):format(clientId))
+		-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md):
+		-- rotineiro/alta frequência (zera a cada troca/fechamento de arquivo no
+		-- VS Code, não só saída real da sessão) -> Logger.debug.
+		Logger.debug(("presenceLeft clientId=%s (presença zerada)"):format(clientId))
 		return
 	end
 
@@ -285,7 +288,9 @@ local function emitPresence(clientId, presence)
 			selectionStartColumn = if presence.selectionStartColumn == -1 then nil else presence.selectionStartColumn,
 		})
 	end
-	log(("presenceChanged clientId=%s (%s) uuid=%s cursor=%d,%d"):format(
+	-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md): rotineiro/
+	-- alta frequência (dispara a cada movimento de cursor/seleção) -> Logger.debug.
+	Logger.debug(("presenceChanged clientId=%s (%s) uuid=%s cursor=%d,%d"):format(
 		clientId,
 		displayName,
 		presence.uuid,
@@ -349,7 +354,10 @@ local function checkPresenceDrift()
 			if sendMessage ~= nil then
 				sendMessage({ kind = "presenceLeft", clientId = clientId })
 			end
-			log(("presenceLeft clientId=%s (sessão removida)"):format(clientId))
+			-- 2026-07-20 (BUG 2, mesmo critério do presenceLeft acima): sessão
+			-- some de Sessions/ também por timeout/cleanupStaleSessions (20s),
+			-- não só saída real -> Logger.debug.
+			Logger.debug(("presenceLeft clientId=%s (sessão removida)"):format(clientId))
 		end
 	end
 end

@@ -35,9 +35,10 @@ Config.NOTIFICATIONS_SETTING_KEY = "SyncTeam_ShowNotifications"
 -- deliberada: o comportamento anterior (auto-start incondicional ao carregar
 -- o plugin, ver init.server.luau) conectava sem o dev pedir; a partir de
 -- agora o dev decide quando conectar clicando em CONNECT no painel, e só quem
--- ligar esta setting explicitamente (ainda sem UI dedicada nesta fatia —
--- mesmo padrão de PORT_SETTING_KEY quando foi introduzida, usuário avançado
--- via plugin:SetSetting(...) no Command Bar) volta a ter auto-start.
+-- ligar esta setting (2026-07-20: toggle real "Reconectar automaticamente ao
+-- abrir a place" na tela de configurações do painel, ver
+-- plugin/src/ui/StatusPanel.luau — antes disso só via
+-- plugin:SetSetting(...) no Command Bar) volta a ter auto-start.
 Config.AUTOSTART_SETTING_KEY = "SyncTeam_AutoStart"
 
 -- Lista de portas candidatas usada SÓ quando não há nenhuma porta
@@ -202,9 +203,10 @@ end
 -- presente e booleana, senão default FALSE (oposto de
 -- resolveNotificationsEnabled — ver comentário de AUTOSTART_SETTING_KEY
 -- acima). GetSetting pode devolver nil (nunca setado, o caso normal para
--- todo mundo até que exista UI para isto) ou um valor de tipo errado —
--- ambos caem no default desligado, nunca erram para o lado de conectar
--- sozinho sem o dev pedir.
+-- quem nunca abriu o toggle de "Reconectar automaticamente ao abrir a
+-- place" nas configurações do painel — que também nasce desligado) ou um
+-- valor de tipo errado — ambos caem no default desligado, nunca erram para
+-- o lado de conectar sozinho sem o dev pedir.
 function Config.resolveAutoStartEnabled(pluginObject)
 	local ok, value = pcall(function()
 		return pluginObject:GetSetting(Config.AUTOSTART_SETTING_KEY)

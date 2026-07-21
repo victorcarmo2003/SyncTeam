@@ -86,6 +86,19 @@ class FakeTransport implements Transport {
         this.scripts.push({ uuid, path: message.path as string, className: message.className as string });
         return { ok: true, uuid, api: "UpdateSourceAsync" };
       }
+      case "deleteScript": {
+        // Best-effort, igual aos demais handlers deste fake: `handleScriptAdded`
+        // só atualiza o estado interno do SyncBridge, nunca `transport.scripts`
+        // (que só é populado pelo modo "criar" de writeSource) — então não dá
+        // pra exigir que o uuid já esteja aqui antes de confirmar o ack.
+        const uuid = message.uuid as string;
+        const idx = this.scripts.findIndex((s) => s.uuid === uuid);
+        if (idx !== -1) {
+          this.scripts.splice(idx, 1);
+        }
+        this.sources.delete(uuid);
+        return { ok: true, uuid };
+      }
       default:
         return { ok: false, error: `unhandled kind ${String(message.kind)}` };
     }
@@ -112,6 +125,11 @@ function writeTmp(relPath: string, content: string): void {
   const absolute = path.join(tmpDir, ...relPath.split("/"));
   fs.mkdirSync(path.dirname(absolute), { recursive: true });
   fs.writeFileSync(absolute, content, "utf8");
+}
+
+/** Apaga direto no disco (bypassando a ponte) — simula o usuário deletando o arquivo no VS Code/Explorer. */
+function deleteTmp(relPath: string): void {
+  fs.rmSync(path.join(tmpDir, ...relPath.split("/")));
 }
 
 beforeEach(() => {
@@ -446,6 +464,136 @@ describe("scriptRemoved", () => {
     await bridge.handleScriptRemoved({ uuid: "uuid-main", path: "ServerScriptService/Server/Main" });
 
     expect(existsTmp("src/server/Main.server.luau")).toBe(false);
+  });
+});
+
+describe("deleção local (disco → Studio) — 2026-07-20", () => {
+  test("delete local de um uuid conhecido manda deleteScript e limpa o estado local no ack de sucesso", async () => {
+    const transport = new FakeTransport();
+    await bridge.handleScriptAdded({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script" }, transport);
+    await bridge.handleSourceChanged({
+      uuid: "uuid-main",
+      path: "ServerScriptService/Server/Main",
+      className: "Script",
+      source: "print(1)",
+    });
+    expect(existsTmp("src/server/Main.server.luau")).toBe(true);
+    transport.sent.length = 0;
+
+    deleteTmp("src/server/Main.server.luau");
+    await bridge.handleLocalFileChange("src/server/Main.server.luau", transport);
+
+    expect(transport.sent).toContainEqual({ kind: "deleteScript", uuid: "uuid-main" });
+    // Estado local limpo: uuid não é mais rastreado em nenhuma direção.
+    expect(bridge.resolveUuidForDiskPath("src/server/Main.server.luau")).toBeNull();
+    expect(bridge.resolveDiskPathForUuid("uuid-main")).toBeNull();
+  });
+
+  test("ack de falha loga erro e NÃO limpa o estado local (uuid continua rastreado)", async () => {
+    const transport = new FakeTransport();
+    await bridge.handleScriptAdded({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script" }, transport);
+    await bridge.handleSourceChanged({
+      uuid: "uuid-main",
+      path: "ServerScriptService/Server/Main",
+      className: "Script",
+      source: "print(1)",
+    });
+
+    class RejectingDeleteTransport implements Transport {
+      readonly sent: Record<string, unknown>[] = [];
+      async request(message: Record<string, unknown>): Promise<Record<string, unknown>> {
+        this.sent.push(message);
+        if (message.kind === "deleteScript") {
+          return { ok: false, error: "uuid desconhecido" };
+        }
+        return transport.request(message);
+      }
+    }
+    const rejecting = new RejectingDeleteTransport();
+
+    const rejections: Array<{ diskPath: string; error: string }> = [];
+    bridge.setOnWriteRejected(({ diskPath, error }) => rejections.push({ diskPath, error }));
+
+    deleteTmp("src/server/Main.server.luau");
+    await bridge.handleLocalFileChange("src/server/Main.server.luau", rejecting);
+
+    expect(rejecting.sent).toContainEqual({ kind: "deleteScript", uuid: "uuid-main" });
+    expect(rejections).toEqual([{ diskPath: "src/server/Main.server.luau", error: "uuid desconhecido" }]);
+    expect(logger.lines.some((l) => l.startsWith("ERROR") && l.includes("uuid-main"))).toBe(true);
+    // Estado local NÃO foi limpo: a instância pode não ter sido removida no Studio.
+    expect(bridge.resolveUuidForDiskPath("src/server/Main.server.luau")).toBe("uuid-main");
+    expect(bridge.resolveDiskPathForUuid("uuid-main")).toBe("src/server/Main.server.luau");
+  });
+
+  test("delete de um path sem uuid conhecido não manda nada ao Studio", async () => {
+    const transport = new FakeTransport();
+
+    await bridge.handleLocalFileChange("src/server/NuncaExistiu.server.luau", transport);
+
+    expect(transport.sent).toHaveLength(0);
+  });
+
+  test("delete dentro de pasta de pacotes Wally é ignorado sem mandar deleteScript", async () => {
+    const transport = new FakeTransport();
+    await bridge.handleScriptAdded(
+      { uuid: "uuid-pkg", path: "ServerScriptService/Server/Packages/Foo", className: "ModuleScript" },
+      transport,
+    );
+    await bridge.handleSourceChanged({
+      uuid: "uuid-pkg",
+      path: "ServerScriptService/Server/Packages/Foo",
+      className: "ModuleScript",
+      source: "return 1",
+    });
+    expect(existsTmp("src/server/Packages/Foo.luau")).toBe(true);
+    transport.sent.length = 0;
+
+    deleteTmp("src/server/Packages/Foo.luau");
+    await bridge.handleLocalFileChange("src/server/Packages/Foo.luau", transport);
+
+    expect(transport.sent.some((m) => m.kind === "deleteScript")).toBe(false);
+    // Nada foi limpo — o uuid continua rastreado normalmente.
+    expect(bridge.resolveDiskPathForUuid("uuid-pkg")).toBe("src/server/Packages/Foo.luau");
+  });
+
+  test("deleção em lote (pasta com vários módulos): cada diskPath deletado é processado independentemente", async () => {
+    // O FileSystemWatcher entrega um evento onDidDelete por ARQUIVO, não um
+    // evento agregado por pasta (confirmado pela API do vscode.FileSystemWatcher
+    // e pelo debounce em extension.ts, que é chaveado por relPath individual) —
+    // este teste simula essa entrega chamando handleLocalFileChange uma vez por
+    // arquivo, como o watcher real faria.
+    const transport = new FakeTransport();
+    await bridge.handleScriptAdded({ uuid: "uuid-a", path: "ServerScriptService/Server/Folder/A", className: "ModuleScript" }, transport);
+    await bridge.handleSourceChanged({
+      uuid: "uuid-a",
+      path: "ServerScriptService/Server/Folder/A",
+      className: "ModuleScript",
+      source: "return 'a'",
+    });
+    await bridge.handleScriptAdded({ uuid: "uuid-b", path: "ServerScriptService/Server/Folder/B", className: "ModuleScript" }, transport);
+    await bridge.handleSourceChanged({
+      uuid: "uuid-b",
+      path: "ServerScriptService/Server/Folder/B",
+      className: "ModuleScript",
+      source: "return 'b'",
+    });
+    expect(existsTmp("src/server/Folder/A.luau")).toBe(true);
+    expect(existsTmp("src/server/Folder/B.luau")).toBe(true);
+    transport.sent.length = 0;
+
+    deleteTmp("src/server/Folder/A.luau");
+    deleteTmp("src/server/Folder/B.luau");
+    await bridge.handleLocalFileChange("src/server/Folder/A.luau", transport);
+    await bridge.handleLocalFileChange("src/server/Folder/B.luau", transport);
+
+    expect(transport.sent).toEqual(
+      expect.arrayContaining([
+        { kind: "deleteScript", uuid: "uuid-a" },
+        { kind: "deleteScript", uuid: "uuid-b" },
+      ]),
+    );
+    expect(bridge.resolveDiskPathForUuid("uuid-a")).toBeNull();
+    expect(bridge.resolveDiskPathForUuid("uuid-b")).toBeNull();
   });
 });
 

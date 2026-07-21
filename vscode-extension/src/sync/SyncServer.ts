@@ -34,6 +34,25 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15000;
 
+// Timeout de segurança (ms) para stop() nunca travar indefinidamente
+// esperando wss.close(). Causa raiz confirmada lendo o código-fonte do `ws`
+// vendorizado (node_modules/ws/lib/websocket.js e websocket-server.js,
+// 2026-07-20): `client.close()` inicia um handshake gracioso e só destrói o
+// socket de fato depois de até CLOSE_TIMEOUT=30000ms (constants.js) se o
+// peer nunca responder — e `WebSocketServer.close(cb)`, no modo `port`
+// (nosso caso), delega para `http.Server.close(cb)`, cujo callback só
+// dispara quando NENHUMA conexão TCP rastreada por ele continuar aberta.
+// Com um plugin morto/sem resposta (o cenário exato que o heartbeat já
+// existe para detectar), isso podia travar stop()/deactivate() por até 30s.
+// Fix: terminate() (destrói o socket na hora, sem esperar handshake) em vez
+// de close() para TODOS os sockets conectados — o plugin não distingue os
+// dois de qualquer forma (WebStreamClient.Closed() não expõe código/motivo,
+// ver .claude/research/2026-07-15-webstreamclient-close-code.md) — e este
+// timeout como rede de segurança adicional, cobrindo qualquer sobra residual
+// (ex.: socket em upgrade HTTP nunca finalizado) sem depender de conhecer
+// todos os casos de borda.
+const DEFAULT_STOP_SAFETY_TIMEOUT_MS = 2000;
+
 export interface SyncServerOptions {
   /** Timeout (ms) das requisições request()/resposta correlacionada. Default 10000. */
   requestTimeoutMs?: number;
@@ -47,6 +66,11 @@ export interface SyncServerOptions {
    * conexão é rejeitada com `connectionRejected`/`port_in_use`.
    */
   multiSync?: boolean;
+  /**
+   * Timeout (ms) de segurança em volta de `wss.close()` dentro de `stop()`.
+   * Default 2000. Ver comentário de `DEFAULT_STOP_SAFETY_TIMEOUT_MS`.
+   */
+  stopSafetyTimeoutMs?: number;
 }
 
 export interface SyncServerHandlers {
@@ -84,6 +108,7 @@ export class SyncServer {
   private readonly heartbeatIntervalMs: number;
   private readonly heartbeatTimeoutMs: number;
   private readonly multiSync: boolean;
+  private readonly stopSafetyTimeoutMs: number;
 
   constructor(
     private readonly port: number,
@@ -94,6 +119,7 @@ export class SyncServer {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
     this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
     this.multiSync = options.multiSync ?? false;
+    this.stopSafetyTimeoutMs = options.stopSafetyTimeoutMs ?? DEFAULT_STOP_SAFETY_TIMEOUT_MS;
   }
 
   setHandlers(handlers: SyncServerHandlers): void {
@@ -124,16 +150,49 @@ export class SyncServer {
     }
     this.heartbeats.clear();
     this.rejectAllPending(new Error("servidor SyncTeam encerrado"));
-    for (const client of this.clients) {
-      client.close();
-    }
     this.clients.clear();
     const wss = this.wss;
     this.wss = null;
     if (!wss) {
       return;
     }
-    await new Promise<void>((resolve) => wss.close(() => resolve()));
+
+    // terminate() (não close()) em TODO socket conectado — inclusive os que
+    // nunca chegaram a mandar 'hello' (wss.clients é o rastreamento interno
+    // do `ws`, superset de this.clients). Ver DEFAULT_STOP_SAFETY_TIMEOUT_MS
+    // acima para o porquê: close() pode travar até 30s por socket se o peer
+    // não responder, e o plugin não distingue os dois de qualquer forma.
+    for (const socket of wss.clients) {
+      socket.terminate();
+    }
+
+    // Mesmo com terminate() imediato, o callback de wss.close() ainda
+    // depende do http.Server interno emitir 'close' (nenhuma conexão TCP
+    // residual) — timeout de segurança garante que stop()/deactivate() NUNCA
+    // fica pendurado, mesmo em algum caso de borda não previsto. Se o
+    // timeout vencer, a porta pode demorar um pouco mais para ser liberada
+    // pelo SO, mas o processo segue adiante normalmente.
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const safety = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.logger.error(
+          `wss.close() não completou em ${this.stopSafetyTimeoutMs}ms — seguindo adiante ` +
+            "(a porta pode demorar um pouco mais para ser liberada pelo SO)",
+        );
+        resolve();
+      }, this.stopSafetyTimeoutMs);
+      wss.close((err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(safety);
+        if (err) {
+          this.logger.error(`erro ao fechar o servidor WebSocket: ${err.message}`);
+        }
+        resolve();
+      });
+    });
   }
 
   /** Algum plugin conectado agora (aberto de fato, hello aceito)? */

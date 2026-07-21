@@ -11,6 +11,7 @@
 --     port: Source<number>,
 --     view: Source<"main" | "settings">,
 --     notificationsEnabled: Source<boolean>,
+--     autoReconnectEnabled: Source<boolean>,
 --     sessionsMap: Source<{ [clientId]: RowData }>,
 --       -- RowData = { clientId, username, joinSequence, isLeader, info }
 --   }
@@ -19,17 +20,20 @@
 --     onDisconnect: () -> (),
 --     onPortSubmit: (newPort: number) -> (),
 --     onNotificationsToggle: (enabled: boolean) -> (),
+--     onAutoReconnectToggle: (enabled: boolean) -> (),
 --   }
 --
 -- `state` é uma tabela de Sources do Vide — cada campo É a própria função
 -- fonte (chamável sem args para ler, com 1 arg para escrever), não um par
--- getter/setter separado; StatusPanel só LÊ (exceto `view` e
--- `notificationsEnabled`, que este módulo também escreve diretamente ao
--- reagir a clique — trocar de tela e ligar/desligar notificações são
--- estado 100% local de UI, não precisam de callback de volta pra
--- PluginUI/init.server.luau; só onNotificationsToggle existe à parte porque
--- a PREFERÊNCIA precisa ser persistida via plugin:SetSetting, que só
--- PluginUI.luau sabe fazer).
+-- getter/setter separado; StatusPanel só LÊ (exceto `view`,
+-- `notificationsEnabled` e `autoReconnectEnabled`, que este módulo também
+-- escreve diretamente ao reagir a clique — trocar de tela e ligar/desligar
+-- as duas preferências são estado 100% local de UI, não precisam de
+-- callback de volta pra PluginUI/init.server.luau só para o VALOR mudar;
+-- `onNotificationsToggle`/`onAutoReconnectToggle` existem à parte porque a
+-- PERSISTÊNCIA (e, no caso de auto-reconectar, a AÇÃO de tentar conectar já
+-- — ver init.server.luau) precisa de código que só quem chamou PluginUI.init
+-- conhece, nunca duplicado aqui).
 --
 -- Decisões de layout (pixels/cores) não especificadas 100% pelo mockup do
 -- usuário: documentadas em detalhe em .claude/agent-memory/ui-dev.md.
@@ -451,6 +455,51 @@ local function NotificationsToggle(state, callbacks)
 	}
 end
 
+-- Segunda opção real desta fatia (2026-07-20): liga/desliga
+-- Config.AUTOSTART_SETTING_KEY (mesma setting que já existia sem UI, ver
+-- Config.luau) — "conectar sozinho ao abrir a place/recarregar o plugin",
+-- NÃO tem relação com reconexão após queda de uma sessão já viva (essa
+-- já é automática e incondicional, ver Config.RECONNECT_SECONDS, e não
+-- precisa de nenhuma preferência). Mesmo mirror visual de NotificationsToggle
+-- (mesmo tamanho/posição/estados hover, texto "Ativado"/"Desativado") —
+-- única diferença é que aqui `callbacks.onAutoReconnectToggle` também pode
+-- AGIR na hora (tentar conectar já, se ligado e desconectado; ver o
+-- comentário completo dessa decisão de UX em init.server.luau,
+-- PluginUI.init).
+local function AutoReconnectToggle(state, callbacks)
+	local hovered = vide.source(false)
+	return vide.create "TextButton" {
+		Name = "AutoReconnectToggle",
+		Size = UDim2.new(0.38, 0, 1, -6),
+		Position = UDim2.new(0.62, 0, 0, 3),
+		BackgroundColor3 = function()
+			return if hovered() then Theme.Color.IconButtonHover else Theme.Color.IconButton
+		end,
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Font = Theme.Font.Body,
+		TextSize = 12,
+		TextColor3 = Theme.Color.ButtonText,
+		Text = function()
+			return if state.autoReconnectEnabled() then "Ativado" else "Desativado"
+		end,
+
+		vide.create "UICorner" { CornerRadius = Theme.Layout.CornerRadius },
+
+		MouseEnter = function()
+			hovered(true)
+		end,
+		MouseLeave = function()
+			hovered(false)
+		end,
+		Activated = function()
+			local newValue = not state.autoReconnectEnabled()
+			state.autoReconnectEnabled(newValue)
+			callbacks.onAutoReconnectToggle(newValue)
+		end,
+	}
+end
+
 -- Itens "em breve" (spec da tarefa: desabilitados, sem funcionalidade real
 -- nesta fatia) — texto estático à direita, sem controle nenhum.
 local DISABLED_SETTINGS = {
@@ -540,6 +589,11 @@ local function SettingsView(state, callbacks)
 			},
 
 			SettingsRow("Mostrar notificações", NotificationsToggle(state, callbacks), false),
+			SettingsRow(
+				"Reconectar automaticamente ao abrir a place",
+				AutoReconnectToggle(state, callbacks),
+				false
+			),
 			DisabledSettingRow(DISABLED_SETTINGS[1]),
 			DisabledSettingRow(DISABLED_SETTINGS[2]),
 			DisabledSettingRow(DISABLED_SETTINGS[3]),

@@ -20,8 +20,12 @@
 -- alterna um DockWidgetPluginGui (painel de status construído com Vide, ver
 -- plugin/src/ui/PluginUI.luau) — este arquivo continua sendo o ÚNICO dono da
 -- lógica de conexão/sessão; PluginUI só invoca callbacks (onConnect/
--- onDisconnect/onPortChange) e reflete estado (setConnectionStatus/setPort),
--- nunca reimplementa nada de start()/stop()/troca de porta.
+-- onDisconnect/onPortChange/onAutoReconnectToggle) e reflete estado
+-- (setConnectionStatus/setPort), nunca reimplementa nada de
+-- start()/stop()/troca de porta. 2026-07-20: a tela de configurações do
+-- painel ganhou um toggle real para Config.AUTOSTART_SETTING_KEY
+-- (onAutoReconnectToggle abaixo, perto de PluginUI.init) — a setting já
+-- existia desde 2026-07-16, só sem UI dedicada.
 --
 -- Fora de escopo aqui (ver docs/MILESTONES.md): UX de lease no VS Code
 -- (M3.3, delegado a ui-dev); renderização de cursores/seleções na extensão
@@ -72,13 +76,24 @@ local client = nil -- WebStreamClient conectado no momento (nil se desconectado)
 -- independente de `enabled`/`currentToken` (precisa rodar mesmo desconectado,
 -- para detectar o retorno à edição e poder chamar start() de novo).
 --
+-- 2026-07-20 (BUG 1, ver docs/DECISIONS.md): a condição
+-- `RunService:IsStudio() and RunService:IsRunning()` estava DUPLICADA (aqui e
+-- no fim do arquivo, antes do autostart) e o botão CONNECT do painel
+-- (onConnect, PluginUI.init abaixo) não tinha NENHUM guard — extraída para
+-- esta função única, usada em TODOS os pontos de entrada de start()
+-- (checkRunModeTransition, autostart, onConnect, e dentro do próprio start()
+-- como defesa em profundidade).
+local function isInRunOrPlayMode()
+	return RunService:IsStudio() and RunService:IsRunning()
+end
+
 -- Limitação conhecida, não resolvida (documentada na pesquisa e em
 -- docs/DECISIONS.md 2026-07-16): quando o teste é PAUSADO, a doc oficial
 -- afirma que `IsRunning()` (e `IsEdit()`) ficam ambos `false` — ou seja, este
 -- guard pode falso-negativo e achar que voltou para edição normal enquanto o
 -- teste só está pausado, retomando o sync indevidamente. Não há solução limpa
 -- documentada para isso; tratado como limitação aceita, não um hack.
-local wasInRunOrPlayMode = RunService:IsStudio() and RunService:IsRunning()
+local wasInRunOrPlayMode = isInRunOrPlayMode()
 local runGuardStoppedSync = false -- true quando ESTE guard (não o usuário) chamou stop() por causa do Run/Play
 
 -- Sinal EXPLÍCITO de rejeição de porta (2026-07-15): a extensão VS Code rejeita
@@ -242,7 +257,14 @@ local function handleWriteSource(message)
 			api = if ok then detail else nil,
 			error = if ok then nil else detail,
 		})
-		log(("writeSource (update) uuid=%s -> %s"):format(
+		-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md):
+		-- rotineiro/alta frequência (dispara a cada escrita vinda do VS Code,
+		-- não só no boot) -> Logger.debug. Continua encaminhado por WS
+		-- (observabilidade de teste automatizado intacta); só não aparece mais
+		-- no Output do Studio a cada edição. Erros de uuid desconhecido/bloqueio
+		-- de pasta vendorizada (acima, ainda `log`) continuam visíveis — são
+		-- raros/acionáveis, não rotina.
+		Logger.debug(("writeSource (update) uuid=%s -> %s"):format(
 			tostring(message.uuid),
 			if ok then detail else "ERRO: " .. tostring(detail)
 		))
@@ -277,10 +299,110 @@ local function handleWriteSource(message)
 		api = if ok then detail else nil,
 		error = if ok then nil else detail,
 	})
-	log(("writeSource (create) '%s' -> uuid=%s %s"):format(
+	-- 2026-07-20 (BUG 2, mesmo critério do writeSource (update) acima):
+	-- rotineiro/alta frequência -> Logger.debug.
+	Logger.debug(("writeSource (create) '%s' -> uuid=%s %s"):format(
 		tostring(message.path),
 		tostring(uuid),
 		if ok then detail else "ERRO: " .. tostring(detail)
+	))
+end
+
+-- Contrato aditivo (extensão -> plugin, docs/DECISIONS.md): o dev deleta um
+-- module localmente no VS Code -> a extensão detecta e manda
+-- {kind="deleteScript", requestId, uuid}. Mesmo estilo/estrutura de
+-- handleWriteSource modo ATUALIZAÇÃO acima (lógica quase paralela: resolve
+-- por uuid, bloqueia pasta vendorizada, checa lease) — reusa o kind
+-- "writeAck" na resposta (mesmo formato que writeSource já usa).
+--
+-- Checagem de lease aplicada aqui pela MESMA razão que updates já a exigem:
+-- evita destruir um script que outro dev está com lease ativa de edição no
+-- exato momento (consistência e segurança; a alternativa — permitir delete
+-- sem lease — abriria uma forma de um dev apagar o trabalho em andamento de
+-- outro sem qualquer arbitragem).
+--
+-- NÃO limpa ScriptRegistry nem emite scriptRemoved aqui: o ciclo de polling
+-- que já existe (checkRegistryDrift em SourceWatcher.luau, docs/MILESTONES.md
+-- M2) já detecta a Instance destruída (ScriptRegistry.isInstanceDestroyed —
+-- Parent == nil + confirmação por pcall, NUNCA ObjectValue.Value == nil, ver
+-- .claude/rules/luau.md) dentro de Config.POLL_INTERVAL_SECONDS (0.5s) e
+-- emite scriptRemoved espontâneo sozinho, pelo MESMO caminho que já existe
+-- para delete feito diretamente no Studio — inclusive o que propaga a
+-- remoção para o OUTRO dev (Team Create replica o Destroy(), o Studio dele
+-- detecta via o mesmo polling e o plugin dele manda scriptRemoved para a
+-- extensão dele).
+local function handleDeleteScript(message)
+	local instance = SourceWatcher.resolveByUuid(message.uuid)
+	if instance == nil then
+		sendMessage({
+			kind = "writeAck",
+			requestId = message.requestId,
+			ok = false,
+			error = "uuid desconhecido ou script inválido: " .. tostring(message.uuid),
+		})
+		log(("deleteScript uuid=%s -> ERRO: desconhecido"):format(tostring(message.uuid)))
+		return
+	end
+
+	-- Pastas vendorizadas (Packages/ServerPackages/DevPackages, ver
+	-- Config.luau/docs/DECISIONS.md 2026-07-16): mesma checagem que
+	-- handleWriteSource (modo atualização) já faz — delete via live sync
+	-- também é bloqueado, para não destruir/perturbar uma árvore vendorizada
+	-- que pode divergir entre devs.
+	if Config.isInsideExcludedPackageFolder(instance) then
+		local blockedMessage = "delete bloqueado: script dentro de pasta de pacote vendorizado (Packages/ServerPackages/DevPackages) — não sincronizado ao vivo"
+		sendMessage({
+			kind = "writeAck",
+			requestId = message.requestId,
+			ok = false,
+			uuid = message.uuid,
+			error = blockedMessage,
+		})
+		log(("deleteScript uuid=%s -> BLOQUEADO (pasta vendorizada): %s"):format(
+			tostring(message.uuid),
+			instance:GetFullName()
+		))
+		return
+	end
+
+	TeamCreateLease.ensureIntent(message.uuid, instance)
+	local canWrite, ownerClientId = TeamCreateLease.canWrite(message.uuid)
+	if not canWrite then
+		local ownerDisplay = TeamCreateLease.describeClient(ownerClientId)
+		local leaseDeniedMessage = ("lease negada — script sendo editado por %s"):format(ownerDisplay)
+		sendMessage({
+			kind = "writeAck",
+			requestId = message.requestId,
+			ok = false,
+			uuid = message.uuid,
+			error = leaseDeniedMessage,
+		})
+		-- Mesmo padrão M4.5 de lease negada em handleWriteSource: toast-worthy
+		-- (Logger.notify), não só log — o dev precisa perceber sem olhar o
+		-- Output.
+		notify(("%s (uuid=%s)"):format(leaseDeniedMessage, tostring(message.uuid)))
+		return
+	end
+
+	-- Toda API de plataforma em pcall (.claude/rules/luau.md).
+	local ok, err = pcall(function()
+		instance:Destroy()
+	end)
+	sendMessage({
+		kind = "writeAck",
+		requestId = message.requestId,
+		ok = ok,
+		uuid = if ok then message.uuid else nil,
+		error = if ok then nil else tostring(err),
+	})
+	-- Diferente de writeSource update/create (rotineiro/alta frequência,
+	-- rebaixado a Logger.debug em 2026-07-20): delete é raro e consequente
+	-- (evento destrutivo) — mesmo critério já estabelecido
+	-- ("rotineiro/alta frequência = debug; raro/acionável = log") aponta para
+	-- manter Logger.log tanto no sucesso quanto no erro.
+	log(("deleteScript uuid=%s -> %s"):format(
+		tostring(message.uuid),
+		if ok then "destruído" else "ERRO: " .. tostring(err)
 	))
 end
 
@@ -322,6 +444,10 @@ local function handleMessage(raw)
 
 	if message.kind == "writeSource" then
 		handleWriteSource(message)
+	elseif message.kind == "deleteScript" then
+		-- Mensagem ADITIVA (extensão -> plugin, docs/DECISIONS.md) — mesmo
+		-- padrão de "ping": não bumpa Config.PROTOCOL_VERSION.
+		handleDeleteScript(message)
 	elseif message.kind == "readSource" then
 		handleReadSource(message)
 	elseif message.kind == "listScripts" then
@@ -728,6 +854,21 @@ local function start(pluginObject)
 		log("já está rodando.")
 		return
 	end
+	-- Defesa em profundidade (2026-07-20, BUG 1 — docs/DECISIONS.md): start()
+	-- recusa a si mesmo em Run/Play, no MESMO padrão de guarda de idempotência
+	-- já usado acima (`if enabled then ... return end`). Cobre qualquer
+	-- chamador futuro que esqueça de checar antes. Os call-sites que já sabem
+	-- de antemão que isRunOrPlayMode() é verdadeiro CONTINUAM checando por
+	-- conta própria antes de chamar start() (ver onConnect abaixo) — só eles
+	-- sabem o CONTEXTO da chamada (ação explícita do usuário) para decidir se
+	-- vale um toast (Logger.notify); aqui dentro só loga (Logger.log), sem
+	-- toast, porque start() não sabe se foi autostart, onConnect ou o guard de
+	-- transição (que na prática nunca cai aqui: só chama start() de volta
+	-- quando JÁ detectou o retorno à edição).
+	if isInRunOrPlayMode() then
+		log("start() recusado: Studio em modo Run/Play (F8/F5); conecte após voltar para edição normal.")
+		return
+	end
 	enabled = true
 	currentToken += 1
 	local myToken = currentToken
@@ -788,9 +929,9 @@ end
 local runModeMonitorEnabled = true
 
 local function checkRunModeTransition()
-	local isInRunOrPlayMode = RunService:IsStudio() and RunService:IsRunning()
+	local nowInRunOrPlayMode = isInRunOrPlayMode()
 
-	if isInRunOrPlayMode and not wasInRunOrPlayMode then
+	if nowInRunOrPlayMode and not wasInRunOrPlayMode then
 		-- Transição edição -> Run/Play: suspende o sync se estava rodando.
 		wasInRunOrPlayMode = true
 		if enabled then
@@ -798,7 +939,7 @@ local function checkRunModeTransition()
 			log("F8/F5 (Run/Play) detectado; sync suspenso durante o teste.")
 			stop()
 		end
-	elseif not isInRunOrPlayMode and wasInRunOrPlayMode then
+	elseif not nowInRunOrPlayMode and wasInRunOrPlayMode then
 		-- Transição Run/Play -> edição (ressalva: também dispara em falso se o
 		-- teste só foi PAUSADO, ver comentário de wasInRunOrPlayMode acima —
 		-- limitação conhecida, não resolvida).
@@ -838,6 +979,24 @@ end)
 -- painel substitui essa necessidade sem precisar de nenhum botão dedicado).
 PluginUI.init(plugin, {
 	onConnect = function()
+		-- Guard de Run/Play no botão CONNECT (2026-07-20, BUG 1 — antes desta
+		-- correção este era o ÚNICO ponto de entrada de start() sem NENHUM
+		-- guard, documentado como "fora de escopo" na tarefa de 2026-07-16 que
+		-- criou o guard de transição). Agora que autostart é opt-in (default
+		-- OFF, ver Config.resolveAutoStartEnabled), CONNECT manual é o fluxo
+		-- normal — clicar nele já em Run/Play (ex.: plugin recarregado durante
+		-- um teste em andamento) faria start() rodar livre, porque o guard de
+		-- TRANSIÇÃO (checkRunModeTransition) nunca veria a transição
+		-- edição->Run/Play (o sync já nasceria dentro do Run/Play) e por isso
+		-- nunca chamaria stop() de volta. Checagem feita AQUI, além da mesma
+		-- checagem dentro de start() (defesa em profundidade, ver comentário
+		-- lá): só este call-site sabe que é uma ação EXPLÍCITA do usuário —
+		-- merece feedback visível (toast via Logger.notify), mesmo padrão dos
+		-- outros pontos M4.5 que notificam recusas (ex.: lease negada).
+		if isInRunOrPlayMode() then
+			notify("CONNECT ignorado: Studio em modo Run/Play (F8/F5); conecte após voltar para edição normal.")
+			return
+		end
 		task.spawn(start, plugin)
 	end,
 	onDisconnect = stop,
@@ -892,6 +1051,49 @@ PluginUI.init(plugin, {
 			end
 		end)
 	end,
+	-- 2026-07-20 (pedido do usuário): toggle real de "Reconectar
+	-- automaticamente ao abrir a place" na tela de configurações do painel
+	-- (ui/StatusPanel.luau) — REUSA Config.AUTOSTART_SETTING_KEY, que já
+	-- existia desde 2026-07-16 (ver comentário de start()/auto-start no fim
+	-- do arquivo) só sem UI dedicada; nenhuma setting nova. Diferente de
+	-- onNotificationsToggle (preferência passiva, só persiste), este AGE na
+	-- hora ao ligar — decisão de UX explícita do usuário: ligar o toggle
+	-- enquanto desconectado deveria conectar já, não só valer "da próxima
+	-- vez".
+	onAutoReconnectToggle = function(newValue)
+		local okSet, errSet = pcall(function()
+			plugin:SetSetting(Config.AUTOSTART_SETTING_KEY, newValue)
+		end)
+		if not okSet then
+			log("falha ao salvar preferência de auto-reconectar:", tostring(errSet))
+			return
+		end
+		if not newValue then
+			-- Desligar só afeta o PRÓXIMO carregamento do plugin/place
+			-- (bloco de auto-start no fim deste arquivo) — NÃO derruba uma
+			-- sessão já conectada agora: o usuário pediu pra parar de
+			-- conectar sozinho no futuro, não pra desconectar o presente
+			-- (isso é o que DISCONNECT/onDisconnect já faz, se for o que
+			-- ele quiser).
+			log("auto-reconectar desligado; só afeta o próximo carregamento do plugin/place.")
+			return
+		end
+		-- Ligar: tenta conectar JÁ (mesma chamada que onConnect faz),
+		-- respeitando o MESMO guard de Run/Play — nunca conecta livre por
+		-- trás de um F8/F5 em andamento, mesmo padrão de feedback (toast)
+		-- que onConnect já dá quando recusado por esse motivo. Se já
+		-- conectado (enabled == true), start() se recusa sozinho
+		-- (idempotência, ver guard no topo de start()) — nada extra a
+		-- checar aqui além do SetSetting acima.
+		if isInRunOrPlayMode() then
+			notify(
+				"Auto-reconectar ativado, mas o Studio está em modo Run/Play (F8/F5);"
+					.. " conecte manualmente após voltar para edição normal."
+			)
+			return
+		end
+		task.spawn(start, plugin)
+	end,
 })
 PluginUI.setPort(Config.resolvePort(plugin))
 
@@ -918,10 +1120,11 @@ log("plugin carregado. Toolbar 'SyncTeam' alterna o painel de status; use o bot�
 -- guard de Run/Play abaixo) — o dev não tinha como optar por conectar
 -- manualmente. Agora o dev decide quando conectar clicando em CONNECT no
 -- painel (onConnect acima já chama `task.spawn(start, plugin)`, mesmo
--- caminho); só quem ligar Config.AUTOSTART_SETTING_KEY explicitamente (ainda
--- sem UI dedicada nesta fatia, mesmo padrão de PORT_SETTING_KEY quando foi
--- introduzida — usuário avançado via plugin:SetSetting(...) no Command Bar)
--- volta a ter o comportamento antigo.
+-- caminho); só quem ligar Config.AUTOSTART_SETTING_KEY volta a ter o
+-- comportamento antigo — 2026-07-20: agora um toggle real ("Reconectar
+-- automaticamente ao abrir a place", tela de configurações do painel, ver
+-- onAutoReconnectToggle em PluginUI.init acima e ui/StatusPanel.luau); antes
+-- disso só dava pra ligar via plugin:SetSetting(...) no Command Bar.
 --
 -- Mesmo padrão de carregamento validado no M0.5
 -- (.claude/agent-memory/luau-dev.md): o Studio auto-executa o Script raiz do
@@ -931,14 +1134,19 @@ log("plugin carregado. Toolbar 'SyncTeam' alterna o painel de status; use o bot�
 -- reinstalação duplicada, o que segue relevante mesmo com autostart opt-in
 -- (ex.: reload com a setting ligada).
 --
--- Guarda de Run/Play (ver comentário de wasInRunOrPlayMode acima): só se
--- aplica quando autostart está de fato ligado — se autostart estiver
--- desligado (o novo default), não há nada para o guard fazer aqui; o dev usa
--- o painel manualmente independente do modo Run/Play (o botão CONNECT em si
--- não tem guard de Run/Play — fora de escopo desta tarefa).
+-- Guarda de Run/Play (ver isInRunOrPlayMode() acima). Atualizado 2026-07-20
+-- (BUG 1, docs/DECISIONS.md): antes desta correção só o autostart e o guard
+-- de TRANSIÇÃO (checkRunModeTransition) tinham essa checagem — o botão
+-- CONNECT (onConnect, PluginUI.init acima) ficava de fora, documentado como
+-- "fora de escopo" na tarefa original de 2026-07-16. Isso deixou de ser
+-- aceitável quando autostart virou opt-in/default OFF (mesma sessão de
+-- 2026-07-16): CONNECT manual passou a ser o fluxo normal, não mais um atalho
+-- raro, então precisava do mesmo guard. Agora os TRÊS pontos de entrada
+-- (autostart aqui, onConnect, e start() como defesa em profundidade) usam a
+-- MESMA função isInRunOrPlayMode().
 if not Config.resolveAutoStartEnabled(plugin) then
 	log("autostart desligado; use o painel (toggle na toolbar) pra conectar manualmente.")
-elseif RunService:IsStudio() and RunService:IsRunning() then
+elseif isInRunOrPlayMode() then
 	log("Studio em modo Run/Play (RunService:IsRunning()==true) no carregamento; sync não iniciado automaticamente.")
 else
 	task.spawn(start, plugin)

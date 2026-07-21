@@ -48,13 +48,19 @@ local widget = nil -- DockWidgetPluginGui
 
 -- Sources do Vide (estado reativo do painel). `connectionStatus`/`port` são
 -- empurrados de fora (init.server.luau, via setConnectionStatus/setPort);
--- `view`/`notificationsEnabled`/`sessionsMap` são geridos aqui dentro.
--- connectionStatus tem 3 valores (item 1 da tarefa): "disconnected" (parado),
--- "connecting" (tentando/reconectando), "connected" (conexão confirmada).
+-- `view`/`notificationsEnabled`/`autoReconnectEnabled`/`sessionsMap` são
+-- geridos aqui dentro. connectionStatus tem 3 valores (item 1 da tarefa):
+-- "disconnected" (parado), "connecting" (tentando/reconectando), "connected"
+-- (conexão confirmada). `autoReconnectEnabled` (2026-07-20) espelha
+-- Config.AUTOSTART_SETTING_KEY — default `false` aqui só é o valor inicial
+-- antes de PluginUI.init ler a setting real via
+-- Config.resolveAutoStartEnabled (mesmo padrão de notificationsEnabledSource
+-- abaixo, cujo default `true` também é só o placeholder pré-init).
 local connectionStatusSource = vide.source("disconnected")
 local portSource = vide.source(Config.DEFAULT_PORT)
 local viewSource = vide.source("main")
 local notificationsEnabledSource = vide.source(true)
+local autoReconnectEnabledSource = vide.source(false)
 local sessionsMapSource = vide.source({})
 
 -- --------------------------------------------------------- tabela de sessões
@@ -185,10 +191,15 @@ end
 -- Chamado 1x por init.server.luau, fora do ciclo start()/stop() (mesmo
 -- lugar/momento em que a toolbar antiga era criada) — cria toolbar+widget,
 -- monta a árvore Vide, e inicia o refresh em segundo plano da tabela de
--- sessões. `callbacks` = { onConnect, onDisconnect, onPortChange(newPort) }
--- (mesma nomenclatura/contrato de start()/stop()/troca de porta já
--- existentes em init.server.luau — este módulo só invoca, nunca reimplementa
--- a lógica de conexão).
+-- sessões. `callbacks` = { onConnect, onDisconnect, onPortChange(newPort),
+-- onAutoReconnectToggle(newValue) } (mesma nomenclatura/contrato de
+-- start()/stop()/troca de porta já existentes em init.server.luau — este
+-- módulo só invoca, nunca reimplementa a lógica de conexão).
+-- `onAutoReconnectToggle` é repassado DIRETO pro StatusPanel sem lógica
+-- própria aqui (diferente de onNotificationsToggle, implementado abaixo só
+-- com plugin:SetSetting): a ação de "ligar auto-reconectar tenta conectar já
+-- respeitando o guard de Run/Play" precisa de start()/isInRunOrPlayMode(),
+-- que só init.server.luau conhece.
 function PluginUI.init(pluginObject, callbacks)
 	if running then
 		return
@@ -201,6 +212,7 @@ function PluginUI.init(pluginObject, callbacks)
 	-- funcionando via init.server.luau independente disso).
 	local ok, err = pcall(function()
 		notificationsEnabledSource(Config.resolveNotificationsEnabled(pluginObject))
+		autoReconnectEnabledSource(Config.resolveAutoStartEnabled(pluginObject))
 
 		local toolbar = pluginObject:CreateToolbar("SyncTeam")
 		local toggleButton = toolbar:CreateButton(
@@ -250,6 +262,11 @@ function PluginUI.init(pluginObject, callbacks)
 					log("falha ao salvar preferência de notificações:", tostring(errSet))
 				end
 			end,
+			-- Passthrough puro (ver comentário de PluginUI.init acima): a
+			-- persistência da setting E a tentativa de conectar já (quando
+			-- ligado) vivem em init.server.luau, o único lugar que conhece
+			-- start()/isInRunOrPlayMode().
+			onAutoReconnectToggle = callbacks.onAutoReconnectToggle,
 		}
 
 		local state = {
@@ -257,6 +274,7 @@ function PluginUI.init(pluginObject, callbacks)
 			port = portSource,
 			view = viewSource,
 			notificationsEnabled = notificationsEnabledSource,
+			autoReconnectEnabled = autoReconnectEnabledSource,
 			sessionsMap = sessionsMapSource,
 		}
 

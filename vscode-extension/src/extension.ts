@@ -396,6 +396,14 @@ async function startService(
   context.subscriptions.push(
     watcher.onDidChange(scheduleNotify),
     watcher.onDidCreate(scheduleNotify),
+    // 2026-07-20: sem isso, uma remoção local (delete de arquivo, ou a
+    // metade "delete" de um rename local) nunca chega a
+    // SyncBridge.handleLocalFileChange pelo watcher ao vivo — o gap coberto
+    // do lado da lógica (readFile null -> deleteScript) ficava morto sem
+    // este fio. Mesmo debounce/scheduleNotify de onDidChange/onDidCreate;
+    // relDiskPathFromUri é só cálculo de path (sem tocar disco), então
+    // funciona igual para uma URI que já não existe mais.
+    watcher.onDidDelete(scheduleNotify),
     watcher,
     { dispose: () => {
       for (const timer of debounceTimers.values()) {

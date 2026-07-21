@@ -1,5 +1,239 @@
 # Decisões registradas
 
+## 2026-07-20 — Toggle real de "Reconectar automaticamente ao abrir a place" no painel do plugin
+
+Pedido do usuário: expor `Config.AUTOSTART_SETTING_KEY`/`Config.resolveAutoStartEnabled`
+(`plugin/src/Config.luau`) — já existentes desde 2026-07-16, mas só ligáveis
+via `plugin:SetSetting(...)` no Command Bar — como um toggle de verdade na
+tela de configurações do painel (`ui-dev`, mesmo mirror visual do toggle
+"Mostrar notificações" já existente). **Nenhuma setting nova**: reusa a
+mesma chave, mesmo default (`false`/desligado).
+
+**Arquivos tocados**: `plugin/src/ui/StatusPanel.luau` (novo
+`AutoReconnectToggle`, `SettingsRow("Reconectar automaticamente ao abrir a
+place", ...)` logo abaixo do de notificações), `plugin/src/ui/PluginUI.luau`
+(novo `autoReconnectEnabledSource`, inicializado via
+`Config.resolveAutoStartEnabled(pluginObject)` dentro de `PluginUI.init`;
+`onAutoReconnectToggle` repassado como passthrough puro pro `StatusPanel`),
+`plugin/src/init.server.luau` (implementação real do callback dentro do
+bloco `PluginUI.init(plugin, {onConnect, onDisconnect, onPortChange,
+onAutoReconnectToggle})`), comentários de `Config.luau` atualizados (não
+dizem mais "ainda sem UI dedicada").
+
+**Decisão de UX** (pedida explicitamente pelo usuário, diferente do toggle de
+notificações — que é preferência passiva): ligar o toggle enquanto
+DESCONECTADO tenta conectar JÁ (`task.spawn(start, plugin)`, mesma chamada
+que o botão CONNECT usa), respeitando o mesmo guard de Run/Play
+(`isInRunOrPlayMode()`, extraído na entrada BUG 1 abaixo, mesma sessão) — se
+em Run/Play, só notifica via `Logger.notify`/toast, não conecta. Se já
+conectado (`enabled == true`), `start()` se recusa sozinho (idempotência),
+então o callback não precisa checar isso explicitamente. Desligar o toggle
+só salva a setting (`plugin:SetSetting`) — **não desconecta** uma sessão já
+ativa; só afeta o próximo carregamento do plugin/place. Reconectar sozinho
+após queda de uma conexão JÁ estabelecida continua sendo automático e
+incondicional (`runConnection`/`Config.RECONNECT_SECONDS`), sem relação
+nenhuma com esta setting — texto do toggle deliberadamente não menciona esse
+caso para não confundir os dois conceitos.
+
+**Validado só por `rojo build` + `lune run`** nos 4 arquivos tocados
+(`Config.luau`, `StatusPanel.luau`, `PluginUI.luau`, `init.server.luau`) —
+todos param no 1º global Roblox-específico (`game`/`script`), prova de parse
+limpo; `Config.luau` roda até o fim sem erro (não toca nenhum global). Build
++ deploy real via `Tools/build-and-deploy-plugin.ps1` feito nesta sessão.
+**`[Hipótese]`, não `[Verificado]`**: teste real em Studio (toggle aparece na
+tela de configurações, liga/desliga persiste entre reloads, ligar
+desconectado conecta na hora respeitando Run/Play, desligar não derruba
+sessão viva) pendente de confirmação física do usuário — não dá para
+automatizar clique em painel de plugin via `Tools/`.
+
+## 2026-07-20 — Bug real corrigido: delete local não propagava ao Studio (causa raiz do "rename cria module duplicado")
+
+Usuário reportou dois sintomas que pareciam separados: (1) renomear um script
+no VS Code fazia aparecer um module NOVO duplicado no VS Code do colega
+(o antigo continuava lá); (2) deletar um module no VS Code não deletava a
+Instance correspondente no Roblox Studio. Investigação por leitura de código
+(sessão principal, sem precisar de agente pra diagnosticar) confirmou UMA
+causa raiz só: o protocolo nunca teve mensagem de "deletar" no sentido
+disco→Studio. `SyncBridge.handleLocalFileChange` (`vscode-extension/src/sync/SyncBridge.ts`)
+já detectava arquivo sumido (`diskIO.readFile` retornando `null`), mas só
+logava `"não encontrado (removido?) — remoção local não é propagada ao
+Studio nesta versão (M2)"` e retornava — limitação deliberadamente
+documentada em `docs/MILESTONES.md` (M2, "fora de escopo desta fatia... fica
+para uma fatia de polish depois") que nunca foi implementada. Rename local =
+delete do path antigo + create do path novo sem correlação; a parte "criar"
+sempre funcionou, a parte "deletar o antigo" nunca chegava ao Studio — daí a
+duplicata.
+
+**Achado adicional durante o fix** (fora do escopo original, mas bloqueava o
+fix funcionar de ponta a ponta): `vscode-extension/src/extension.ts` nunca
+assinava `watcher.onDidDelete(...)` no `FileSystemWatcher` — só `onDidChange`/
+`onDidCreate`. Sem isso, uma deleção real nunca chegava a
+`handleLocalFileChange` nem pelo caminho antigo (que já detectava `null` via
+`readFile`). Corrigido junto.
+
+**Contrato de protocolo novo** (aditivo, não bumpa `PROTOCOL_VERSION` — mesmo
+raciocínio já usado para `ping`): requisição extensão→plugin
+`{kind:"deleteScript", requestId, uuid}`; resposta plugin→extensão reusa o
+kind `writeAck` já existente (`transport.request()`/`SyncServer.request`
+correlacionam só por `requestId`, não por `kind`, então não precisou mudar
+`SyncServer`) — `{kind:"writeAck", requestId, ok, uuid?, error?}`.
+
+**Lado da extensão** (`extension-dev`, `vscode-extension/src/sync/SyncBridge.ts`):
+novo método privado `handleLocalFileRemoved` chamado do ramo `content===null`
+de `handleLocalFileChange`. Sem uuid conhecido pro path: nada muda (só limpa
+`contentCache`, como já fazia). Com uuid conhecido: respeita a mesma exclusão
+de pastas Wally que updates já respeitam (`isInsideExcludedPackageFolder`),
+manda `deleteScript`, e no ack `ok=true` limpa `scripts`/`sourceCache`/
+`unregisterDiskPath`/`contentCache` (mesma limpeza de `handleScriptRemoved`,
+sem chamar `diskIO.deleteFile` de novo). Ack `ok=false` NÃO limpa nada e
+aciona `onWriteRejected?.({diskPath, error})`, mesmo shape dos outros
+call-sites. `protocol.ts` ganhou o tipo `DeleteScriptRequest` documentado.
+Deleção em lote (apagar uma pasta inteira) não precisou de mudança de
+arquitetura — `FileSystemWatcher` já entrega um `onDidDelete` por arquivo e o
+debounce já é por `relPath` individual. 5 testes novos em
+`vscode-extension/test/syncBridge.test.ts` (186/186 passando), `tsc --noEmit`
+limpo, `npm run build` (esbuild) sem erro.
+
+**Lado do plugin** (`luau-dev`, `plugin/src/init.server.luau`): novo
+`handleDeleteScript(message)`, espelhando `handleWriteSource` modo
+atualização — resolve por uuid (`SourceWatcher.resolveByUuid`), bloqueia
+pasta vendorizada (`Config.isInsideExcludedPackageFolder`), **checa lease**
+(`TeamCreateLease.ensureIntent`+`canWrite`, decisão deliberada: mesma
+checagem que updates já fazem, para não deixar um dev destruir um script que
+outro tem lease ativa de edição no momento) e só então `pcall(instance.Destroy)`.
+Não precisou limpar `ScriptRegistry` nem emitir `scriptRemoved` manualmente —
+o ciclo de polling que já existe (`checkRegistryDrift`/
+`ScriptRegistry.isInstanceDestroyed`) detecta a Instance destruída sozinho
+dentro de `Config.POLL_INTERVAL_SECONDS` (0.5s) e emite `scriptRemoved` pro
+MESMO caminho que delete feito direto no Studio já usa — é isso que propaga a
+remoção pro colega (Team Create replica o `Destroy()`). Log do
+sucesso/erro mantido em `Logger.log` (visível), não `Logger.debug` — decisão
+deliberada: delete é raro/consequente, diferente do `writeSource`
+update/create que a tarefa irmã do mesmo dia acabou de rebaixar por ser
+rotineiro. `rojo build` + `lune run` limpos; buildado e implantado via
+`Tools/build-and-deploy-plugin.ps1`.
+
+**O que continua fora de escopo, deliberadamente**: rename "de verdade" com
+preservação de UUID do lado do disco (correlacionar um delete+create como um
+único `scriptMoved`, como o Studio→disco já faz desde M2) não foi
+implementado — continua sendo delete+create sem correlação, uuid antigo
+morre e um novo nasce. O fix desta entrada já resolve o sintoma prático
+(duplicata/órfão desaparecem), mas a identidade do script não sobrevive a um
+rename feito no VS Code. Fica registrado como possível fatia de polish
+futura, não bloqueante.
+
+**Validado só por build + testes automatizados dos dois lados** (`rojo
+build`+`lune run` no plugin; `tsc --noEmit`+`vitest`+`esbuild` na extensão) —
+nada testado em Studio real nesta tarefa. Fica `[Hipótese]` até o usuário
+confirmar o roteiro: (1) deletar script sincronizado no VS Code → Instance
+some no Studio em ~0.5-1s → colega recebe a remoção; (2) tentar deletar
+script dentro de `Packages/`/pasta vendorizada → bloqueado; (3) tentar
+deletar com lease ativa de outro dev → negado; (4) renomear um script → só o
+novo aparece no colega, sem duplicata.
+
+## 2026-07-20 — BUG 1: botão CONNECT sem guard de Run/Play + guard de idempotência em start(); BUG 2: mais ruído de uso contínuo rebaixado a Logger.debug
+
+**Contexto**: usuário relatou o plugin "parecendo que estava executando em
+run-time (dando F8)". A entrada de 2026-07-16 ("Guard para não rodar sync
+durante F8 Run / F5 Play") só cobre a TRANSIÇÃO edição->Run/Play detectada por
+polling (`checkRunModeTransition`) — não cobre nascer JÁ em Run/Play. O
+autostart no fim do arquivo já tinha essa checagem desde sempre, mas o botão
+CONNECT do painel (`onConnect`, M4.5) NUNCA teve guard nenhum — documentado
+explicitamente como "fora de escopo" no comentário da tarefa de 2026-07-16.
+Isso deixou de ser aceitável na MESMA sessão de 2026-07-16 que tornou o
+autostart opt-in/default OFF: CONNECT manual virou o fluxo normal, não mais um
+atalho raro. Se o dev clicasse CONNECT já em Run/Play (plugin recarregado
+durante um teste em andamento, ou clique acidental depois de já ter apertado
+F8), `start()` rodava livre e o guard de TRANSIÇÃO nunca via a transição
+edição->Run/Play (o sync já nascia dentro do Run/Play) — sync ficava ativo o
+teste inteiro. Bate com o sintoma relatado.
+
+**Fix (BUG 1)**, `plugin/src/init.server.luau`:
+
+1. Extraída a condição duplicada `RunService:IsStudio() and
+   RunService:IsRunning()` (antes repetida em `wasInRunOrPlayMode` e no fim do
+   arquivo antes do autostart) para uma função única module-level:
+   `local function isInRunOrPlayMode() return RunService:IsStudio() and
+   RunService:IsRunning() end`, definida antes de `wasInRunOrPlayMode` (que
+   passou a usá-la na inicialização).
+2. **Padrão escolhido**: guarda em CADA ponto de entrada de `start()`, não só
+   dentro de `start()` — decisão registrada em comentário no código.
+   `start()` ganhou a MESMA checagem como **defesa em profundidade**, no mesmo
+   estilo da guarda de idempotência já existente ali (`if enabled then ...
+   return end`) — cobre qualquer chamador futuro que esqueça de checar antes,
+   e só loga (`Logger.log`, sem toast, porque não sabe o CONTEXTO da chamada).
+   `onConnect` (botão CONNECT) ganhou a MESMA checagem ANTES de chamar
+   `start()` — não só porque é defesa redundante, mas porque só este
+   call-site sabe que é uma ação EXPLÍCITA do usuário e por isso usa
+   `Logger.notify` (toast), mesmo padrão dos outros pontos M4.5 que notificam
+   recusas (ex.: lease negada): "CONNECT ignorado: Studio em modo Run/Play
+   (F8/F5); conecte após voltar para edição normal." O autostart no fim do
+   arquivo passou a chamar a função extraída em vez de repetir a condição
+   inline (sem mudança de comportamento ali, só remoção de duplicação).
+   `checkRunModeTransition` (guard de transição) também passou a usar a
+   função — variável local interna renomeada de `isInRunOrPlayMode` (colidia
+   com o nome da nova função) para `nowInRunOrPlayMode`.
+
+**Limitação conhecida herdada, não resolvida** (mesma da entrada de
+2026-07-16): quando o teste é PAUSADO, `IsRunning()`/`IsEdit()` ficam ambos
+`false` — o guard de transição pode falso-negativo. Não mexido aqui, aceito
+como antes.
+
+**Fix (BUG 2)**, ruído de USO CONTÍNUO (não só boot) rebaixado a
+`Logger.debug` — mesmo padrão já aplicado a ruído de BOOT em 2026-07-16, agora
+estendido a eventos por-evento/por-script que disparam durante edição normal:
+
+- `TeamCreateLease.luau`: "lease concedida", "lease liberada", "leaseChanged",
+  "lease intentSequenced".
+- `TeamCreatePresence.luau`: "presenceChanged" (dispara a cada movimento de
+  cursor/seleção) e "presenceLeft" (os DOIS gatilhos — presença zerada e
+  sessão removida; ambos disparam também por timeout/fechamento normal de
+  arquivo, não só saída real).
+- `TeamCreateElection.luau`: "joinSequence atribuído".
+- `SourceWatcher.luau`: "sourceChanged" (dispara a cada edição de Source,
+  tanto via sinal quanto polling).
+- `init.server.luau`: "writeSource (update) uuid=... -> ..." e "writeSource
+  (create) '...' -> uuid=...", os dois caminhos de SUCESSO/detalhe (dispara a
+  cada escrita vinda do VS Code) — os early-returns de ERRO (uuid desconhecido,
+  bloqueio de pasta vendorizada) continuam `Logger.log`, por serem
+  raros/acionáveis, não rotina.
+
+**Explicitamente NÃO tocado** (mesmo critério "rotineiro/alta frequência =
+debug; raro/acionável = log" já usado em 2026-07-16): mudança de liderança
+("sou o líder agora"/"líder atual"), lease negada (já `Logger.notify`), erros
+genuínos, linhas de porta ocupada/candidatas esgotadas, "removendo sessão
+obsoleta" (heartbeat stale, raro/diagnóstico), e as linhas do guard de F8/Play
+("F8/F5 (Run/Play) detectado..."/"retorno ao modo de edição detectado...").
+Mensagens nativas do próprio Studio ("dev_X joined live editing session.",
+"Unable to load plugin icon: ...") não são geradas pelo nosso código — fora de
+alcance, não tocadas.
+
+**Validado só por `rojo build` + `lune run`** nos 5 arquivos tocados
+(`init.server.luau`, `TeamCreateLease.luau`, `TeamCreatePresence.luau`,
+`TeamCreateElection.luau`, `SourceWatcher.luau`) — sem erro de sintaxe, erro
+esperado só na primeira linha que toca `game`/`script`/`plugin`. Plugin
+buildado e implantado via `Tools/build-and-deploy-plugin.ps1` (`OK - plugin
+implantado`), pronto para o usuário testar. **`[Hipótese]` até o usuário
+confirmar em Studio real**: nenhum dos dois bugs pode ser testado sem apertar
+F8/F5 fisicamente dentro do Studio (`Tools/` automatiza build/deploy/log, não
+input físico — ver `Tools/README.md`). Roteiro manual:
+
+1. **BUG 1**: com o plugin conectado (CONNECT clicado), apertar F8 (Run) ou F5
+   (Play) — sync deve suspender (`stop()`, log "F8/F5 (Run/Play)
+   detectado..."). Sair do Run/Play — sync deve retomar sozinho (comportamento
+   já existente, não mudou). Cenário NOVO a testar: apertar F8/F5 PRIMEIRO
+   (sync desconectado), e SÓ DEPOIS clicar CONNECT enquanto ainda em Run/Play
+   — esperado: toast "CONNECT ignorado: Studio em modo Run/Play..." e o botão
+   NÃO deve virar "connecting"/"connected". Sair do Run/Play e clicar CONNECT
+   de novo — deve conectar normalmente.
+2. **BUG 2**: com 2 Studios reais editando por alguns minutos (cursores se
+   movendo, scripts sendo salvos), confirmar que o Output do Studio não mostra
+   mais rajadas de "lease concedida"/"leaseChanged"/"presenceChanged"/
+   "sourceChanged"/"writeSource" por evento — só as linhas que continuam
+   `Logger.log` (conexão, liderança, lease negada, etc.). Observabilidade via
+   `Tools/` (WS forward) deve continuar mostrando TUDO, inclusive o que virou
+   `Logger.debug` — só o Output visual do Studio muda.
+
 ## 2026-07-16 — Autostart passa a ser opt-in, default DESLIGADO
 
 **Mudança de comportamento padrão, pedida pelo usuário após teste real.** Até

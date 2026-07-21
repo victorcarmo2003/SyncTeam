@@ -501,9 +501,21 @@ export class SyncBridge {
    * Senão, é um arquivo local novo: manda `writeSource {path, source,
    * className}` (modo criar) e registra o uuid retornado no `writeAck`.
    *
+   * Remoção local (fatia de polish, 2026-07-20): se `relDiskPath` sumiu do
+   * disco E tem um uuid conhecido, manda `deleteScript {uuid}` para o plugin
+   * destruir a Instance correspondente no Studio — ver
+   * .claude/agent-memory/extension-dev.md para o contrato completo. Isso
+   * também é o que resolve o sintoma de "rename local vira duplicata": um
+   * rename é delete(path antigo)+create(path novo) sem correlação nos dois
+   * eventos do watcher, e antes desta fatia só a metade "criar" chegava ao
+   * Studio — o antigo nunca era destruído. Correlacionar delete+create como
+   * um único `scriptMoved` de disco continua fora de escopo (limitação
+   * aceita).
+   *
    * Fora de escopo desta fatia (limitação aceita, ver docs/MILESTONES.md):
-   * detectar rename/move feito do LADO DO DISCO — continua virando
-   * delete+create do lado do Studio (perde a identidade nesse sentido).
+   * detectar rename/move feito do LADO DO DISCO como uma operação única —
+   * continua virando deleteScript+writeSource(criar) sem preservar
+   * identidade/histórico do uuid antigo (o uuid antigo morre, um novo nasce).
    */
   async handleLocalFileChange(relDiskPath: string, transport: Transport): Promise<void> {
     const key = contentCacheKey(relDiskPath);
@@ -516,10 +528,8 @@ export class SyncBridge {
       return;
     }
     if (content === null) {
-      this.logger.info(
-        `'${relDiskPath}' não encontrado (removido?) — remoção local não é propagada ao Studio nesta versão (M2)`,
-      );
       this.contentCache.delete(key);
+      await this.handleLocalFileRemoved(relDiskPath, key, transport);
       return;
     }
 
@@ -597,6 +607,49 @@ export class SyncBridge {
       await this.recomputeAndApplyLayout(`writeSource criado localmente: uuid '${newUuid}' em '${dataModelPath}'`);
     } catch (error) {
       this.logger.error(`disco → Studio: erro enviando '${relDiskPath}': ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * `relDiskPath` sumiu do disco (`readFile` retornou `null` em
+   * `handleLocalFileChange`). Se não houver uuid conhecido para esse path,
+   * nunca foi um script sincronizado — nada a fazer no Studio (o
+   * `contentCache` já foi limpo pelo chamador). Se houver, manda
+   * `deleteScript {uuid}` para o plugin destruir a Instance correspondente;
+   * mesma exclusão de pastas de pacotes Wally que o modo "atualizar" respeita
+   * (`isInsideExcludedPackageFolder`).
+   */
+  private async handleLocalFileRemoved(relDiskPath: string, key: string, transport: Transport): Promise<void> {
+    const knownUuid = this.uuidByDiskPath.get(key);
+    if (knownUuid === undefined) {
+      this.logger.info(`'${relDiskPath}' não encontrado (removido?) — nenhum uuid conhecido para este path, nada a propagar ao Studio`);
+      return;
+    }
+
+    const instancePath = this.scripts.get(knownUuid)?.path ?? relDiskPath;
+    if (isInsideExcludedPackageFolder(instancePath)) {
+      this.logger.info(
+        `disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') removido do disco dentro de pasta de pacotes Wally — remoção ignorada (live-edit-sync não se aplica)`,
+      );
+      return;
+    }
+
+    this.logger.info(`disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') removido do disco, enviando deleteScript`);
+    try {
+      const ack = await transport.request({ kind: "deleteScript", uuid: knownUuid });
+      if (ack.ok === true) {
+        this.scripts.delete(knownUuid);
+        this.sourceCache.delete(knownUuid);
+        this.unregisterDiskPath(knownUuid);
+        this.contentCache.delete(key);
+        this.logger.info(`disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') removido no Studio`);
+      } else {
+        const errorMsg = String(ack.error ?? "motivo desconhecido");
+        this.logger.error(`disco → Studio: FALHA removendo '${relDiskPath}' (uuid '${knownUuid}'): ${errorMsg}`);
+        this.onWriteRejected?.({ diskPath: relDiskPath, error: errorMsg });
+      }
+    } catch (error) {
+      this.logger.error(`disco → Studio: erro enviando deleteScript para '${relDiskPath}' (uuid '${knownUuid}'): ${(error as Error).message}`);
     }
   }
 

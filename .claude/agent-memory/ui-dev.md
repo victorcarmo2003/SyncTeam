@@ -3,6 +3,53 @@
 Padrões visuais e convenções de texto adotados no SyncTeam.
 Atualize ao final de cada tarefa; mantenha curto e acionável.
 
+## M4.5+ — Toggle real de "Reconectar automaticamente" no painel do plugin, 2026-07-20
+
+Padrão para expor uma setting já existente (sem UI) como toggle real: NUNCA
+criar uma segunda setting nem duplicar a lógica de resolução (`Config.resolveX`)
+— só espelhar o valor num `vide.source` inicializado dentro do `pcall` de
+`PluginUI.init` (mesmo lugar que já inicializava `notificationsEnabledSource`
+via `Config.resolveNotificationsEnabled`).
+
+**Dois padrões de callback distintos, escolha depende de ONDE a lógica
+mora**:
+- Se a ação do toggle é só `plugin:SetSetting(...)` (nenhuma dependência de
+  `start()`/estado de conexão): implementar o callback INTEIRO dentro de
+  `PluginUI.luau` (padrão `onNotificationsToggle` — self-contained, não
+  precisa voltar pra `init.server.luau`).
+- Se a ação depende de lógica que só `init.server.luau` conhece (`start()`,
+  `isInRunOrPlayMode()`, `enabled`): o callback é só um PASSTHROUGH em
+  `PluginUI.luau` (`onAutoReconnectToggle = callbacks.onAutoReconnectToggle`,
+  sem lógica própria) e a implementação real vive em `init.server.luau`,
+  dentro do MESMO bloco `PluginUI.init(plugin, {onConnect, onDisconnect,
+  onPortChange, onAutoReconnectToggle})` que já hospeda `onConnect`/
+  `onDisconnect`/`onPortChange` — nunca duplicar `isInRunOrPlayMode()` em
+  `PluginUI.luau` (essa função é module-level privada de `init.server.luau`).
+
+**Texto/label**: `SettingsRow("Reconectar automaticamente ao abrir a
+place", ...)` — evitar a palavra "reconectar" sozinha porque no projeto ela
+já tem um significado técnico DIFERENTE (o retry loop incondicional de
+`runConnection`/`Config.RECONNECT_SECONDS` após queda de uma sessão viva,
+que não tem nada a ver com esta setting) — o texto do toggle precisa deixar
+claro que é sobre AUTOSTART (abrir a place / recarregar o plugin), não sobre
+recuperação de queda. Botão em si (`AutoReconnectToggle`) é mirror visual
+1:1 de `NotificationsToggle` (mesmo tamanho/posição/hover, texto
+"Ativado"/"Desativado") — quando duas preferências booleanas do painel usam
+o mesmo controle, reusar a MESMA aparência, só o texto do rótulo à esquerda
+muda.
+
+**Toggle que AGE, não só persiste**: quando o pedido explicitamente distingue
+"isso é diferente do toggle passivo de notificações, esse aqui deveria
+also fazer a coisa na hora" — implementar a ação (aqui: `task.spawn(start,
+plugin)` ao ligar, se desconectado) reusando o MESMO caminho que o botão de
+ação equivalente já usa (aqui: `onConnect`), incluindo o MESMO guard (Run/
+Play) e o MESMO padrão de feedback (`Logger.notify`/toast quando recusado).
+Deliberadamente assimétrico: desligar nunca desfaz uma ação já em curso
+(aqui: não desconecta sessão viva) — só afeta o comportamento futuro. Regra
+geral pra próxima vez que aparecer um toggle "ativo": ligar pode agir agora,
+desligar só muda o padrão pra depois, nunca o inverso (evita surpresa de
+"eu só queria parar de reconectar sozinho no futuro e caí da sessão atual").
+
 - Referência validada: `RojoCoop/vscode-extension/src/ui/` — cores por
   colaborador mapeadas a temas do VS Code, cursor com etiqueta de nome
   posicionada abaixo da linha, seleção como overlay semitransparente,

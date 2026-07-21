@@ -129,6 +129,25 @@ export interface ScriptRemovedEvent {
 }
 
 /**
+ * Extensão → plugin (2026-07-20, aditiva — NÃO muda `PROTOCOL_VERSION`, mesmo
+ * precedente de `ping`/`leaseChanged`): manda quando um arquivo mapeado some
+ * do disco (delete local, ou a metade "delete" de um rename local sem
+ * correlação — ver `SyncBridge.handleLocalFileRemoved`) e há um uuid
+ * conhecido para aquele diskPath. Pede ao plugin para destruir a Instance
+ * correspondente no Studio. Responde reusando `writeAck` (mesmo padrão de
+ * `writeSource` — `transport.request()` correlaciona só por `requestId`, não
+ * por `kind`): `uuid` presente quando `ok=true` (o mesmo uuid deletado);
+ * `error` presente quando `ok=false` (ex.: uuid desconhecido, ou script
+ * dentro de pasta de pacote vendorizado, que o plugin bloqueia igual já faz
+ * para updates).
+ */
+export interface DeleteScriptRequest {
+  kind: "deleteScript";
+  requestId: string;
+  uuid: string;
+}
+
+/**
  * Espontânea (M2, nova): o plugin detecta rename/move do lado do Studio (via
  * `ObjectValue`/caminho canônico mudando para o mesmo uuid) e manda esta
  * mensagem em vez de um par scriptRemoved+scriptAdded — preserva a

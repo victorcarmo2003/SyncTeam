@@ -292,7 +292,10 @@ local function applyJoinSequenceAssignments(sessions)
 		local assigned = assignments[session.clientId]
 		if assigned ~= nil and session.values.JoinSequence.Value <= 0 then
 			session.values.JoinSequence.Value = assigned
-			log(("joinSequence atribuído clientId=%s sequence=%d"):format(session.clientId, assigned))
+			-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md):
+			-- rotineiro (dispara por sessão que entra, não só no boot) ->
+			-- Logger.debug.
+			Logger.debug(("joinSequence atribuído clientId=%s sequence=%d"):format(session.clientId, assigned))
 		end
 	end
 	rootValues.NextJoinSequence.Value = newNext
