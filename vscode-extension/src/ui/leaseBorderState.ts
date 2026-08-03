@@ -52,4 +52,39 @@ export const STRINGS = {
   saveWarning: (owner: string, fileName: string): string =>
     `SyncTeam: '${fileName}' está bloqueado para edição por ${owner} — o Studio vai rejeitar esta alteração ` +
     `quando ela chegar lá.`,
+
+  // Item da status bar (ver LeaseStatusBarItem em LeaseBorderDecoration.ts) —
+  // mesmo padrão de codicon curto usado em statusBarMenu.ts, para não competir
+  // por espaço com o resto da barra.
+  statusBarText: (owner: string): string => `$(lock) ${owner}`,
+  statusBarTooltip: (owner: string): string =>
+    `SyncTeam: '${owner}' tem a lease deste arquivo — suas edições locais não serão sincronizadas até ele ` +
+    `liberar (por inatividade ou ao trocar de arquivo).`,
 } as const;
+
+/** Visual do item da status bar que mostra quem tem a lease do arquivo ATIVO. */
+export interface LeaseStatusBarVisual {
+  /** false quando não há lease alheia no arquivo ativo — o item deve ficar oculto (`.hide()`), nunca vazio-visível. */
+  visible: boolean;
+  text: string;
+  tooltip: string;
+}
+
+const HIDDEN_STATUS_BAR_VISUAL: LeaseStatusBarVisual = { visible: false, text: "", tooltip: "" };
+
+/**
+ * Constrói o visual do item de status bar de lease a partir do mesmo
+ * `LeaseBorderState` que decide a decoração do editor — nenhuma regra de
+ * negócio nova, só empacota texto/tooltip para o widget da barra.
+ */
+export function buildLeaseStatusBarVisual(state: LeaseBorderState): LeaseStatusBarVisual {
+  if (!state.locked) {
+    return HIDDEN_STATUS_BAR_VISUAL;
+  }
+  const owner = state.ownerName ?? STRINGS.fallbackOwnerName;
+  return {
+    visible: true,
+    text: STRINGS.statusBarText(owner),
+    tooltip: STRINGS.statusBarTooltip(owner),
+  };
+}

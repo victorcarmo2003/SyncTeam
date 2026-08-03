@@ -454,6 +454,80 @@ describe("disco -> Studio", () => {
   });
 });
 
+// "Handoff quase-instantâneo de lease" (2026-08-02, docs/DECISIONS.md "8ª
+// rodada"): handleBufferContentChange manda a MESMA mensagem writeSource que
+// handleLocalFileChange (modo atualizar), mas a partir de um `content`
+// passado diretamente pelo chamador (simula o buffer do editor) — NUNCA lê
+// disco. Os testes abaixo não tocam fs.writeFileSync para o conteúdo em si
+// (só para popular o cenário inicial via handleScriptAdded/handleSourceChanged),
+// provando que o método realmente não depende do disco para decidir o que
+// mandar.
+describe("handleBufferContentChange (buffer -> Studio, 'handoff quase-instantâneo de lease')", () => {
+  test("uuid conhecido + conteúdo diferente do último sincronizado envia writeSource (modo atualizar)", async () => {
+    const transport = new FakeTransport();
+    await bridge.handleScriptAdded({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script" }, transport);
+    await bridge.handleSourceChanged({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script", source: "print('studio')" });
+    transport.sent.length = 0;
+
+    await bridge.handleBufferContentChange("src/server/Main.server.luau", "print('buffer, ainda não salvo')", transport);
+
+    expect(transport.sent).toEqual([{ kind: "writeSource", uuid: "uuid-main", source: "print('buffer, ainda não salvo')" }]);
+    // Nada foi escrito no disco por este caminho — só a mensagem de rede.
+    expect(readTmp("src/server/Main.server.luau")).toBe("print('studio')");
+  });
+
+  test("conteúdo igual ao último sincronizado não gera writeSource (dedupe pelo mesmo contentCache)", async () => {
+    const transport = new FakeTransport();
+    await bridge.handleScriptAdded({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script" }, transport);
+    await bridge.handleSourceChanged({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script", source: "print(1)" });
+    transport.sent.length = 0;
+
+    await bridge.handleBufferContentChange("src/server/Main.server.luau", "print(1)", transport);
+
+    expect(transport.sent).toHaveLength(0);
+  });
+
+  test("uuid desconhecido para o diskPath não manda nada ao Studio (defensivo — extension.ts já deveria filtrar antes)", async () => {
+    const transport = new FakeTransport();
+
+    await bridge.handleBufferContentChange("src/server/NuncaFoiCriado.server.luau", "print(1)", transport);
+
+    expect(transport.sent).toHaveLength(0);
+    expect(logger.lines.some((l) => l.includes("sem uuid conhecido"))).toBe(true);
+  });
+
+  test("pulse de buffer seguido de save com o MESMO conteúdo não gera um segundo writeSource (evita write redundante)", async () => {
+    const transport = new FakeTransport();
+    await bridge.handleScriptAdded({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script" }, transport);
+    await bridge.handleSourceChanged({ uuid: "uuid-main", path: "ServerScriptService/Server/Main", className: "Script", source: "print(1)" });
+    transport.sent.length = 0;
+
+    // Pulse de buffer manda o conteúdo novo primeiro (usuário ainda digitando).
+    await bridge.handleBufferContentChange("src/server/Main.server.luau", "print('novo')", transport);
+    expect(transport.sent).toHaveLength(1);
+
+    // Save acontece logo depois, com o MESMO conteúdo já enviado pelo pulse —
+    // handleLocalFileChange encontra o contentCache já batendo e sai cedo.
+    fs.writeFileSync(path.join(tmpDir, "src", "server", "Main.server.luau"), "print('novo')", "utf8");
+    await bridge.handleLocalFileChange("src/server/Main.server.luau", transport);
+
+    expect(transport.sent).toHaveLength(1); // ainda só 1 — nenhum write redundante
+  });
+
+  test("dentro de pasta de pacotes Wally, atualização via buffer é ignorada (mesma exclusão de handleLocalFileChange)", async () => {
+    const transport = new FakeTransport();
+    transport.sources.set("uuid-pkg", "-- v1");
+    await bridge.handleScriptAdded({ uuid: "uuid-pkg", path: "ServerScriptService/Server/Packages/Foo", className: "ModuleScript" }, transport);
+    transport.sent.length = 0;
+
+    await bridge.handleBufferContentChange("src/server/Packages/Foo.luau", "-- editado no buffer", transport);
+
+    expect(transport.sent).toHaveLength(0);
+    expect(transport.sources.get("uuid-pkg")).toBe("-- v1");
+    expect(logger.lines.some((l) => l.includes("pasta de pacotes Wally") && l.includes("ignorada"))).toBe(true);
+  });
+});
+
 describe("scriptRemoved", () => {
   test("remove o arquivo materializado (pelo uuid, não pelo path) e limpa as caches", async () => {
     const transport = new FakeTransport();
@@ -952,5 +1026,114 @@ describe("refreshSync — merge de 3 vias sob demanda", () => {
       expect(created).toBeDefined();
       expect(transport.sources.get(created!.uuid)).toBe("return 'novo pacote'");
     });
+  });
+});
+
+// "ReSync" (2026-08-02, docs/DECISIONS.md "5ª rodada"): reset forçado — apaga
+// TODO arquivo rastreado (diskPathByUuid) e repuxa tudo de novo do Studio.
+// Diferente de refreshSync (merge de 3 vias, não-destrutivo), aqui o objetivo
+// é justamente destruir e recriar para eliminar duplicata/estado bagunçado.
+describe("resyncFromScratch (ReSync, 2026-08-02)", () => {
+  test("apaga todo arquivo rastreado, zera os mapas e repuxa fresco do Studio (arquivo fora do escopo é preservado)", async () => {
+    const seedTransport = new FakeTransport();
+    seedTransport.scripts.push({ uuid: "uuid-a", path: "ServerScriptService/Server/A", className: "Script" });
+    seedTransport.scripts.push({ uuid: "uuid-b", path: "ServerScriptService/Server/B", className: "ModuleScript" });
+    seedTransport.sources.set("uuid-a", "old a");
+    seedTransport.sources.set("uuid-b", "old b");
+    await bridge.runInitialSync(seedTransport);
+
+    expect(existsTmp("src/server/A.server.luau")).toBe(true);
+    expect(readTmp("src/server/A.server.luau")).toBe("old a");
+    expect(existsTmp("src/server/B.luau")).toBe(true);
+
+    // Arquivo NUNCA rastreado por este bridge (fora do escopo do ReSync,
+    // regra registrada em docs/DECISIONS.md) — precisa sobreviver intacto.
+    writeTmp("src/server/NaoRastreado.luau", "arquivo alheio");
+
+    // Studio reporta os MESMOS uuid/path, mas com conteúdo NOVO — prova que o
+    // resync de fato apagou e recriou (não deixou o conteúdo velho intocado).
+    const resyncTransport = new FakeTransport();
+    resyncTransport.scripts.push({ uuid: "uuid-a", path: "ServerScriptService/Server/A", className: "Script" });
+    resyncTransport.scripts.push({ uuid: "uuid-b", path: "ServerScriptService/Server/B", className: "ModuleScript" });
+    resyncTransport.sources.set("uuid-a", "new a");
+    resyncTransport.sources.set("uuid-b", "new b");
+
+    const deletedCount = await bridge.resyncFromScratch(resyncTransport);
+
+    expect(deletedCount).toBe(2);
+    expect(readTmp("src/server/A.server.luau")).toBe("new a");
+    expect(readTmp("src/server/B.luau")).toBe("new b");
+    expect(existsTmp("src/server/NaoRastreado.luau")).toBe(true); // fora do escopo, preservado
+
+    // Mapas internos reconstruídos corretamente pelo runInitialSync interno —
+    // mesmo uuid, mesmo diskPath, sem mistura de estado velho.
+    expect(bridge.resolveDiskPathForUuid("uuid-a")).toBe("src/server/A.server.luau");
+    expect(bridge.resolveUuidForDiskPath("src/server/A.server.luau")).toBe("uuid-a");
+  });
+
+  test("Studio sem nenhum script reportado deixa os mapas de fato vazios após o reset (nada para repuxar)", async () => {
+    const seedTransport = new FakeTransport();
+    seedTransport.scripts.push({ uuid: "uuid-a", path: "ServerScriptService/Server/A", className: "Script" });
+    seedTransport.sources.set("uuid-a", "conteudo");
+    await bridge.runInitialSync(seedTransport);
+    expect(existsTmp("src/server/A.server.luau")).toBe(true);
+
+    const emptyTransport = new FakeTransport(); // sem nenhum script — simula Studio "vazio"
+    const deletedCount = await bridge.resyncFromScratch(emptyTransport);
+
+    expect(deletedCount).toBe(1);
+    expect(existsTmp("src/server/A.server.luau")).toBe(false);
+    expect(bridge.resolveDiskPathForUuid("uuid-a")).toBeNull();
+    expect(bridge.resolveUuidForDiskPath("src/server/A.server.luau")).toBeNull();
+  });
+
+  test("delete que falha (arquivo bloqueado) não aborta o resto — deletedCount só conta os que de fato apagou", async () => {
+    // DiskIO que falha ao apagar um path específico, simulando arquivo
+    // locked/permissão negada — mesmo espírito de CountingDiskIO, mas
+    // injetando falha em vez de só contar chamadas.
+    class FlakyDeleteDiskIO implements DiskIO {
+      constructor(
+        private readonly inner: DiskIO,
+        private readonly failPath: string,
+      ) {}
+      readFile(relPath: string) {
+        return this.inner.readFile(relPath);
+      }
+      writeFile(relPath: string, content: string) {
+        return this.inner.writeFile(relPath, content);
+      }
+      async deleteFile(relPath: string): Promise<void> {
+        if (relPath === this.failPath) {
+          throw new Error("EBUSY: arquivo bloqueado (simulado)");
+        }
+        return this.inner.deleteFile(relPath);
+      }
+      removeEmptyDirsUpward(relDir: string) {
+        return this.inner.removeEmptyDirsUpward(relDir);
+      }
+      renameFile(oldRelPath: string, newRelPath: string) {
+        return this.inner.renameFile(oldRelPath, newRelPath);
+      }
+      listFiles(relDir: string) {
+        return this.inner.listFiles(relDir);
+      }
+    }
+
+    const flakyIO = new FlakyDeleteDiskIO(new NodeDiskIO(tmpDir), "src/server/A.server.luau");
+    const flakyBridge = new SyncBridge(MOUNT_POINTS, flakyIO, logger);
+
+    const seedTransport = new FakeTransport();
+    seedTransport.scripts.push({ uuid: "uuid-a", path: "ServerScriptService/Server/A", className: "Script" });
+    seedTransport.scripts.push({ uuid: "uuid-b", path: "ServerScriptService/Server/B", className: "ModuleScript" });
+    seedTransport.sources.set("uuid-a", "a");
+    seedTransport.sources.set("uuid-b", "b");
+    await flakyBridge.runInitialSync(seedTransport);
+
+    const deletedCount = await flakyBridge.resyncFromScratch(seedTransport);
+
+    expect(deletedCount).toBe(1); // só B foi apagado de fato; A falhou e foi logado, não abortou o resto
+    expect(logger.lines.some((l) => l.startsWith("ERROR") && l.includes("erro apagando") && l.includes("A.server.luau"))).toBe(true);
+    // B foi mesmo removido e re-materializado (resyncFromScratch seguiu em frente).
+    expect(existsTmp("src/server/B.luau")).toBe(true);
   });
 });

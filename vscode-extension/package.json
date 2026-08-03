@@ -3,14 +3,41 @@
   "displayName": "SyncTeam",
   "description": "Sincroniza scripts Luau entre VS Code e Roblox Studio via Team Create, sem servidor externo.",
   "version": "0.1.0",
-  "publisher": "syncteam",
+  "publisher": "dev-hakor",
+  "license": "Apache-2.0",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/victorcarmo2003/SyncTeam.git"
+  },
+  "homepage": "https://github.com/victorcarmo2003/SyncTeam#readme",
+  "bugs": {
+    "url": "https://github.com/victorcarmo2003/SyncTeam/issues"
+  },
+  "keywords": [
+    "roblox",
+    "luau",
+    "rojo",
+    "team create",
+    "live share"
+  ],
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["workspaceContains:**/default.project.json"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/default.project.json"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
+    "icons": {
+      "syncteam-logo": {
+        "description": "Logo do SyncTeam",
+        "default": { "fontPath": "./resources/syncteam-icons.woff", "fontCharacter": "\\F101" }
+      }
+    },
     "configuration": {
       "title": "SyncTeam",
       "properties": {
@@ -59,7 +86,9 @@
     ]
   },
   "scripts": {
+    "prebuild": "node scripts/build-icon-font.cjs",
     "build": "node esbuild.config.mjs",
+    "build:icons": "node scripts/build-icon-font.cjs",
     "watch": "node esbuild.config.mjs --watch",
     "lint": "tsc --noEmit",
     "test": "vitest run",
@@ -70,6 +99,7 @@
     "@types/vscode": "^1.85.0",
     "@types/ws": "^8.5.10",
     "esbuild": "^0.21.0",
+    "fantasticon": "^4.1.0",
     "typescript": "^5.4.0",
     "vitest": "^3.2.0"
   },

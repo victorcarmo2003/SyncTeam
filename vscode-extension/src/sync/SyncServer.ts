@@ -23,8 +23,21 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { PROTOCOL_VERSION, parseIncomingMessage, type RawMessage } from "../protocol.js";
 import type { Logger } from "../util/logger.js";
 import { HeartbeatMonitor } from "./HeartbeatMonitor.js";
+import { MAX_PORT } from "../util/port.js";
+import { writePortLock, removePortLock, type PortOccupiedDecision } from "./PortOwnership.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
+
+// Fallback automático de porta ocupada (2026-08-02, .claude/rules/authority.md
+// — "obstáculo recuperável: decide e segue, sem travar pedindo confirmação").
+// Esquema deliberadamente simples/documentável (docs/DECISIONS.md): em
+// EADDRINUSE na porta configurada, tenta port+1, port+2, ... incrementando de
+// 1 em 1, até este número de tentativas alternativas (a porta original conta
+// à parte). Nunca mata processo de terceiro para liberar a porta original —
+// limite explícito da regra de autoridade. Qualquer OUTRO erro de bind (ex.
+// EACCES) não aciona fallback: só "porta ocupada" é o obstáculo recuperável
+// coberto por essa regra, tentar outra porta não resolveria um EACCES.
+const DEFAULT_PORT_FALLBACK_ATTEMPTS = 5;
 
 // Heartbeat da conexão local (extensão ↔ plugin). Localhost, então o custo de
 // um ping a cada 5s é irrisório; o timeout de 15s (3x o intervalo) tolera até
@@ -71,6 +84,38 @@ export interface SyncServerOptions {
    * Default 2000. Ver comentário de `DEFAULT_STOP_SAFETY_TIMEOUT_MS`.
    */
   stopSafetyTimeoutMs?: number;
+  /**
+   * Quantas portas alternativas tentar (port+1, port+2, ...) quando a porta
+   * configurada está ocupada (EADDRINUSE), antes de desistir. Default 5 (ver
+   * `DEFAULT_PORT_FALLBACK_ATTEMPTS`). `0` desliga o fallback por completo
+   * (volta ao comportamento antigo: falha imediata em porta ocupada).
+   */
+  portFallbackAttempts?: number;
+  /**
+   * Diretório persistente onde gravar/remover um lockfile (PID + porta) a
+   * cada bind bem-sucedido (2026-08-02, "posse de porta" — docs/DECISIONS.md
+   * / `.claude/rules/authority.md`). Permite que uma tentativa de bind
+   * FUTURA na MESMA porta reconhecer, com razoável confiança, "esse processo
+   * é uma instância órfã do próprio SyncTeam" (ver `PortOwnership.ts`).
+   * Omitido (padrão): lockfile desligado — nenhum arquivo é gravado/lido,
+   * comportamento anterior a esta feature (usado por todo teste que não
+   * passa essa opção).
+   */
+  portLockDir?: string;
+  /**
+   * Chamado quando a porta CONFIGURADA (nunca uma de fallback) está ocupada
+   * (EADDRINUSE), ANTES de cair para a alternativa automática (port+1...) —
+   * dá à camada de ativação (extension.ts) a chance de identificar o
+   * processo dono da porta, perguntar ao usuário se quer encerrá-lo, e só
+   * então pedir uma nova tentativa NA MESMA porta (`{action:"retrySamePort"}`)
+   * ou desistir e seguir o fallback normal (`{action:"fallback"}`). Chamado
+   * no máximo UMA vez por `start()` (só a porta configurada, tentativa 0) —
+   * nunca em loop, mesmo que a porta continue ocupada depois do retry. Se
+   * ausente, ou se rejeitar/lançar, o fallback automático de sempre segue
+   * normalmente, sem nenhuma mudança de comportamento. Ver `PortOwnership.ts`
+   * (`attemptPortReclaim`, implementação real deste hook em `extension.ts`).
+   */
+  onPortOccupied?: (info: { requestedPort: number; occupiedPort: number }) => Promise<PortOccupiedDecision>;
 }
 
 export interface SyncServerHandlers {
@@ -109,6 +154,17 @@ export class SyncServer {
   private readonly heartbeatTimeoutMs: number;
   private readonly multiSync: boolean;
   private readonly stopSafetyTimeoutMs: number;
+  private readonly portFallbackAttempts: number;
+  private readonly portLockDir: string | undefined;
+  private readonly onPortOccupied: ((info: { requestedPort: number; occupiedPort: number }) => Promise<PortOccupiedDecision>) | undefined;
+  // Porta em que o servidor está REALMENTE ouvindo agora (pode diferir de
+  // `this.port` — a configurada — se um fallback por porta ocupada
+  // aconteceu). `null` enquanto parado.
+  private actualPort: number | null = null;
+  // Info do processo identificado e encerrado (via onPortOccupied) para
+  // liberar a porta CONFIGURADA no último start() bem-sucedido, se isso
+  // aconteceu. Reciclado (`null`) a cada novo start(). Ver getLastReclaimed().
+  private lastReclaimed: { pid: number; processName: string | null } | null = null;
 
   constructor(
     private readonly port: number,
@@ -120,6 +176,9 @@ export class SyncServer {
     this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
     this.multiSync = options.multiSync ?? false;
     this.stopSafetyTimeoutMs = options.stopSafetyTimeoutMs ?? DEFAULT_STOP_SAFETY_TIMEOUT_MS;
+    this.portFallbackAttempts = options.portFallbackAttempts ?? DEFAULT_PORT_FALLBACK_ATTEMPTS;
+    this.portLockDir = options.portLockDir;
+    this.onPortOccupied = options.onPortOccupied;
   }
 
   setHandlers(handlers: SyncServerHandlers): void {
@@ -127,21 +186,125 @@ export class SyncServer {
   }
 
   start(): Promise<void> {
+    this.lastReclaimed = null;
+    return this.tryListen(this.port, 0);
+  }
+
+  /**
+   * Tenta abrir o servidor em `candidatePort`. Em `EADDRINUSE` (porta
+   * ocupada por outro processo), cai para `candidatePort + 1` e tenta de
+   * novo, até `this.portFallbackAttempts` vezes — esquema documentado em
+   * docs/DECISIONS.md (2026-08-02): incremento de 1 em 1 a partir da porta
+   * configurada, nunca ultrapassando `MAX_PORT`. Cada tentativa (inclusive a
+   * que dá certo, e a falha final) é logada com clareza. Qualquer erro que
+   * NÃO seja `EADDRINUSE` (ex. `EACCES`) rejeita imediatamente, sem
+   * fallback — trocar de porta não resolveria esse tipo de erro.
+   *
+   * `hookTried` (2026-08-02, "posse de porta"): antes de cair no fallback
+   * automático pela primeira vez, se `candidatePort` for a porta CONFIGURADA
+   * (nunca uma já de fallback) e `this.onPortOccupied` estiver definido, dá
+   * a ele a chance de identificar+encerrar o processo ocupante e pedir UMA
+   * nova tentativa na mesma porta (`retrySamePort`) — `hookTried=true` nessa
+   * segunda tentativa garante que isso acontece no MÁXIMO uma vez por
+   * `start()`, nunca em loop, mesmo que o retry também esbarre em
+   * EADDRINUSE (cai então no fallback normal, como se o hook não existisse).
+   */
+  private tryListen(candidatePort: number, attempt: number, hookTried = false): Promise<void> {
     return new Promise((resolve, reject) => {
-      const wss = new WebSocketServer({ host: "127.0.0.1", port: this.port });
-      this.wss = wss;
+      const wss = new WebSocketServer({ host: "127.0.0.1", port: candidatePort });
       const onListening = () => {
-        this.logger.info(`servidor WebSocket ouvindo em ws://127.0.0.1:${this.port}`);
+        this.wss = wss;
+        this.actualPort = candidatePort;
+        if (this.portLockDir) {
+          try {
+            writePortLock(this.portLockDir, { pid: process.pid, port: candidatePort, startedAt: Date.now() });
+          } catch (error) {
+            this.logger.error(`falha ao gravar o lockfile de posse da porta ${candidatePort}: ${(error as Error).message}`);
+          }
+        }
+        if (candidatePort !== this.port) {
+          this.logger.error(
+            `porta configurada ${this.port} estava ocupada — usando a porta ${candidatePort} em vez dela ` +
+              "(fallback automático de porta ocupada, nenhum processo de terceiro foi encerrado — ver " +
+              ".claude/rules/authority.md). Aponte o plugin do Studio para esta porta, ou libere a porta " +
+              `${this.port} e reinicie o SyncTeam para voltar a ela.`,
+          );
+        }
+        this.logger.info(`servidor WebSocket ouvindo em ws://127.0.0.1:${candidatePort}`);
+        wss.on("connection", (socket) => this.handleConnection(socket));
+        wss.on("error", (error) => this.logger.error(`erro do servidor WebSocket: ${error.message}`));
         resolve();
       };
-      const onFirstError = (error: Error) => {
+      const onFirstError = (error: NodeJS.ErrnoException) => {
+        if (error.code === "EADDRINUSE") {
+          if (!hookTried && candidatePort === this.port && this.onPortOccupied) {
+            this.logger.error(
+              `porta ${candidatePort} ocupada (EADDRINUSE) — verificando se é possível tomar posse antes do fallback automático`,
+            );
+            this.onPortOccupied({ requestedPort: this.port, occupiedPort: candidatePort })
+              .then((decision) => {
+                if (decision.action === "retrySamePort") {
+                  this.lastReclaimed = decision.reclaimed ?? null;
+                  resolve(this.tryListen(candidatePort, attempt, true));
+                  return;
+                }
+                this.fallbackOrGiveUp(candidatePort, attempt, error, resolve, reject);
+              })
+              .catch((hookError: unknown) => {
+                this.logger.error(
+                  `erro ao tentar tomar posse da porta ${candidatePort}: ${(hookError as Error).message} — ` +
+                    "seguindo com o fallback automático",
+                );
+                this.fallbackOrGiveUp(candidatePort, attempt, error, resolve, reject);
+              });
+            return;
+          }
+          this.fallbackOrGiveUp(candidatePort, attempt, error, resolve, reject);
+          return;
+        }
         reject(error);
       };
       wss.once("listening", onListening);
       wss.once("error", onFirstError);
-      wss.on("connection", (socket) => this.handleConnection(socket));
-      wss.on("error", (error) => this.logger.error(`erro do servidor WebSocket: ${error.message}`));
     });
+  }
+
+  /**
+   * Fallback automático de porta ocupada de sempre (port+1, port+2, ...) —
+   * extraído de `tryListen` para ser reusado tanto no caminho direto (sem
+   * hook, ou porta já de fallback) quanto depois de uma tentativa de posse
+   * recusada/malsucedida/sem hook configurado.
+   */
+  private fallbackOrGiveUp(
+    candidatePort: number,
+    attempt: number,
+    error: NodeJS.ErrnoException,
+    resolve: (value: void | PromiseLike<void>) => void,
+    reject: (reason?: unknown) => void,
+  ): void {
+    if (attempt < this.portFallbackAttempts) {
+      const nextPort = candidatePort + 1;
+      if (nextPort > MAX_PORT) {
+        this.logger.error(
+          `porta ${candidatePort} ocupada (EADDRINUSE) e não há mais portas candidatas dentro do limite ` +
+            `(${MAX_PORT}) — desistindo do fallback`,
+        );
+        reject(error);
+        return;
+      }
+      this.logger.error(
+        `porta ${candidatePort} ocupada (EADDRINUSE) — tentando a porta alternativa ${nextPort} ` +
+          `(tentativa de fallback ${attempt + 1}/${this.portFallbackAttempts})`,
+      );
+      resolve(this.tryListen(nextPort, attempt + 1));
+      return;
+    }
+    this.logger.error(
+      `porta ${candidatePort} ocupada (EADDRINUSE) — todas as ${this.portFallbackAttempts} tentativa(s) ` +
+        "de fallback esgotadas, desistindo (nenhum processo de terceiro foi encerrado — ver " +
+        ".claude/rules/authority.md)",
+    );
+    reject(error);
   }
 
   async stop(): Promise<void> {
@@ -153,6 +316,14 @@ export class SyncServer {
     this.clients.clear();
     const wss = this.wss;
     this.wss = null;
+    if (this.portLockDir && this.actualPort !== null) {
+      try {
+        removePortLock(this.portLockDir, this.actualPort);
+      } catch (error) {
+        this.logger.error(`falha ao remover o lockfile de posse da porta ${this.actualPort}: ${(error as Error).message}`);
+      }
+    }
+    this.actualPort = null;
     if (!wss) {
       return;
     }
@@ -203,6 +374,33 @@ export class SyncServer {
   /** Quantos plugins estão conectados agora (útil quando `multiSync=true`). */
   getConnectedCount(): number {
     return this.openClients().length;
+  }
+
+  /** Porta que foi PEDIDA (configurada) — sempre a mesma, mude o servidor de porta real ou não. */
+  getConfiguredPort(): number {
+    return this.port;
+  }
+
+  /**
+   * Porta em que o servidor está REALMENTE ouvindo agora, ou `null` se
+   * parado. Difere de `getConfiguredPort()` quando um fallback automático de
+   * porta ocupada aconteceu no último `start()` bem-sucedido (ver
+   * `tryListen`/docs/DECISIONS.md) — é esta a porta que o plugin do Studio
+   * precisa usar para conectar.
+   */
+  getActualPort(): number | null {
+    return this.actualPort;
+  }
+
+  /**
+   * Info do processo identificado e encerrado (via `onPortOccupied`) para
+   * liberar a porta CONFIGURADA no último `start()` bem-sucedido, ou `null`
+   * se não houve tomada de posse nessa chamada (sem hook configurado, hook
+   * recusado/malsucedido, ou a porta nunca esteve ocupada). Reciclado a cada
+   * novo `start()` — reflete só a tentativa MAIS RECENTE.
+   */
+  getLastReclaimed(): { pid: number; processName: string | null } | null {
+    return this.lastReclaimed;
   }
 
   private openClients(): WebSocket[] {

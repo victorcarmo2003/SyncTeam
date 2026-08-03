@@ -159,6 +159,43 @@ export function resolveMountForDiskPath(diskPath: string, mountPoints: MountPoin
 }
 
 /**
+ * Extrai os nomes de serviço de TOPO (primeiro segmento de `dataModelPath`,
+ * ex.: "ReplicatedFirst" de "ReplicatedFirst/First", ou "Lighting" de
+ * "Lighting" quando o mount aponta direto para a raiz do serviço) referenciados
+ * por qualquer ponto de montagem do projeto atual — sem duplicata.
+ *
+ * Existe porque o plugin Studio (Luau) roda no sandbox do Roblox e NÃO tem
+ * acesso ao `default.project.json` no disco — só a extensão VS Code lê e
+ * parseia esse arquivo. Antes desta função, o plugin dependia de uma tabela
+ * FIXA hardcoded de "watched roots" (`plugin/src/Config.luau`) que não
+ * acompanhava mount points novos que o usuário adiciona ao projeto (bug real
+ * relatado 2026-07-29 — ver docs/DECISIONS.md mesma data: mount point novo em
+ * `ReplicatedFirst` não sincronizava porque o serviço não estava na lista
+ * fixa). A extensão manda esta lista dinamicamente ao plugin via mensagem
+ * `watchedRoots` (ver protocol.ts) logo após validar o `hello`, para que o
+ * plugin escaneie exatamente os containers que o projeto atual usa — a lista
+ * fixa do plugin passa a ser só um fallback para quando esta mensagem nunca
+ * chegar.
+ *
+ * Ordem preservada por primeira aparição em `mountPoints` (não ordenado
+ * alfabeticamente) — irrelevante para o plugin (trata como conjunto), mas
+ * determinístico para teste.
+ */
+export function computeWatchedRoots(mountPoints: MountPoint[]): string[] {
+  const seen = new Set<string>();
+  const roots: string[] = [];
+  for (const mount of mountPoints) {
+    const topLevel = mount.dataModelPath.split("/")[0];
+    if (topLevel.length === 0 || seen.has(topLevel)) {
+      continue;
+    }
+    seen.add(topLevel);
+    roots.push(topLevel);
+  }
+  return roots;
+}
+
+/**
  * Composição DataModel -> disco: agrupa `entries` por ponto de montagem,
  * calcula o layout Rojo (computeLayout) dentro de cada grupo usando o path
  * relativo ao mount, e reconstrói o `diskPath` completo prefixando com

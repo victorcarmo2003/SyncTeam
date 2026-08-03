@@ -10,6 +10,7 @@ import {
   resolveMountForDiskPath,
   computeFullLayout,
   resolveDataModelPathForDiskChange,
+  computeWatchedRoots,
   type MountPoint,
 } from "../src/mapping/projectMapping.js";
 
@@ -196,6 +197,51 @@ describe("computeFullLayout (DataModel -> disco)", () => {
         mountPoints,
       ),
     ).toThrowError(/colisão de diskPath/i);
+  });
+});
+
+describe("computeWatchedRoots", () => {
+  test("extrai o serviço de topo (primeiro segmento) de cada mount, sem duplicata", () => {
+    const mountPoints = parseMountPoints(M1_TEST_PROJECT);
+    // M1_TEST_PROJECT tem 3 mounts, cada um sob um serviço de topo distinto.
+    expect(computeWatchedRoots(mountPoints)).toEqual(["ReplicatedStorage", "ServerScriptService", "StarterPlayer"]);
+  });
+
+  test("deduplica quando 2+ mounts caem sob o MESMO serviço de topo", () => {
+    const mountPoints: MountPoint[] = [
+      { dataModelPath: "ReplicatedStorage/Shared", diskPath: "src/shared" },
+      { dataModelPath: "ReplicatedStorage/Vendor", diskPath: "src/vendor" },
+      { dataModelPath: "ServerScriptService/Server", diskPath: "src/server" },
+    ];
+    expect(computeWatchedRoots(mountPoints)).toEqual(["ReplicatedStorage", "ServerScriptService"]);
+  });
+
+  test("mount cujo dataModelPath é a raiz do serviço (sem sub-segmento) conta como esse serviço", () => {
+    const mountPoints: MountPoint[] = [{ dataModelPath: "ReplicatedFirst", diskPath: "src/first" }];
+    expect(computeWatchedRoots(mountPoints)).toEqual(["ReplicatedFirst"]);
+  });
+
+  test("preserva a ordem de primeira aparição em mountPoints (não ordena alfabeticamente)", () => {
+    const mountPoints: MountPoint[] = [
+      { dataModelPath: "StarterPlayer/StarterPlayerScripts/Client", diskPath: "src/client" },
+      { dataModelPath: "ReplicatedStorage/Shared", diskPath: "src/shared" },
+      { dataModelPath: "ServerScriptService/Server", diskPath: "src/server" },
+    ];
+    expect(computeWatchedRoots(mountPoints)).toEqual(["StarterPlayer", "ReplicatedStorage", "ServerScriptService"]);
+  });
+
+  test("lista vazia de mount points devolve lista vazia", () => {
+    expect(computeWatchedRoots([])).toEqual([]);
+  });
+
+  test("bug real 2026-07-29: mount point novo sob serviço fora da lista fixa do plugin (ReplicatedFirst) aparece normalmente", () => {
+    const mountPoints = parseMountPoints({
+      tree: {
+        ReplicatedFirst: { First: { $path: "src/first" } },
+        ServerScriptService: { Server: { $path: "src/server" } },
+      },
+    });
+    expect(computeWatchedRoots(mountPoints)).toEqual(expect.arrayContaining(["ReplicatedFirst", "ServerScriptService"]));
   });
 });
 

@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { SyncServer } from "./sync/SyncServer.js";
 import { SyncTeamService } from "./sync/SyncTeamService.js";
 import { VscodeDiskIO } from "./sync/VscodeDiskIO.js";
+import { attemptPortReclaim } from "./sync/PortOwnership.js";
 import { parseMountPoints, type MountPoint } from "./mapping/projectMapping.js";
 import { createOutputChannelLogger } from "./util/vscodeLogger.js";
 import type { Logger } from "./util/logger.js";
@@ -34,6 +35,13 @@ const WATCH_DEBOUNCE_MS = 150;
 // cursor/seleção a cada tecla/movimento inundaria o canal sem necessidade
 // (ver .claude/agent-memory/ui-dev.md para o raciocínio completo).
 const PRESENCE_DEBOUNCE_MS = WATCH_DEBOUNCE_MS;
+// "Handoff quase-instantâneo de lease" (2026-08-02, docs/DECISIONS.md "8ª
+// rodada"): mesma ordem de grandeza de WATCH_DEBOUNCE_MS, calibrada para
+// ficar confortavelmente abaixo do novo STALE_AFTER_SECONDS configurável do
+// lado Luau (~2-3s) e do tick de checagem de staleness lá (agora 0.5s) — ver
+// scheduleBufferPulse abaixo para o porquê de ser um THROTTLE, não um
+// debounce como os dois acima.
+const BUFFER_PULSE_THROTTLE_MS = WATCH_DEBOUNCE_MS;
 // M4: rede de segurança de staleness do PresenceTracker é por-entrada (ver
 // PresenceTracker.expireStale); isso só define de quanto em quanto tempo a
 // varredura roda.
@@ -73,6 +81,15 @@ const presenceTracker = new PresenceTracker();
 // start/restart/setPort) e precisa re-renderizar a decoração quando uma
 // lease muda.
 let leaseBorderDecoration: LeaseBorderDecoration | undefined;
+// "Handoff quase-instantâneo de lease": timers de throttle do pulse de buffer
+// (ver scheduleBufferPulse), chaveados por relDiskPath. Module-level (não
+// hoisted por startService, ao contrário de `debounceTimers` do watcher de
+// disco) porque o listener onDidChangeTextDocument é registrado UMA vez em
+// activate() — sobrevive a restart do serviço; se um timer disparar depois de
+// um restart, `service`/`projectDir` são lidos NA HORA (getter-style), então
+// o pior caso é um pulse perdido/ignorado pelo SyncBridge novo (uuid
+// desconhecido), nunca um crash.
+const bufferPulseTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 async function findProjectFile(): Promise<vscode.Uri | null> {
   const matches = await vscode.workspace.findFiles("**/default.project.json", "**/node_modules/**", 1);
@@ -185,6 +202,68 @@ function publishCurrentPresence(): void {
   });
 }
 
+// ------------------------------------------- handoff quase-instantâneo de lease
+
+/**
+ * `onDidChangeTextDocument` (nível de BUFFER — dispara a cada edição no
+ * editor, sem exigir save) — 2026-08-02, docs/DECISIONS.md "8ª rodada". O
+ * `FileSystemWatcher` de disco (`scheduleNotify`, dentro de `startService`)
+ * CONTINUA existindo e intocado: ele é o fallback necessário para mudanças
+ * que não passam pelo buffer do VS Code (git checkout, outro processo
+ * escrevendo o arquivo). Este listener é uma via EM PARALELO, cujo único
+ * objetivo é fazer o `Pulse` do lease do lado Luau
+ * (`TeamCreateLease.ensureIntent`) atualizar continuamente ENQUANTO o dono
+ * digita, não só quando salva — hoje a detecção de "dono morto" (~8-10s
+ * depois de parar de editar) é inteira baseada em save via disco.
+ *
+ * É THROTTLE, não debounce (ao contrário de `scheduleNotify`/
+ * `schedulePresencePublish` acima, que resetam o timer a cada evento e só
+ * disparam depois de um período de silêncio): o objetivo aqui é o OPOSTO —
+ * mandar o pulse PERIODICAMENTE durante digitação contínua. Um debounce puro
+ * nunca dispararia enquanto o usuário não parasse de digitar por
+ * BUFFER_PULSE_THROTTLE_MS, o que anularia o propósito da feature. Reusa o
+ * mesmo mecanismo (Map<path, Timer> + setTimeout) do `scheduleNotify` acima —
+ * só sem o `clearTimeout`/reagendamento a cada evento: se já existe um timer
+ * pendente para este path, novos eventos dentro da janela são ignorados (o
+ * disparo pendente vai pegar `document.getText()` no MOMENTO em que
+ * disparar, ou seja, sempre o conteúdo mais recente — `TextDocument` é o
+ * mesmo objeto vivo, não um snapshot).
+ *
+ * Gate de posse (pedido explícito da tarefa): só age se o arquivo já tiver
+ * uuid resolvido (script já sincronizado — a criação de um script novo
+ * continua só pelo save, via `handleLocalFileChange`) E a lease for
+ * EXPLICITAMENTE minha nesta sessão (`LeaseTracker.isExplicitlyOwnedByMe`,
+ * não o `isOwnedByMe` otimista que `LeaseBorderDecoration`/save usam — esse
+ * também libera quando a lease ainda não foi arbitrada, o que aqui
+ * dispararia pulses cedo demais, antes de eu ser dono de verdade). Reusa
+ * `LeaseTracker`/`resolveUuidForFsPath` como única fonte de verdade — nenhum
+ * estado de posse novo é criado aqui.
+ */
+function scheduleBufferPulse(document: vscode.TextDocument): void {
+  if (!service || !projectDir || document.uri.scheme !== "file") {
+    return;
+  }
+  const relPath = relDiskPathFromUri(projectDir, document.uri);
+  const uuid = service.resolveUuidForDiskPath(relPath);
+  if (uuid === null) {
+    return; // fora do workspace de sync, ou uuid ainda não resolvido — fluxo de criação via save cuida disso
+  }
+  const leaseTracker = service.getLeaseTracker();
+  if (!leaseTracker?.isExplicitlyOwnedByMe(uuid)) {
+    return; // não é minha posse confirmada — nunca dispara para arquivo alheio ou lease ainda não resolvida
+  }
+  if (bufferPulseTimers.has(relPath)) {
+    return; // já agendado dentro da janela de throttle
+  }
+  bufferPulseTimers.set(
+    relPath,
+    setTimeout(() => {
+      bufferPulseTimers.delete(relPath);
+      service?.notifyBufferChange(relPath, document.getText());
+    }, BUFFER_PULSE_THROTTLE_MS),
+  );
+}
+
 /**
  * Ponto de entrada do comando "Refresh Sync" (`syncteam.refreshSync`): dispara
  * a reconciliação bidirecional de 3 vias para todos os arquivos mapeados de uma
@@ -282,7 +361,35 @@ async function startService(
     logger.info("syncteam.multiSync = true — múltiplos plugins Studio podem conectar nesta porta ao mesmo tempo");
   }
 
-  const server = new SyncServer(port, logger, { multiSync });
+  // "Posse de porta" (2026-08-02, docs/DECISIONS.md 3ª rodada,
+  // .claude/rules/authority.md "Matar processo de terceiro"): quando a porta
+  // CONFIGURADA está ocupada, oferece ao usuário encerrar o processo que a
+  // ocupa (com confirmação explícita SEMPRE, PID/nome visíveis) em vez de
+  // pular direto para o fallback automático (port+1...) — a decisão real
+  // (identificar dono, sondar se é uma sessão SyncTeam já ativa, compor a
+  // mensagem) vive em `PortOwnership.ts::attemptPortReclaim` (testável sem
+  // `vscode`); aqui só fornecemos o diretório do lockfile persistente
+  // (`globalStorageUri`, sobrevive a "Reload Window"/reinstalação) e a ponte
+  // com o diálogo real do VS Code.
+  const portLockDir = vscode.Uri.joinPath(context.globalStorageUri, "port-locks").fsPath;
+  const server = new SyncServer(port, logger, {
+    multiSync,
+    portLockDir,
+    onPortOccupied: (info) =>
+      attemptPortReclaim({
+        requestedPort: info.requestedPort,
+        occupiedPort: info.occupiedPort,
+        lockDir: portLockDir,
+        host: {
+          confirmKill: (message) =>
+            Promise.resolve(
+              vscode.window.showWarningMessage(message, { modal: true }, "Encerrar processo", "Usar porta alternativa"),
+            ).then((choice) => choice === "Encerrar processo"),
+          info: (message) => logger.info(message),
+          error: (message) => logger.error(message),
+        },
+      }),
+  });
   service = new SyncTeamService(server, mountPoints, diskIO, logger, multiSync);
   presencePublisher = new PresencePublisher(service.getPresenceTransport());
 
@@ -306,6 +413,18 @@ async function startService(
     // Antes só ia para o log (SyncServer). Agora vira aviso visível também.
     vscode.window.showErrorMessage(`SyncTeam: ${message}`);
   });
+
+  // "ReSync" (2026-08-02, docs/DECISIONS.md "5ª rodada"): confirmação modal
+  // ANTES de apagar qualquer arquivo de Source sincronizado — mesmo padrão
+  // já usado para "posse de porta" (`host.confirmKill` acima): a decisão real
+  // (o quê apagar, como zerar o estado, como repuxar) vive em
+  // `SyncTeamService`/`SyncBridge` (testável sem `vscode`); aqui só ligamos o
+  // diálogo real.
+  service.setOnConfirmResync((message) =>
+    Promise.resolve(vscode.window.showWarningMessage(message, { modal: true }, "Confirmar", "Cancelar")).then(
+      (choice) => choice === "Confirmar",
+    ),
+  );
 
   // M3.3: configurar callbacks de UI para leaseChanged e writeRejected.
   service.setOnLeaseChanged(({ uuid, ownerClientId, ownerDisplayName }) => {
@@ -376,6 +495,19 @@ async function startService(
     return { ok: false, reason: `erro ao abrir a porta ${port} — ${message}` };
   }
 
+  // Fallback automático de porta ocupada (2026-08-02, .claude/rules/authority.md):
+  // se a porta configurada estava ocupada, service.start() já resolveu numa
+  // porta alternativa (SyncServer.tryListen) em vez de rejeitar — a porta REAL
+  // pode diferir de `port` aqui. Repassamos para o SyncController anunciar
+  // claramente e atualizar o estado consultável pela status bar.
+  const actualPort = service.getActualPort() ?? port;
+  // "Posse de porta": se em vez do fallback acima o usuário optou por
+  // encerrar o processo que ocupava a porta CONFIGURADA (ver onPortOccupied
+  // acima), service.start() reconquistou a MESMA porta pedida — actualPort
+  // já é igual a `port` neste caso, e isto só existe para o SyncController
+  // mostrar uma mensagem distinta confirmando a posse tomada.
+  const reclaimed = service.getLastReclaimed();
+
   const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(dir, "**/*"));
   fileWatcher = watcher;
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -413,8 +545,11 @@ async function startService(
     } },
   );
 
-  logger.info(`SyncTeam ativo — projeto '${projectFileUri.fsPath}', porta ${port}`);
-  return { ok: true };
+  logger.info(`SyncTeam ativo — projeto '${projectFileUri.fsPath}', porta ${actualPort}`);
+  if (actualPort !== port) {
+    return { ok: true, actualPort };
+  }
+  return reclaimed ? { ok: true, portReclaimed: reclaimed } : { ok: true };
 }
 
 /**
@@ -468,6 +603,16 @@ export function activate(context: vscode.ExtensionContext): void {
         clearTimeout(presenceDebounceTimer);
         presenceDebounceTimer = undefined;
       }
+    } },
+    // "Handoff quase-instantâneo de lease" (ver scheduleBufferPulse acima) —
+    // registrado uma vez só (sobrevive a restart do serviço, mesmo padrão dos
+    // dois listeners de presença logo acima).
+    vscode.workspace.onDidChangeTextDocument((event) => scheduleBufferPulse(event.document)),
+    { dispose: () => {
+      for (const timer of bufferPulseTimers.values()) {
+        clearTimeout(timer);
+      }
+      bufferPulseTimers.clear();
     } },
   );
 

@@ -154,6 +154,9 @@ local function getOrCreate(parent, className, name)
 	end
 	local value = Instance.new(className)
 	value.Name = name
+	-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1 (fast-path
+	-- best-effort) — ver comentário em TeamCreateSchema.luau.
+	value.Archivable = false
 	value.Parent = parent
 	return value
 end
@@ -185,6 +188,9 @@ function TeamCreatePresence.updateOwnPresence(message)
 	if presenceFolder == nil then
 		presenceFolder = Instance.new("Folder")
 		presenceFolder.Name = "Presence"
+		-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1
+		-- (fast-path best-effort) — ver comentário em TeamCreateSchema.luau.
+		presenceFolder.Archivable = false
 		presenceFolder.Parent = sessionFolder
 	end
 
@@ -290,13 +296,15 @@ local function emitPresence(clientId, presence)
 	end
 	-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md): rotineiro/
 	-- alta frequência (dispara a cada movimento de cursor/seleção) -> Logger.debug.
-	Logger.debug(("presenceChanged clientId=%s (%s) uuid=%s cursor=%d,%d"):format(
-		clientId,
-		displayName,
-		presence.uuid,
-		presence.cursorLine,
-		presence.cursorColumn
-	))
+	Logger.debug(
+		("presenceChanged clientId=%s (%s) uuid=%s cursor=%d,%d"):format(
+			clientId,
+			displayName,
+			presence.uuid,
+			presence.cursorLine,
+			presence.cursorColumn
+		)
+	)
 end
 
 -- Ciclo de observação (M4): para cada sessão viva que não seja a própria,
@@ -369,6 +377,30 @@ end
 -- readPresenceValues, mesmo parser de checkPresenceDrift. Não participa do
 -- ciclo de observação/dedupe acima (não mexe em lastPresenceByClientId).
 -- nil se a sessão não existe, não tem Presence ainda, ou zerou (uuid == "").
+-- ------------------------------------------------------- undo guard (2026-07-26)
+--
+-- Self-healing reativo (camada 2 da mitigação de undo, ver
+-- TeamCreateUndoGuard.luau/docs/DECISIONS.md): chamado após
+-- ChangeHistoryService.OnUndo/OnRedo. Mesmo gap/fix de
+-- TeamCreateLease.checkIntegrity (`sessionsFolder` cacheado 1x em
+-- ensureContainers(), nunca refeito) — força `sessionsFolder = nil` antes de
+-- chamar ensureContainers() de novo. A PRÓPRIA Presence (Sessions/<clientId>/
+-- Presence) não precisa de recriação forçada aqui: updateOwnPresence já a
+-- recria lazily (FindFirstChild -> Instance.new se ausente) no próximo
+-- `presenceUpdate` recebido da extensão (a cada movimento de cursor/seleção,
+-- alta frequência) — duplicar isso aqui não ganha responsividade real. No-op
+-- se o módulo não estiver rodando (enabled == false).
+function TeamCreatePresence.checkIntegrity()
+	if not enabled then
+		return
+	end
+	if sessionsFolder == nil or sessionsFolder.Parent == nil then
+		sessionsFolder = nil
+		ensureContainers()
+		log("integridade: containers de presença ausentes (undo/redo?) — recriados")
+	end
+end
+
 function TeamCreatePresence.getActiveUuid(clientId)
 	ensureContainers()
 	local folder = sessionsFolder:FindFirstChild(clientId)

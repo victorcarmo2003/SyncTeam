@@ -41,6 +41,13 @@ local watched = {} -- LuaSourceContainer -> RBXScriptConnection (sinal fast-path
 local lastSourceByInstance = {} -- LuaSourceContainer -> último Source visto (dedupe sinal+polling)
 local recentWrites = {} -- LuaSourceContainer -> os.clock() da última escrita local via writeSource
 local rootConnections = {} -- DescendantAdded/DescendantRemoving dos containers observados
+-- Instance (Service) -> true para todo container já coberto por scanAndWatch
+-- nesta geração (currentToken) — 2026-07-29 (mensagem watchedRoots,
+-- docs/DECISIONS.md): permite SourceWatcher.applyWatchedRoots adicionar só os
+-- containers NOVOS que a lista fixa ainda não cobria, sem re-escanear (e sem
+-- duplicar conexões DescendantAdded/DescendantRemoving) os que start() já
+-- tinha coberto.
+local scannedRoots = {}
 
 local log = Logger.log
 
@@ -89,6 +96,7 @@ function SourceWatcher.resolvePath(path, createClassName)
 	local parts = string.split(path, "/")
 	local current = game
 	for index, name in parts do
+		local isFinal = index == #parts
 		local child = current:FindFirstChild(name)
 		if child == nil and index == 1 then
 			-- Primeiro segmento deveria ser um serviço padrão (ServerScriptService,
@@ -103,7 +111,6 @@ function SourceWatcher.resolvePath(path, createClassName)
 			if createClassName == nil then
 				return nil, ("'%s' não encontrado em '%s'"):format(name, current:GetFullName())
 			end
-			local isFinal = index == #parts
 			local ok, created = pcall(Instance.new, if isFinal then createClassName else "Folder")
 			if not ok then
 				return nil, ("falha ao criar '%s': %s"):format(name, tostring(created))
@@ -111,6 +118,137 @@ function SourceWatcher.resolvePath(path, createClassName)
 			created.Name = name
 			created.Parent = current
 			child = created
+		elseif
+			isFinal
+			and index > 1 -- nunca converter o 1º segmento (sempre um Service do DataModel, ver fallback acima)
+			and createClassName ~= nil
+			and child.ClassName ~= createClassName
+			and not child:IsA("LuaSourceContainer")
+		then
+			-- Bug real reportado pelo usuário (2026-07-26, docs/DECISIONS.md):
+			-- convenção Rojo — uma pasta que já existia agrupando filhos (ex.:
+			-- Folder "Interface" com scripts dentro, criada só pra agrupar) ganha
+			-- um init.luau e a PRÓPRIA pasta vira o script (ModuleScript/Script/
+			-- LocalScript com Source), mantendo os filhos dentro dela. Sem esta
+			-- conversão, o segmento final resolvia sempre para a Folder já
+			-- existente (o código nunca comparava classe do child reusado), e o
+			-- chamador (init.server.luau handleWriteSource, modo criação) rejeitava
+			-- com "alvo não é um script" — uma Folder nunca vira LuaSourceContainer
+			-- sozinha, então IsA("LuaSourceContainer") sempre falhava.
+			--
+			-- CONVERTE preservando Name e Parent e reparentando TODOS os filhos
+			-- atuais da Folder para a nova Instance, só então destrói a casca
+			-- antiga — nunca perde os scripts que já viviam dentro dela. Os
+			-- filhos preservam a MESMA Instance (não são recriados), então
+			-- ScriptRegistry/watched (chaveados pela Instance, não pelo path)
+			-- continuam válidos sem nenhuma limpeza extra — e como Name/Parent da
+			-- Folder→script não mudam, o caminho canônico dos filhos nem muda de
+			-- string (SourceWatcher.pathFor deles fica idêntico), então o próximo
+			-- checkRegistryDrift não confunde isso com um scriptMoved.
+			--
+			-- ORDEM DAS OPERAÇÕES (corrigida 2026-08-02, continuação 3ª rodada
+			-- §2 — bug confirmado pelo researcher em
+			-- .claude/research/2026-08-02-reparent-descendantremoving-semantics.md,
+			-- fonte oficial Roblox/creator-docs Instance.yaml): `newInstance` é
+			-- parentado em `current` ANTES de mover os filhos pra dentro dela —
+			-- nunca depois. A ordem antiga (montar newInstance inteira, órfã,
+			-- fora da árvore, e só parentar no final) fazia cada `oldChild`
+			-- deixar de ser descendente da raiz observada no instante em que
+			-- virava filho de uma `newInstance` ainda sem Parent — a definição
+			-- oficial de `DescendantRemoving` ("fires immediately before the
+			-- parent Instance changes such that a descendant instance will no
+			-- longer be a descendant") cobre exatamente esse caso, então o
+			-- handler de `scanAndWatch` disparava `unwatchScript` incorretamente
+			-- pra cada filho, e a reconexão via `DescendantAdded` quando
+			-- `newInstance.Parent = current` rodava depois NÃO tinha garantia
+			-- documentada de refire individual por descendente pré-existente de
+			-- uma subárvore movida de uma vez (só relato de fórum, não-oficial,
+			-- com ressalva explícita de "não garantido"). Com `newInstance` já
+			-- dentro da árvore observada ANTES do loop, cada `oldChild.Parent =
+			-- newInstance` é um reparent DIRETO dentro da mesma árvore já
+			-- observada (nunca deixa de ser descendente da raiz) — não dispara
+			-- `DescendantRemoving` nem depende de nenhum `DescendantAdded` de
+			-- reconexão: a conexão de sinal (`watched[oldChild]`) e o registro
+			-- em `ScriptRegistry` de cada filho nunca são tocados, sobrevivem
+			-- intactos à conversão. Trade-off aceito: mais eventos de
+			-- replicação Team Create (newInstance entra vazia primeiro, depois
+			-- cada filho reparenta individualmente) em troca de nunca perder o
+			-- watch de Source dos filhos — a ordem antiga era mais econômica em
+			-- replicação, mas incorreta.
+			--
+			-- Só entra aqui quando a classe existente NÃO é LuaSourceContainer
+			-- (ex.: Folder) — um LuaSourceContainer de OUTRA classe já existente
+			-- ali (ex.: Script onde se queria ModuleScript) não é convertido por
+			-- esta correção; mantém o comportamento herdado (reusa como está),
+			-- fora do escopo deste bug. `index > 1` protege os Services do
+			-- DataModel (1º segmento, resolvidos via GetService acima) de serem
+			-- convertidos/destruídos por engano — nunca deveria acontecer na
+			-- prática (Config.getWatchedRoots() nunca aponta pra um path de 1
+			-- segmento só), mas o guard custa nada e evita um acidente catastrófico
+			-- se algum dia acontecer.
+			-- Preservação de identidade (docs/DECISIONS.md 2026-08-02, 3ª rodada,
+			-- seção 2): captura o uuid da Folder ANTES de destruí-la — ver
+			-- ScriptRegistry.reassignInstance para o porquê (no caminho comum de
+			-- hoje isto é sempre nil, já que uma Folder pura nunca é registrada;
+			-- a checagem é defensiva/futuro-prova, não corrige um caso hoje
+			-- observável).
+			local existingUuid = ScriptRegistry.getUuid(child)
+			local ok, convertedOrErr = pcall(function()
+				local newInstance = Instance.new(createClassName)
+				newInstance.Name = child.Name
+				-- Parenteia ANTES de mover os filhos (ver comentário acima) —
+				-- newInstance nunca fica órfã enquanto os filhos entram nela.
+				newInstance.Parent = current
+				for _, oldChild in child:GetChildren() do
+					oldChild.Parent = newInstance
+				end
+				child:Destroy()
+				return newInstance
+			end)
+			if not ok then
+				return nil,
+					("falha ao converter '%s' de %s para %s: %s"):format(
+						name,
+						child.ClassName,
+						createClassName,
+						tostring(convertedOrErr)
+					)
+			end
+			if existingUuid ~= nil then
+				-- A Folder já tinha uuid registrado (ver nota de honestidade acima —
+				-- hoje não deveria acontecer, mas se acontecer, o uuid antigo passa a
+				-- apontar para a Instance nova em vez de ser varrido como "destruído"
+				-- pelo próximo checkRegistryDrift + um uuid novo sem relação ser
+				-- alocado por resolveOrAllocate (chamado logo em seguida por
+				-- SourceWatcher.writeSource, via watchScript). Isso garante que
+				-- watchScript/resolveOrAllocate reutilizem o MESMO uuid para a
+				-- Instance nova (primeiro check de resolveOrAllocate é justamente
+				-- `uuidByInstance[instance]`, já populado aqui).
+				-- Nota sobre a reordenação acima: `newInstance.Parent = current` agora
+				-- roda ANTES do loop de filhos (não depois) — mas isso não muda esta
+				-- interação. Sob SignalBehavior Immediate, `DescendantAdded` do root já
+				-- podia disparar `watchScript(newInstance)`/`resolveOrAllocate` de forma
+				-- síncrona DENTRO do pcall mesmo na ordem antiga (só que no final, em vez
+				-- de agora, no início) — se isso alocasse um uuid novo pra newInstance
+				-- antes deste reassignInstance rodar, o registro desse uuid novo ficaria
+				-- órfão (dormant hoje, porque existingUuid é sempre nil na prática — ver
+				-- nota de honestidade acima). Pré-existente à reordenação, não introduzido
+				-- por ela; não corrigido aqui (fora do escopo desta tarefa).
+				ScriptRegistry.reassignInstance(existingUuid, convertedOrErr)
+				log(
+					("resolvePath: uuid=%s preservado na conversão de '%s' (Folder já registrada)."):format(
+						existingUuid,
+						name
+					)
+				)
+			end
+			log(
+				("resolvePath: convertido '%s' de Folder para %s (pasta com filhos virando script via init.*, convenção Rojo)."):format(
+					name,
+					createClassName
+				)
+			)
+			child = convertedOrErr
 		end
 		current = child
 	end
@@ -304,6 +442,59 @@ local function checkDeadFastPath(uuid, instance, storedPath)
 	end)
 end
 
+-- Escaneia um container observado (Service) recursivamente, registra a
+-- observação de cada script já existente e conecta DescendantAdded/
+-- DescendantRemoving para o resto da vida desta geração (myToken). Extraído
+-- de dentro de start() (2026-07-29, mensagem watchedRoots, docs/DECISIONS.md)
+-- para poder ser chamado tanto pelo scan inicial (start(), com a lista fixa
+-- ou uma lista dinâmica já conhecida de uma conexão anterior) quanto por
+-- SourceWatcher.applyWatchedRoots quando a extensão manda containers novos NO
+-- MEIO de uma conexão já em andamento. Idempotente por root: se `root` já
+-- estiver em scannedRoots (mesma geração), não re-escaneia nem duplica
+-- conexões.
+local function scanAndWatch(root, myToken)
+	if scannedRoots[root] then
+		return
+	end
+	scannedRoots[root] = true
+	for _, descendant in root:GetDescendants() do
+		watchScript(descendant)
+	end
+	table.insert(
+		rootConnections,
+		root.DescendantAdded:Connect(function(descendant)
+			if currentToken ~= myToken then
+				return
+			end
+			if descendant:IsA("LuaSourceContainer") then
+				local uuid = watchScript(descendant)
+				local path = SourceWatcher.pathFor(descendant)
+				if path ~= nil and uuid ~= nil and sendMessage ~= nil then
+					sendMessage({ kind = "scriptAdded", uuid = uuid, path = path, className = descendant.ClassName })
+				end
+			end
+		end)
+	)
+	table.insert(
+		rootConnections,
+		root.DescendantRemoving:Connect(function(descendant)
+			if currentToken ~= myToken then
+				return
+			end
+			if watched[descendant] ~= nil then
+				-- Fast-path opcional (ver checkDeadFastPath acima): captura
+				-- uuid/storedPath ANTES de unwatchScript, que só faz
+				-- bookkeeping local e nunca toca o ScriptRegistry.
+				local uuid = ScriptRegistry.getUuid(descendant)
+				if uuid ~= nil then
+					checkDeadFastPath(uuid, descendant, ScriptRegistry.getCanonicalPath(uuid))
+				end
+				unwatchScript(descendant)
+			end
+		end)
+	)
+end
+
 local function pollLoop(myToken)
 	while enabled and currentToken == myToken do
 		task.wait(Config.POLL_INTERVAL_SECONDS)
@@ -395,47 +586,8 @@ function SourceWatcher.start()
 	ScriptRegistry.init()
 	ScriptRegistry.reconcile(isInstanceWatchable)
 
-	local function scanAndWatch(root)
-		for _, descendant in root:GetDescendants() do
-			watchScript(descendant)
-		end
-		table.insert(
-			rootConnections,
-			root.DescendantAdded:Connect(function(descendant)
-				if currentToken ~= myToken then
-					return
-				end
-				if descendant:IsA("LuaSourceContainer") then
-					local uuid = watchScript(descendant)
-					local path = SourceWatcher.pathFor(descendant)
-					if path ~= nil and uuid ~= nil and sendMessage ~= nil then
-						sendMessage({ kind = "scriptAdded", uuid = uuid, path = path, className = descendant.ClassName })
-					end
-				end
-			end)
-		)
-		table.insert(
-			rootConnections,
-			root.DescendantRemoving:Connect(function(descendant)
-				if currentToken ~= myToken then
-					return
-				end
-				if watched[descendant] ~= nil then
-					-- Fast-path opcional (ver checkDeadFastPath acima): captura
-					-- uuid/storedPath ANTES de unwatchScript, que só faz
-					-- bookkeeping local e nunca toca o ScriptRegistry.
-					local uuid = ScriptRegistry.getUuid(descendant)
-					if uuid ~= nil then
-						checkDeadFastPath(uuid, descendant, ScriptRegistry.getCanonicalPath(uuid))
-					end
-					unwatchScript(descendant)
-				end
-			end)
-		)
-	end
-
 	for _, root in Config.getWatchedRoots() do
-		scanAndWatch(root)
+		scanAndWatch(root, myToken)
 	end
 
 	task.spawn(pollLoop, myToken)
@@ -459,6 +611,7 @@ function SourceWatcher.stop()
 		connection:Disconnect()
 	end
 	table.clear(rootConnections)
+	table.clear(scannedRoots)
 	for _, connection in watched do
 		connection:Disconnect()
 	end
@@ -466,6 +619,89 @@ function SourceWatcher.stop()
 	table.clear(lastSourceByInstance)
 	table.clear(recentWrites)
 	log("observação parada.")
+end
+
+-- ------------------------------------------------------- watchedRoots (extensão -> plugin)
+--
+-- Contrato completo em docs/DECISIONS.md (2026-07-29) e
+-- vscode-extension/src/protocol.ts (WatchedRootsMessage): a extensão manda
+-- {kind="watchedRoots", roots={"ReplicatedFirst", ...}} uma vez por conexão
+-- aceita, logo após validar o hello e ANTES do primeiro listScripts. `roots`
+-- são nomes de Service (primeiro segmento de cada mount point do
+-- default.project.json do usuário) — em vez da lista fixa hardcoded de
+-- Config.getWatchedRoots().
+--
+-- Timing escolhido (opção "b" das duas avaliadas na tarefa, ver
+-- docs/DECISIONS.md para a justificativa completa): NÃO atrasamos o scan
+-- inicial esperando esta mensagem. start() já escaneia com
+-- Config.getWatchedRoots() (fixa, ou a dinâmica de uma conexão anterior desta
+-- mesma sessão de plugin) de forma síncrona e imediata, exatamente como antes
+-- desta tarefa — sem introduzir timeout/espera nova que poderia travar a
+-- conexão inicial caso a extensão nunca mande watchedRoots (extensão mais
+-- velha, erro). Quando/se watchedRoots chegar (via handleMessage em
+-- init.server.luau, sincronamente, sem nenhum yield no caminho — GetDescendants/
+-- Instance.new/Connect são todos síncronos), esta função só ADICIONA os
+-- containers que a lista fixa ainda não cobria — scanAndWatch é idempotente
+-- por root (scannedRoots), então containers já escaneados nunca são
+-- reprocessados/duplicados. Isso termina de aplicar a lista nova ANTES do
+-- handler retornar, e como cada mensagem WS é processada até o fim antes da
+-- próxima (mesma premissa de ordering já usada por todo o resto do
+-- dispatch de handleMessage), o listScripts que a extensão manda link
+-- LOGO DEPOIS já reflete os containers novos.
+--
+-- Decisão de UNIÃO (fixa ∪ dinâmica), não substituição total: Config.
+-- getWatchedRoots() nunca REMOVE um container da lista fixa quando a
+-- dinâmica chega — só adiciona os que faltam. Motivo: remover um container
+-- que já estava sendo observado arriscaria "perder de vista" scripts já
+-- conhecidos (uuid alocado, possivelmente com lease ativa) só porque o
+-- default.project.json do usuário não referencia mais aquele Service no
+-- momento exato da mensagem — um risco desnecessário para o problema real
+-- reportado (containers FALTANDO, nunca containers sobrando). Escanear um
+-- Service fixo a mais que o necessário é barato (mesmo custo de hoje); nunca
+-- vimos indicação de que isso seja um problema.
+function SourceWatcher.applyWatchedRoots(names)
+	local invalidNames = Config.setDynamicWatchedRoots(names)
+	for _, name in invalidNames do
+		-- Nome de Service desconhecido/inválido (game:GetService falhou dentro
+		-- de Config.setDynamicWatchedRoots) — nunca derruba o plugin, só pula
+		-- esse nome específico e loga (regra .claude/rules/luau.md).
+		log(("watchedRoots: serviço desconhecido/inválido '%s' ignorado."):format(tostring(name)))
+	end
+
+	if not enabled then
+		-- SourceWatcher ainda não iniciado (ou já parado) quando esta mensagem
+		-- chegou — não deveria acontecer na prática (ver ordering acima), mas
+		-- se acontecer: a lista dinâmica já ficou registrada em Config e será
+		-- usada na união completa (fixa+dinâmica) na próxima vez que start()
+		-- rodar. Nada mais a fazer aqui.
+		Logger.debug(
+			"watchedRoots recebido com SourceWatcher parado; lista dinâmica guardada para o próximo start()."
+		)
+		return
+	end
+
+	local myToken = currentToken
+	local addedCount = 0
+	for _, root in Config.getWatchedRoots() do
+		if currentToken ~= myToken then
+			return
+		end
+		if not scannedRoots[root] then
+			scanAndWatch(root, myToken)
+			addedCount += 1
+		end
+	end
+
+	if addedCount > 0 then
+		log(
+			("watchedRoots aplicado: +%d container(es) novo(s) (%d scripts observados no total)."):format(
+				addedCount,
+				SourceWatcher.getWatchedCount()
+			)
+		)
+	else
+		Logger.debug("watchedRoots aplicado: nenhum container novo (já cobertos pela lista fixa).")
+	end
 end
 
 return SourceWatcher

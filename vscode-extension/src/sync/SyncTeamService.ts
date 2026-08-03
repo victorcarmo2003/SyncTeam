@@ -6,7 +6,7 @@ import { SyncBridge, type Transport, type OnWriteRejectedCallback, type OnSyncCo
 import { SyncServer } from "./SyncServer.js";
 import { LeaseTracker } from "./LeaseTracker.js";
 import type { DiskIO } from "./DiskIO.js";
-import type { MountPoint } from "../mapping/projectMapping.js";
+import { computeWatchedRoots, type MountPoint } from "../mapping/projectMapping.js";
 import type { Logger } from "../util/logger.js";
 import type { RawMessage } from "../protocol.js";
 import type { PresenceTransport, PresenceUpdatePayload } from "../presence/PresencePublisher.js";
@@ -48,6 +48,19 @@ export type OnPresenceLeftCallback = (message: { clientId: string }) => void;
 export type OnProtocolErrorCallback = (message: string) => void;
 
 /**
+ * Callback que mostra a confirmação modal ANTES de um "ReSync" destrutivo
+ * (2026-08-02, ver docs/DECISIONS.md "5ª rodada") — apagar e recriar todo
+ * Source sincronizado é ação com risco, então quem decide de fato é o lado
+ * que vai perder o arquivo local, nunca o clique isolado no Studio. Mesmo
+ * padrão de `PortReclaimHost.confirmKill` (`PortOwnership.ts`, 2026-08-02,
+ * 3ª rodada): mantém este módulo livre de `vscode`/testável com um fake — a
+ * camada de ativação (extension.ts) é quem liga isto a
+ * `vscode.window.showWarningMessage(..., {modal:true}, ...)`. Resolve `true`
+ * se o usuário confirmou, `false` se cancelou ou fechou sem escolher.
+ */
+export type ConfirmResyncCallback = (message: string) => Promise<boolean>;
+
+/**
  * Callback chamado quando todo estado de presença remota deixa de ser
  * confiável (nova conexão de plugin OU desconexão) — a camada de ativação
  * deve limpar seu `PresenceTracker` inteiro nesse momento.
@@ -76,14 +89,66 @@ export class SyncTeamService {
   private onProtocolError: OnProtocolErrorCallback | null = null;
   private onPluginConnected: (() => void) | null = null;
   private onPluginDisconnected: (() => void) | null = null;
+  private onConfirmResync: ConfirmResyncCallback | null = null;
   // multiSync: dedupe de espontânea duplicada (ver routeSpontaneous). Fica
   // null/0 até a primeira mensagem processada; só ativo quando `multiSync`.
   private lastSpontaneousSignature: string | null = null;
   private lastSpontaneousAt = 0;
 
+  // Fila FIFO que serializa toda mutação de estado compartilhado do
+  // SyncBridge + I/O de disco (bug real relatado 2026-07-27, ver
+  // .claude/agent-memory/extension-dev.md e docs/DECISIONS.md mesma data):
+  // ANTES desta fila, `routeSpontaneous` despachava `sourceChanged`/
+  // `scriptAdded`/`scriptMoved`/`scriptRemoved` fire-and-forget a partir do
+  // handler SÍNCRONO de mensagem do `SyncServer` (que processa cada frame do
+  // WebSocket assim que chega, sem esperar o handler assíncrono anterior
+  // terminar). Uma rajada de mensagens quase simultâneas do Studio (ex.:
+  // reparentar ~30 scripts/pastas de uma vez no Explorer, gerando ~30
+  // `scriptMoved` em menos de 1.5s) disparava várias chamadas CONCORRENTES a
+  // `SyncBridge.handleScriptMoved`/etc., todas lendo/escrevendo os MESMOS
+  // mapas mutáveis (`scripts`/`diskPathByUuid`/`uuidByDiskPath`/
+  // `contentCache`) e fazendo I/O de disco assíncrono intercalado —
+  // corrompendo o layout final (arquivo duplicado, promoção pasta->arquivo
+  // nunca concluída porque nenhuma chamada individual via um snapshot
+  // consistente de `this.scripts`).
+  //
+  // `enqueueMutation` encadeia cada tarefa em `queueTail`, garantindo (1)
+  // ORDEM FIFO de chegada e (2) que cada handler complete por inteiro
+  // (inclusive todos os `await` internos) antes do próximo começar.
+  // `queueTail` em si NUNCA rejeita — o `.then(noop, noop)` engole
+  // resultado/erro da tarefa anterior só para efeito de "posso seguir para a
+  // próxima" — assim um handler que falha não trava a fila inteira; quem
+  // enfileira ainda recebe a Promise ORIGINAL (com o erro, se houver) para
+  // logar exatamente como já fazia antes (`.catch(...)`).
+  //
+  // Deliberadamente inclui `runInitialSync`/`refreshSync` (também mutam os
+  // mesmos mapas + tocam disco) e `handleLocalFileChange` (via
+  // `notifyLocalFileChange`, chamado pelo watcher de arquivos — mexe nos
+  // MESMOS mapas compartilhados, então uma edição local concorrente com uma
+  // rajada de mensagens do Studio tem o MESMO tipo de corrida). NÃO inclui
+  // `leaseChanged`/`presenceChanged`/`presenceLeft`/`log` — esses nunca tocam
+  // `this.bridge`/disco (só `leaseTracker`/callbacks de UI/logger), então
+  // enfileirá-los só adicionaria latência artificial a mensagens de alta
+  // frequência (presença/cursor) sem nenhum ganho de correção.
+  private queueTail: Promise<void> = Promise.resolve();
+
+  // Genérico desde 2026-08-02 (ReSync): `resyncFromScratch` precisa devolver
+  // `deletedCount` (número) para quem chamou, diferente das demais mutações
+  // enfileiradas até então (todas `Promise<void>`, valor descartado). `T`
+  // default continua compatível com todo call site pré-existente sem
+  // nenhuma mudança neles — `void` é só mais um `T` possível.
+  private enqueueMutation<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.queueTail.then(task);
+    this.queueTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   constructor(
     private readonly server: SyncServer,
-    mountPoints: MountPoint[],
+    private readonly mountPoints: MountPoint[],
     diskIO: DiskIO,
     private readonly logger: Logger,
     private readonly multiSync: boolean = false,
@@ -103,7 +168,17 @@ export class SyncTeamService {
         // observado antes desta conexão não é mais confiável.
         this.onPresenceReset?.();
 
-        this.bridge.runInitialSync(this.transport).catch((error: Error) => {
+        // watchedRoots (2026-07-29, ver protocol.ts): manda a lista de
+        // serviços de topo referenciados pelos mount points do
+        // default.project.json ATUAL, ANTES do listScripts da sincronização
+        // inicial — o plugin precisa saber quais containers escanear antes de
+        // reportar scriptList. Espontânea (sem requestId/ack), mesmo
+        // mecanismo de sendPresenceUpdate.
+        const roots = computeWatchedRoots(this.mountPoints);
+        this.logger.info(`watchedRoots: ${roots.join(", ") || "(nenhum)"}`);
+        this.server.sendSpontaneous({ kind: "watchedRoots", roots });
+
+        this.enqueueMutation(() => this.bridge.runInitialSync(this.transport)).catch((error: Error) => {
           this.logger.error(`sincronização inicial falhou: ${error.message}`);
         });
 
@@ -171,7 +246,7 @@ export class SyncTeamService {
    * interno vai falhar com "nenhum plugin conectado".
    */
   refreshSync(): Promise<void> {
-    return this.bridge.refreshSync(this.transport);
+    return this.enqueueMutation(() => this.bridge.refreshSync(this.transport));
   }
 
   /** Há um plugin Studio conectado agora? (Guarda para o comando Refresh Sync.) */
@@ -187,6 +262,27 @@ export class SyncTeamService {
    */
   getConnectedCount(): number {
     return this.server.getConnectedCount();
+  }
+
+  /**
+   * Porta em que o servidor está REALMENTE ouvindo agora, ou `null` se
+   * parado. Passthrough para `SyncServer.getActualPort` — difere da porta
+   * configurada (`syncteam.port`) quando um fallback automático de porta
+   * ocupada aconteceu (2026-08-02, `.claude/rules/authority.md`; ver
+   * docs/DECISIONS.md).
+   */
+  getActualPort(): number | null {
+    return this.server.getActualPort();
+  }
+
+  /**
+   * Passthrough para `SyncServer.getLastReclaimed()` — info do processo
+   * identificado e encerrado (via "posse de porta", 2026-08-02,
+   * docs/DECISIONS.md 3ª rodada) para liberar a porta configurada no último
+   * `start()`, ou `null` se não houve tomada de posse.
+   */
+  getLastReclaimed(): { pid: number; processName: string | null } | null {
+    return this.server.getLastReclaimed();
   }
 
   /** Retorna o rastreador de leases (pode ser null se hello ainda não foi recebido). */
@@ -249,6 +345,16 @@ export class SyncTeamService {
   }
 
   /**
+   * Define o callback que mostra a confirmação modal antes de um "ReSync"
+   * destrutivo. Ver `ConfirmResyncCallback` para o contrato completo. Sem
+   * callback registrado, `resyncRequest` é recusado por segurança (nunca
+   * apaga nada sem uma forma de confirmar com o usuário).
+   */
+  setOnConfirmResync(callback: ConfirmResyncCallback): void {
+    this.onConfirmResync = callback;
+  }
+
+  /**
    * Resolve o uuid do script sincronizado materializado em `diskPath`
    * (relativo à raiz do workspace), ou `null` se não for um script
    * sincronizado conhecido. Usado pela camada de presença (M4) tanto para
@@ -302,6 +408,13 @@ export class SyncTeamService {
         );
       case "presenceLeft":
         return `presenceLeft:${String(message.clientId)}`;
+      case "resyncRequest":
+        // Sem campo variável — cada clique gera a mesma assinatura. Isso é
+        // deliberado: um duplo-clique acidental no botão do painel (2 Studios
+        // reportando o MESMO clique, cenário multiSync) deve mesmo ser
+        // dedupido dentro da janela, evitando dois modais de confirmação
+        // empilhados para o mesmo pedido lógico.
+        return "resyncRequest";
       default:
         return `${message.kind}:${JSON.stringify(message)}`;
     }
@@ -325,19 +438,33 @@ export class SyncTeamService {
     }
 
     switch (message.kind) {
+      // Estes 4 kinds mutam estado compartilhado do SyncBridge (scripts/
+      // diskPathByUuid/uuidByDiskPath/contentCache) e tocam disco — passam
+      // pela fila FIFO (`enqueueMutation`, ver comentário no campo
+      // `queueTail`) para nunca rodar concorrentemente com outra mensagem da
+      // MESMA rajada nem com uma edição local concorrente
+      // (`notifyLocalFileChange`). Continuam fire-and-forget do ponto de
+      // vista de quem chama `routeSpontaneous` (retorna `void`) — só a ORDEM
+      // de execução mudou, não a assinatura.
       case "sourceChanged":
-        this.bridge.handleSourceChanged(message).catch((error: Error) => this.logger.error(`sourceChanged: ${error.message}`));
+        this.enqueueMutation(() => this.bridge.handleSourceChanged(message)).catch((error: Error) =>
+          this.logger.error(`sourceChanged: ${error.message}`),
+        );
         break;
       case "scriptAdded":
-        this.bridge
-          .handleScriptAdded(message, this.transport)
-          .catch((error: Error) => this.logger.error(`scriptAdded: ${error.message}`));
+        this.enqueueMutation(() => this.bridge.handleScriptAdded(message, this.transport)).catch((error: Error) =>
+          this.logger.error(`scriptAdded: ${error.message}`),
+        );
         break;
       case "scriptMoved":
-        this.bridge.handleScriptMoved(message).catch((error: Error) => this.logger.error(`scriptMoved: ${error.message}`));
+        this.enqueueMutation(() => this.bridge.handleScriptMoved(message)).catch((error: Error) =>
+          this.logger.error(`scriptMoved: ${error.message}`),
+        );
         break;
       case "scriptRemoved":
-        this.bridge.handleScriptRemoved(message).catch((error: Error) => this.logger.error(`scriptRemoved: ${error.message}`));
+        this.enqueueMutation(() => this.bridge.handleScriptRemoved(message)).catch((error: Error) =>
+          this.logger.error(`scriptRemoved: ${error.message}`),
+        );
         break;
       case "leaseChanged":
         this.handleLeaseChanged(message);
@@ -350,6 +477,9 @@ export class SyncTeamService {
         break;
       case "log":
         this.handleLog(message);
+        break;
+      case "resyncRequest":
+        this.handleResyncRequest();
         break;
       default:
         this.logger.info(`mensagem espontânea de kind desconhecido ignorada: ${message.kind}`);
@@ -477,6 +607,49 @@ export class SyncTeamService {
     this.logger.info(`[studio] ${text}`);
   }
 
+  /**
+   * `resyncRequest` (2026-08-02, "ReSync" — ver docs/DECISIONS.md "5ª
+   * rodada"): o Studio pediu um reset forçado (apagar todo Source
+   * sincronizado e repuxar do zero). ANTES de apagar qualquer coisa, mostra
+   * uma confirmação modal ao usuário LOCAL (via `onConfirmResync` — quem
+   * clicou foi o Studio, mas quem perde o arquivo local é este lado, então
+   * quem confirma de fato é este lado). Nunca deixa o pedido sem resposta:
+   * toda saída (recusa por falta de confirmador, cancelamento, sucesso, erro)
+   * manda `resyncResult` de volta — senão o botão do painel do Studio fica
+   * travado em "syncing" para sempre.
+   */
+  private handleResyncRequest(): void {
+    if (!this.onConfirmResync) {
+      this.logger.error("resyncRequest: nenhum confirmador de UI registrado — recusando por segurança, nada foi apagado");
+      this.server.sendSpontaneous({ kind: "resyncResult", ok: false, reason: "no_confirm_handler" });
+      return;
+    }
+
+    const message =
+      "SyncTeam: ReSync solicitado pelo Studio — isso vai apagar e recriar todos os arquivos de Source " +
+      "sincronizados neste workspace, removendo qualquer duplicata. Continuar?";
+
+    this.onConfirmResync(message)
+      .then((confirmed) => {
+        if (!confirmed) {
+          this.logger.info("resyncRequest: cancelado pelo usuário — nada apagado");
+          this.server.sendSpontaneous({ kind: "resyncResult", ok: false, reason: "cancelled_by_user" });
+          return;
+        }
+        return this.enqueueMutation(() => this.bridge.resyncFromScratch(this.transport)).then((deletedCount) => {
+          this.logger.info(`resyncRequest: concluído — ${deletedCount} arquivo(s) apagado(s), sincronização inicial repuxada`);
+          this.server.sendSpontaneous({ kind: "resyncResult", ok: true, deletedCount });
+        });
+      })
+      .catch((error: Error) => {
+        // Nunca deixa a exceção subir sem resposta — o plugin precisa saber
+        // que o ReSync não aconteceu, seja falha na confirmação em si ou no
+        // reset (resyncFromScratch/runInitialSync).
+        this.logger.error(`resyncRequest: falha — ${error.message}`);
+        this.server.sendSpontaneous({ kind: "resyncResult", ok: false, reason: error.message });
+      });
+  }
+
   start(): Promise<void> {
     return this.server.start();
   }
@@ -485,10 +658,33 @@ export class SyncTeamService {
     return this.server.stop();
   }
 
-  /** Chamado pelo watcher de arquivos (fs.watch ou vscode.FileSystemWatcher) da camada de ativação. */
+  /**
+   * Chamado pelo watcher de arquivos (fs.watch ou vscode.FileSystemWatcher) da
+   * camada de ativação. Passa pela MESMA fila FIFO (`enqueueMutation`) que os
+   * kinds espontâneos mutantes de `routeSpontaneous` — `handleLocalFileChange`
+   * mexe nos MESMOS mapas compartilhados do SyncBridge, então uma edição local
+   * concorrente com uma rajada de mensagens do Studio tem o mesmo tipo de
+   * corrida (ver comentário no campo `queueTail`).
+   */
   notifyLocalFileChange(relDiskPath: string): void {
-    this.bridge.handleLocalFileChange(relDiskPath, this.transport).catch((error: Error) => {
+    this.enqueueMutation(() => this.bridge.handleLocalFileChange(relDiskPath, this.transport)).catch((error: Error) => {
       this.logger.error(`disco → Studio: erro processando mudança local '${relDiskPath}': ${error.message}`);
+    });
+  }
+
+  /**
+   * Chamado pelo listener `onDidChangeTextDocument` (buffer do editor,
+   * throttled) da camada de ativação — ver `SyncBridge.handleBufferContentChange`
+   * para o contrato completo (2026-08-02, "handoff quase-instantâneo de
+   * lease", docs/DECISIONS.md "8ª rodada"). Mesma fila FIFO
+   * (`enqueueMutation`) que `notifyLocalFileChange`/`routeSpontaneous` — mexe
+   * nos mesmos mapas compartilhados do `SyncBridge`, então uma pulsação de
+   * buffer concorrente com uma rajada de mensagens do Studio (ou com o
+   * próprio save) tem o mesmo tipo de corrida.
+   */
+  notifyBufferChange(relDiskPath: string, content: string): void {
+    this.enqueueMutation(() => this.bridge.handleBufferContentChange(relDiskPath, content, this.transport)).catch((error: Error) => {
+      this.logger.error(`buffer → Studio: erro processando mudança de buffer '${relDiskPath}': ${error.message}`);
     });
   }
 }

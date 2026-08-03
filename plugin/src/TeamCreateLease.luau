@@ -90,6 +90,22 @@
 -- eleição. Primeira observação de um uuid nesta sessão só grava baseline
 -- sem emitir (evita rajada de leaseChanged para leases já existentes no
 -- momento em que este Studio conecta) — ver comentário em checkLeaseDrift.
+--
+-- Handoff quase-instantâneo de lease (2026-08-02, docs/DECISIONS.md "8ª
+-- rodada") — duas mudanças, ver comentários nos pontos exatos:
+-- 1. O ciclo do líder (leaderTick, task.spawn em start()) parou de reusar
+--    TeamCreateElection.PULSE_INTERVAL_SECONDS (2s) e passou a rodar em
+--    Config.POLL_INTERVAL_SECONDS (0.5s) — só baixar o limiar de staleness
+--    sem isso seria decorativo (piso de detecção preso em ~2-4s). O
+--    heartbeat de eleição em si (TeamCreateElection.tick()) NÃO mudou.
+-- 2. readLiveIntents troca TeamCreateElection.STALE_AFTER_SECONDS (8s fixo)
+--    por Config.getPlaceSetting(pluginObjectRef, "leaseStaleAfterSeconds")
+--    (default 2s, configurável no painel). Deliberadamente NÃO aplicado a
+--    TeamCreateElection.elect/tick (detecção de sessão/líder morto continua
+--    nos 8s fixos validados no RojoCoop, incluindo failover forçado) — a
+--    decisão registrada fala de LEASE, não de eleição; ver comentário de
+--    Config.PLACE_SETTINGS_DEFAULTS.leaseStaleAfterSeconds para o raciocínio
+--    completo de por que os dois se desacoplaram.
 
 local HttpService = game:GetService("HttpService")
 
@@ -136,6 +152,18 @@ local rootValues = nil -- {LeaderClientId, LeaderTerm, NextJoinSequence, NextLea
 local ownIntents = {} -- uuid -> { folder, values = {IntentId, Pulse, RequestSequence, ScriptRef} }
 local intentPulseObservations = {} -- "clientId:uuid" -> {pulse, observedAt} (bookkeeping do ciclo do líder)
 
+-- Handoff quase-instantâneo de lease (2026-08-02, docs/DECISIONS.md "8ª
+-- rodada"): guardado module-level (diferente de TeamCreateElection.start, que
+-- só usa pluginObject de forma síncrona dentro do próprio start() e não
+-- precisa reter) porque readLiveIntents/leaderTick precisam consultar
+-- Config.getPlaceSetting(pluginObjectRef, "leaseStaleAfterSeconds") em TODO
+-- ciclo do líder, não só no boot — o dev pode editar o valor no painel com a
+-- sessão já conectada (StatusPanel.luau/PluginUI.luau) e o próximo ciclo
+-- (até 0.5s depois) já precisa refletir. nil-safe: Config.getPlaceSetting
+-- degrada para o default (2s) se pluginObjectRef ainda for nil (start() não
+-- chamado) ou se GetSetting falhar internamente (mesmo pcall de sempre).
+local pluginObjectRef = nil
+
 -- M3.3: uuid -> último OwnerClientId observado (dedupe), OU NO_OWNER_KEY
 -- quando a última observação foi "sem lease". Mesmo princípio de dedupe por
 -- último valor visto já usado para Source/registry/sessões desde
@@ -168,6 +196,9 @@ local function getOrCreate(parent, className, name)
 	end
 	local value = Instance.new(className)
 	value.Name = name
+	-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1 (fast-path
+	-- best-effort) — ver comentário em TeamCreateSchema.luau.
+	value.Archivable = false
 	value.Parent = parent
 	return value
 end
@@ -207,6 +238,9 @@ function TeamCreateLease.ensureIntent(uuid, instance)
 	if intentsFolder == nil then
 		intentsFolder = Instance.new("Folder")
 		intentsFolder.Name = "LeaseIntents"
+		-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1
+		-- (fast-path best-effort) — ver comentário em TeamCreateSchema.luau.
+		intentsFolder.Archivable = false
 		intentsFolder.Parent = sessionFolder
 	end
 
@@ -216,6 +250,7 @@ function TeamCreateLease.ensureIntent(uuid, instance)
 		if folder == nil then
 			folder = Instance.new("Folder")
 			folder.Name = uuid
+			folder.Archivable = false
 			folder.Parent = intentsFolder
 		end
 		local values = {}
@@ -356,11 +391,21 @@ end
 -- ------------------------------------------------------- ciclo do líder
 
 -- Varre Sessions/*/LeaseIntents/* e devolve só os intents "vivos" (Pulse
--- mudou há menos de STALE_AFTER_SECONDS, observado localmente — ver decisão
--- 3 no cabeçalho). joinSequence vem da sessão dona (Sessions/<clientId>/
+-- mudou há menos de leaseStaleAfterSeconds, observado localmente — ver
+-- decisão 3 no cabeçalho). joinSequence vem da sessão dona (Sessions/<clientId>/
 -- JoinSequence), lido diretamente (não precisa de aliveness própria da
 -- sessão, ver decisão 3).
+--
+-- 2026-08-02 (docs/DECISIONS.md "8ª rodada"): o limiar de staleness NÃO usa
+-- mais TeamCreateElection.STALE_AFTER_SECONDS (8s fixo, constante de
+-- coordenação de sessão/líder — ver Config.PLACE_SETTINGS_DEFAULTS,
+-- comentário de leaseStaleAfterSeconds, para o porquê de LEASE e ELEIÇÃO
+-- terem se desacoplado). Lido a cada chamada (não cacheado) — é barato
+-- (1 leitura de GetSetting via Config.getPlaceSettings) e permite ao dev
+-- editar o valor no painel com a sessão já conectada, refletindo no próximo
+-- ciclo do líder.
 local function readLiveIntents(now)
+	local staleAfter = Config.getPlaceSetting(pluginObjectRef, "leaseStaleAfterSeconds")
 	local intents = {}
 	for _, sessionFolder in ipairs(sessionsFolder:GetChildren()) do
 		if not sessionFolder:IsA("Folder") then
@@ -408,7 +453,7 @@ local function readLiveIntents(now)
 				intentPulseObservations[observationKey] = observation
 			end
 			local heartbeatAge = math.max(0, now - observation.observedAt)
-			if heartbeatAge > TeamCreateElection.STALE_AFTER_SECONDS then
+			if heartbeatAge > staleAfter then
 				continue -- intent morto: dev parou de escrever nesse uuid
 			end
 
@@ -490,6 +535,9 @@ local function reconcileLeases(intents, leaderTerm)
 		if leaseFolder == nil then
 			leaseFolder = Instance.new("Folder")
 			leaseFolder.Name = uuid
+			-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1
+			-- (fast-path best-effort) — ver comentário em TeamCreateSchema.luau.
+			leaseFolder.Archivable = false
 			leaseFolder.Parent = leasesFolder
 		end
 		local values = {}
@@ -510,12 +558,14 @@ local function reconcileLeases(intents, leaderTerm)
 			-- 2026-07-20 (BUG 2, ruído de uso contínuo — docs/DECISIONS.md):
 			-- rotineiro/alta frequência (troca de dono acontece a cada início
 			-- de edição de script diferente, não só no boot) -> Logger.debug.
-			Logger.debug(("lease concedida uuid=%s owner=%s term=%d requestSequence=%d"):format(
-				uuid,
-				winner.clientId,
-				leaderTerm,
-				winner.requestSequence
-			))
+			Logger.debug(
+				("lease concedida uuid=%s owner=%s term=%d requestSequence=%d"):format(
+					uuid,
+					winner.clientId,
+					leaderTerm,
+					winner.requestSequence
+				)
+			)
 		end
 
 		existing[uuid] = nil
@@ -560,7 +610,7 @@ end
 -- (script deletado) a entrada correspondente em lastOwnerByUuid nunca é
 -- limpa — lixo pequeno e inofensivo em memória, não em replicação.
 local function checkLeaseDrift()
-	ScriptRegistry.forEach(function(uuid, instance, storedPath)
+	ScriptRegistry.forEach(function(uuid)
 		local owner = TeamCreateLease.getOwner(uuid)
 		local ownerKey = owner or NO_OWNER_KEY
 		local lastKey = lastOwnerByUuid[uuid]
@@ -598,6 +648,38 @@ end
 -- só itera Leases/<uuid> já concedidas. Reusa readLease (mesmo parser da
 -- leaderTick). ensureContainers() garante leasesFolder mesmo se chamado
 -- antes de qualquer start() (painel pode renderizar antes da eleição ligar).
+-- ------------------------------------------------------- undo guard (2026-07-26)
+--
+-- Self-healing reativo (camada 2 da mitigação de undo, ver
+-- TeamCreateUndoGuard.luau/docs/DECISIONS.md): chamado após
+-- ChangeHistoryService.OnUndo/OnRedo. Corrige um gap JÁ DOCUMENTADO desde
+-- 2026-07-07 (ver comentário em TeamCreateElection.luau daquela data,
+-- "risco residual aceito"): `leasesFolder`/`sessionsFolder`/`rootValues` são
+-- cacheados 1x em ensureContainers() (guard `if leasesFolder ~= nil then
+-- return end`) e NUNCA refeitos depois — se undo destruir `Leases` (ou a
+-- árvore acima dela), este módulo ficaria preso operando sobre uma Instance
+-- morta (Parent == nil) pelo resto da sessão do plugin, sem nenhum ciclo
+-- periódico que force o refresh (diferente de TeamCreateElection.tick(), que
+-- já chama ensureRoot()/ensureFolder() a cada pulso). Fix: força
+-- `leasesFolder = nil` (invalida o guard de cache-once) antes de chamar
+-- ensureContainers() de novo, que então recria/reconcilia containers do
+-- zero. Não recria intents/leases individuais aqui — `ensureIntent` já
+-- recria a própria pasta de intent lazily no próximo write (checa
+-- `record.folder.Parent == nil`), e `leaderTick`/`reconcileLeases` já recria
+-- `Leases/<uuid>` no próximo ciclo de 2s para qualquer intent ainda vivo,
+-- desde que os containers voltem a apontar pra Instances vivas. No-op se o
+-- módulo não estiver rodando (enabled == false).
+function TeamCreateLease.checkIntegrity()
+	if not enabled then
+		return
+	end
+	if leasesFolder == nil or leasesFolder.Parent == nil or sessionsFolder == nil or sessionsFolder.Parent == nil then
+		leasesFolder = nil
+		ensureContainers()
+		log("integridade: containers de lease ausentes (undo/redo?) — recriados")
+	end
+end
+
 function TeamCreateLease.forEachLease(callback)
 	ensureContainers()
 	for _, folder in ipairs(leasesFolder:GetChildren()) do
@@ -613,10 +695,24 @@ end
 
 -- ------------------------------------------------------------ start/stop
 
--- Roda seu PRÓPRIO task.spawn a cada PULSE_INTERVAL_SECONDS (decisão 2 do
--- cabeçalho) — não duplica o loop de heartbeat de TeamCreateElection, só
--- reusa a mesma constante de intervalo.
-function TeamCreateLease.start()
+-- Roda seu PRÓPRIO task.spawn (decisão 2 do cabeçalho) — não duplica o loop
+-- de heartbeat de TeamCreateElection, mas TAMBÉM NÃO reusa mais a constante
+-- de intervalo dele desde 2026-08-02 (docs/DECISIONS.md "8ª rodada", handoff
+-- quase-instantâneo de lease): antes rodava a TeamCreateElection.
+-- PULSE_INTERVAL_SECONDS (2s) — mesma cadência do heartbeat de
+-- eleição/sessão, que NÃO precisava mudar para esta feature. Baixar só
+-- leaseStaleAfterSeconds sem desacoplar este loop seria decorativo (piso de
+-- detecção preso em ~2-4s independente do número configurado) — por isso
+-- agora roda em Config.POLL_INTERVAL_SECONDS (0.5s), mesma cadência que
+-- checkLeaseDrift já usa logo abaixo. TeamCreateElection.PULSE_INTERVAL_SECONDS
+-- continua intocado, sem nenhuma mudança no heartbeat de eleição em si.
+--
+-- pluginObject (novo parâmetro, mesmo contrato de TeamCreateElection.start):
+-- guardado em pluginObjectRef (module-level, ver comentário na declaração)
+-- para readLiveIntents poder consultar leaseStaleAfterSeconds a cada ciclo.
+-- Pode ser nil (chamador antigo/defensivo) — Config.getPlaceSetting já
+-- degrada para o default (2s) nesse caso.
+function TeamCreateLease.start(pluginObject)
 	if enabled then
 		return
 	end
@@ -624,6 +720,7 @@ function TeamCreateLease.start()
 	currentToken += 1
 	local myToken = currentToken
 
+	pluginObjectRef = pluginObject
 	ensureContainers()
 	ownIntents = {}
 	intentPulseObservations = {}
@@ -631,7 +728,7 @@ function TeamCreateLease.start()
 
 	task.spawn(function()
 		while enabled and currentToken == myToken do
-			task.wait(TeamCreateElection.PULSE_INTERVAL_SECONDS)
+			task.wait(Config.POLL_INTERVAL_SECONDS)
 			if enabled and currentToken == myToken then
 				leaderTick()
 			end
@@ -670,6 +767,7 @@ function TeamCreateLease.stop()
 	end
 	enabled = false
 	currentToken += 1
+	pluginObjectRef = nil
 	ownIntents = {}
 	intentPulseObservations = {}
 	lastOwnerByUuid = {}

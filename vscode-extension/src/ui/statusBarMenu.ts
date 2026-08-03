@@ -10,15 +10,20 @@
 // inicial), centralizado num único ponto para facilitar i18n futura — nenhum
 // texto solto no StatusBarItem.ts.
 
-/** Estado de conexão lido ao vivo pela camada de ativação (ver extension.ts). */
-export interface ConnectionState {
-  /** Servidor WebSocket local no ar (extensão ativa e ouvindo na porta). */
-  running: boolean;
-  /** Plugin do Studio conectado e com handshake (`hello`) concluído. */
-  connected: boolean;
-  /** Porta configurada em `syncteam.port`. */
-  port: number;
-}
+// Estado de conexão lido ao vivo pela camada de ativação (ver extension.ts).
+// Importado (não redeclarado) do tipo já definido em SyncController.ts — eram
+// duas interfaces estruturalmente compatíveis mas duplicadas (achado do
+// code-reviewer, 2026-08-02); `import type` é elidido em tempo de compilação,
+// então isto NÃO faz este módulo depender de `vscode` em runtime
+// (SyncController.ts também não importa `vscode`). Campos relevantes aqui:
+// `running` (servidor WebSocket local no ar), `connected` (plugin do Studio
+// com handshake concluído) e `port` (porta REAL em uso agora — pode divergir
+// da configurada em `syncteam.port` durante um fallback automático de porta
+// ocupada; ver `portFallbackFrom` em SyncController.ts). Reexportado para que
+// quem já importava `ConnectionState` daqui (StatusBarItem.ts, os testes)
+// continue funcionando sem mudar o import.
+import type { ConnectionState } from "../SyncController.js";
+export type { ConnectionState };
 
 /** Os três estados visuais distintos do item, na ordem de "menos pronto" -> "pronto". */
 export type StatusVisualKind = "stopped" | "waiting" | "connected";
@@ -57,6 +62,14 @@ export const COMMANDS = {
 
 const APP = "SyncTeam";
 
+// Ícone customizado (logo do SyncTeam), declarado em `contributes.icons` do
+// package.json a partir da fonte gerada por
+// `scripts/build-icon-font.cjs` (resources/icon.svg -> resources/syncteam-icons.woff).
+// Prefixo ADICIONADO na frente do ícone de status (círculo/broadcast) em
+// todos os estados — reforço de marca, nunca substitui o indicador de
+// estado que já existia (ver .claude/agent-memory/ui-dev.md, 2026-08-03).
+const BRAND_ICON = "$(syncteam-logo)";
+
 export const STRINGS = {
   menuPlaceholder: "SyncTeam — escolha uma ação",
 
@@ -81,7 +94,9 @@ export const STRINGS = {
 
 /**
  * Texto/ícone/tooltip do item da barra de status a partir do estado. Três
- * estados, do "menos pronto" para o "pronto":
+ * estados, do "menos pronto" para o "pronto" — cada um com o logo do
+ * SyncTeam (`$(syncteam-logo)`) na frente, seguido do indicador de estado
+ * (o logo é só reforço de marca, nunca substitui o indicador):
  *
  * - parado          → `$(circle-outline)` (círculo vazado), neutro;
  * - no ar/aguardando → `$(broadcast)` (hospedando/ouvindo) + fundo de aviso;
@@ -96,7 +111,7 @@ export function buildStatusVisual(state: ConnectionState): StatusVisual {
   if (!state.running) {
     return {
       kind: "stopped",
-      text: `$(circle-outline) ${APP} :${port}`,
+      text: `${BRAND_ICON} $(circle-outline) ${APP} :${port}`,
       tooltip: STRINGS.tooltipStopped(port),
       warning: false,
     };
@@ -105,7 +120,7 @@ export function buildStatusVisual(state: ConnectionState): StatusVisual {
   if (!state.connected) {
     return {
       kind: "waiting",
-      text: `$(broadcast) ${APP} :${port}`,
+      text: `${BRAND_ICON} $(broadcast) ${APP} :${port}`,
       tooltip: STRINGS.tooltipWaiting(port),
       warning: true,
     };
@@ -113,7 +128,7 @@ export function buildStatusVisual(state: ConnectionState): StatusVisual {
 
   return {
     kind: "connected",
-    text: `$(circle-filled) ${APP} :${port}`,
+    text: `${BRAND_ICON} $(circle-filled) ${APP} :${port}`,
     tooltip: STRINGS.tooltipConnected(port),
     warning: false,
   };

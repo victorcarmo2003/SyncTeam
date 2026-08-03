@@ -61,6 +61,7 @@
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 
+local Config = require(script.Parent.Config)
 local Logger = require(script.Parent.Logger)
 local TeamCreateSchema = require(script.Parent.TeamCreateSchema)
 
@@ -181,6 +182,16 @@ local pulseObservations = {} -- clientId -> {pulse, observedAt}
 local candidateObservation = nil -- {candidate, observations, leader}
 local announcedLeader = nil
 
+-- Item 2(b) da tarefa 2026-07-21 (toast de colaborador entrou/saiu): roster
+-- local de OUTRAS sessões já vistas nesta sessão do plugin, p/ diff
+-- tick-a-tick (ver checkSessionRoster abaixo). clientId -> displayName.
+local knownOtherSessions = {}
+-- Baseline (mesmo princípio de TeamCreatePresence.checkPresenceDrift): a 1ª
+-- leitura de sessions nesta sessão do plugin nunca dispara toast (evita
+-- rajada de "entrou" pra cada colaborador JÁ conectado quando ESTE Studio
+-- conecta).
+local rosterBaselined = false
+
 -- ------------------------------------------------------------- schema (Sessions/<clientId>)
 
 local SESSION_VALUE_CLASSES = {
@@ -199,6 +210,9 @@ local function getOrCreate(parent, className, name)
 	end
 	local value = Instance.new(className)
 	value.Name = name
+	-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1 (fast-path
+	-- best-effort) — ver comentário equivalente em TeamCreateSchema.luau.
+	value.Archivable = false
 	value.Parent = parent
 	return value
 end
@@ -210,6 +224,9 @@ local function ensureOwnSession()
 	if folder == nil then
 		folder = Instance.new("Folder")
 		folder.Name = clientId
+		-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1
+		-- (fast-path best-effort) — ver comentário em TeamCreateSchema.luau.
+		folder.Archivable = false
 		folder.Parent = sessionsFolder
 	end
 
@@ -313,11 +330,53 @@ local function cleanupStaleSessions(sessions)
 			and session.heartbeatAge >= TeamCreateElection.CLEANUP_AFTER_SECONDS
 			and session.folder.Parent == sessionsFolder
 		then
-			log(("removendo sessão obsoleta clientId=%s heartbeatAge=%.1fs"):format(session.clientId, session.heartbeatAge))
+			log(
+				("removendo sessão obsoleta clientId=%s heartbeatAge=%.1fs"):format(
+					session.clientId,
+					session.heartbeatAge
+				)
+			)
 			session.folder:Destroy()
 			pulseObservations[session.clientId] = nil
 		end
 	end
+end
+
+-- Item 2(b) da tarefa 2026-07-21: diff tick-a-tick entre `knownOtherSessions`
+-- (o que já vimos) e `sessions` (o que Sessions/ tem agora) — toast de
+-- "colaborador entrou"/"colaborador saiu" por sessão de OUTRO Studio que
+-- aparece/some. Chamado incondicionalmente a cada tick (não só pelo líder):
+-- cada Studio conectado detecta joins/leaves de forma independente, sem
+-- depender de quem é o líder no momento. Nunca notifica a própria sessão
+-- (clientId == a própria). Baseline (rosterBaselined) evita rajada de
+-- "entrou" na primeira leitura desta sessão do plugin, quando outras sessões
+-- já estavam conectadas antes deste Studio entrar.
+local function checkSessionRoster(sessions)
+	local seenThisTick = {}
+	for _, session in ipairs(sessions) do
+		if session.clientId == clientId then
+			continue -- nunca notifica a própria sessão
+		end
+		seenThisTick[session.clientId] = true
+		if knownOtherSessions[session.clientId] == nil then
+			local displayName = if session.username ~= "" then session.username else session.clientId
+			knownOtherSessions[session.clientId] = displayName
+			if rosterBaselined then
+				Logger.notify(("colaborador entrou: %s"):format(displayName))
+			end
+		end
+	end
+
+	for otherClientId, displayName in knownOtherSessions do
+		if not seenThisTick[otherClientId] then
+			knownOtherSessions[otherClientId] = nil
+			if rosterBaselined then
+				Logger.notify(("colaborador saiu: %s"):format(displayName))
+			end
+		end
+	end
+
+	rosterBaselined = true
 end
 
 -- ------------------------------------------------------------------- tick
@@ -347,12 +406,10 @@ local function tick()
 	sessionValues.Pulse.Value += 1
 
 	local sessions = readSessions(now)
+	checkSessionRoster(sessions)
 	local candidate = TeamCreateElection.elect(sessions, TeamCreateElection.STALE_AFTER_SECONDS)
-	candidateObservation = TeamCreateElection.observeCandidate(
-		candidateObservation,
-		candidate,
-		TeamCreateElection.PROMOTION_OBSERVATIONS
-	)
+	candidateObservation =
+		TeamCreateElection.observeCandidate(candidateObservation, candidate, TeamCreateElection.PROMOTION_OBSERVATIONS)
 	local leaderClientId = candidateObservation.leader
 
 	if leaderClientId == clientId then
@@ -378,11 +435,41 @@ end
 
 -- ------------------------------------------------------------ start/stop
 
+-- Resolve o nome real do Roblox via Players:GetNameFromUserIdAsync (yield) e
+-- publica em sessionValues.Username.Value. Extraído de dentro de start()
+-- (M4.5+, "Nome de exibição customizado" — ver Config.resolveCustomDisplayName)
+-- para ser reusado também por TeamCreateElection.setLocalUsername quando o
+-- dev LIMPA o campo de nome customizado com uma sessão já conectada
+-- (precisa voltar a resolver o nome do Roblox, não só publicar string
+-- vazia). Roda em task.spawn próprio (a chamada em si dá yield) — reconfere
+-- token/enabled/sessionValues antes de escrever de volta, mesmo cuidado de
+-- todo yield neste projeto (start()/stop() pode ter rodado de novo enquanto
+-- isso resolvia).
+local function resolveAndPublishRobloxUsername(myToken)
+	task.spawn(function()
+		local fallback = tostring(userId)
+		local username = fallback
+		if userId > 0 then
+			local ok, resolved = pcall(Players.GetNameFromUserIdAsync, Players, userId)
+			if ok and type(resolved) == "string" and resolved ~= "" then
+				username = resolved
+			end
+		end
+		if enabled and currentToken == myToken and sessionValues ~= nil then
+			sessionValues.Username.Value = username
+		end
+	end)
+end
+
 -- userIdParam: resultado de StudioService:GetUserId() (já resolvido pelo
 -- chamador, init.server.luau — este módulo não chama StudioService
 -- diretamente para não duplicar o pcall que init.server.luau já faz para o
 -- `hello`).
-function TeamCreateElection.start(userIdParam)
+-- pluginObject (M4.5+, novo parâmetro): só usado para resolver
+-- Config.resolveCustomDisplayName no boot desta sessão — nenhum outro uso
+-- neste módulo (não guardado module-level; TeamCreateElection.setLocalUsername,
+-- abaixo, recebe o nome já resolvido pelo chamador, não o pluginObject).
+function TeamCreateElection.start(userIdParam, pluginObject)
 	if enabled then
 		return
 	end
@@ -402,29 +489,37 @@ function TeamCreateElection.start(userIdParam)
 	pulseObservations = {}
 	candidateObservation = nil
 	announcedLeader = nil
+	-- Item 2(b) da tarefa 2026-07-21: reconexão (troca de porta, F8/F5, reload
+	-- do plugin) re-baseline o roster em vez de disparar "saiu" pra sessões
+	-- antigas (que não existem mais neste processo) e "entrou" em rajada pras
+	-- sessões que já estavam lá.
+	knownOtherSessions = {}
+	rosterBaselined = false
 
 	ensureOwnSession()
 	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
 	-- continua encaminhado por WS, só não polui o Output a cada conexão.
 	Logger.debug(("sessão criada clientId=%s userId=%d"):format(clientId, userId))
 
-	-- Username via Players:GetNameFromUserIdAsync (yield), então roda em
-	-- task.spawn separado — decisão 2 do cabeçalho. Reconfere token/enabled
-	-- antes de escrever de volta (mesmo cuidado de todo yield neste projeto:
-	-- start()/stop() pode ter rodado de novo enquanto isso resolvia).
-	task.spawn(function()
-		local fallback = tostring(userId)
-		local username = fallback
-		if userId > 0 then
-			local ok, resolved = pcall(Players.GetNameFromUserIdAsync, Players, userId)
-			if ok and type(resolved) == "string" and resolved ~= "" then
-				username = resolved
-			end
-		end
-		if enabled and currentToken == myToken and sessionValues ~= nil then
-			sessionValues.Username.Value = username
-		end
-	end)
+	-- Nome de exibição customizado (M4.5+, implementado de verdade em
+	-- 2026-08-02 — antes um placeholder "em breve" no painel): resolvido 1x
+	-- aqui no boot desta sessão de eleição. Quando presente (string
+	-- não-vazia), PULA POR COMPLETO a resolução assíncrona do nome real do
+	-- Roblox (Players:GetNameFromUserIdAsync) e publica o nome customizado
+	-- direto, de forma síncrona — decisão deliberada (documentada também na
+	-- tarefa original): menos uma yield/chamada de rede que o resultado nem
+	-- seria usado, já que o dev escolheu explicitamente um nome fixo.
+	-- pluginObject pode ser nil (chamador antigo/defensivo) —
+	-- Config.resolveCustomDisplayName já degrada para "" nesse caso (pcall
+	-- interno falha ao indexar nil, cai no default).
+	local customDisplayName = Config.resolveCustomDisplayName(pluginObject)
+	if customDisplayName ~= "" then
+		sessionValues.Username.Value = customDisplayName
+	else
+		-- Username via Players:GetNameFromUserIdAsync (yield), então roda em
+		-- task.spawn separado — decisão 2 do cabeçalho.
+		resolveAndPublishRobloxUsername(myToken)
+	end
 
 	tick()
 	task.spawn(function()
@@ -461,6 +556,34 @@ function TeamCreateElection.stop()
 	candidateObservation = nil
 	announcedLeader = nil
 	pulseObservations = {}
+	-- Item 2(b) da tarefa 2026-07-21: mesma simetria/higiene do reset em
+	-- start() acima — evita que um start() seguinte reveja este roster velho.
+	knownOtherSessions = {}
+	rosterBaselined = false
+end
+
+-- Atualiza o Username publicado da PRÓPRIA sessão em runtime, sem exigir
+-- reconectar (M4.5+, "Nome de exibição customizado" — chamado pelo callback
+-- do TextBox correspondente em plugin/src/ui/StatusPanel.luau, via
+-- PluginUI.luau, assim que o dev confirma um novo valor com a sessão já
+-- conectada). `customName` não-vazio: publica direto. `customName` vazio
+-- (dev limpou o campo, "voltar a usar o nome do Roblox"): dispara de novo a
+-- resolução assíncrona via Players:GetNameFromUserIdAsync (mesmo caminho de
+-- start(), extraído em resolveAndPublishRobloxUsername acima) — nunca
+-- publica uma string vazia como Username. No-op silencioso se a eleição não
+-- estiver rodando ainda (sessionValues == nil, ex.: dev editou a setting
+-- antes de conectar pela 1ª vez nesta sessão do plugin) — Config já
+-- persistiu o valor por conta do chamador; o próximo start() aplica o nome
+-- customizado do zero, lendo a setting de novo.
+function TeamCreateElection.setLocalUsername(customName)
+	if sessionValues == nil then
+		return
+	end
+	if type(customName) == "string" and customName ~= "" then
+		sessionValues.Username.Value = customName
+		return
+	end
+	resolveAndPublishRobloxUsername(currentToken)
 end
 
 -- Exposto só para eventual UI/diagnóstico futuro (não usado nesta fatia).
@@ -484,6 +607,37 @@ end
 
 function TeamCreateElection.isLeader()
 	return rootValues ~= nil and clientId ~= nil and rootValues.LeaderClientId.Value == clientId
+end
+
+-- ------------------------------------------------------- undo guard (2026-07-26)
+--
+-- Self-healing reativo (camada 2 da mitigação de undo, ver
+-- TeamCreateUndoGuard.luau/docs/DECISIONS.md): chamado após
+-- ChangeHistoryService.OnUndo/OnRedo dispararem (não sabemos QUAIS instances
+-- foram afetadas, só que ALGUM undo/redo aconteceu — checagem de integridade
+-- é a única opção). Sem isto, um Ctrl+Z que destrua a PRÓPRIA
+-- Sessions/<clientId> deixaria tick() preso para sempre no guard
+-- `sessionFolder.Parent == nil` do topo (early return silencioso) —
+-- heartbeat/eleição param, e getSessionFolder() (usado por
+-- TeamCreateLease/TeamCreatePresence) passa a devolver nil pra sempre,
+-- quebrando leases/presença junto. Reaproveita ensureOwnSession() (já
+-- idempotente, mesma função usada em start()) em vez de duplicar lógica de
+-- criação. No-op se a eleição não estiver rodando (enabled == false).
+function TeamCreateElection.checkIntegrity()
+	if not enabled then
+		return
+	end
+	-- Mesmo refresh que tick() já faz a cada pulso (docs/DECISIONS.md
+	-- 2026-07-07, split-brain de liderança): reconsulta TeamCreateSchema para
+	-- convergir na Instance canônica atual antes de checar/recriar a sessão.
+	local root = TeamCreateSchema.ensureRoot()
+	rootValues = root.values
+	sessionsFolder = TeamCreateSchema.ensureFolder("Sessions")
+
+	if sessionFolder == nil or sessionFolder.Parent == nil then
+		log("integridade: sessão local ausente (undo/redo?) — recriando")
+		ensureOwnSession()
+	end
 end
 
 -- ---------------------------------------------------------- leitura p/ UI (M4.5)

@@ -1,0 +1,1276 @@
+/* SyncTeam — design preview (referência visual solta, ver README/skill)
+   Sem build step: CSS puro, sem pré-processador. Organizado em seções:
+   1. Chrome da própria ferramenta (banner, sidebar, layout)
+   2. Componentes "lab" (campos de teste de texto)
+   3. Mockup do lado Roblox Studio (prefixo .studio-, .st-)
+   4. Mockup do lado VS Code (prefixo .vsc-)
+   5. Tooltip customizado compartilhado (hover de lease/cursor/presença)
+*/
+
+:root {
+  color-scheme: dark;
+  --tool-bg: #16161a;
+  --tool-panel: #1c1c22;
+  --tool-border: #2c2c34;
+  --tool-text: #e4e4ea;
+  --tool-text-muted: #9a9aa4;
+  --tool-accent: #6c8cff;
+  --tool-warning-bg: #4a3300;
+  --tool-warning-border: #a9711b;
+  --tool-warning-text: #ffd98a;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--tool-bg);
+  color: var(--tool-text);
+  min-height: 100%;
+}
+
+code {
+  font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+  font-size: 0.92em;
+}
+
+/* --------------------------------------------------------- 1. chrome geral */
+
+.disclaimer-banner {
+  position: sticky;
+  top: 0;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--tool-warning-bg);
+  border-bottom: 1px solid var(--tool-warning-border);
+  color: var(--tool-warning-text);
+  padding: 8px 16px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.disclaimer-banner__icon {
+  font-size: 16px;
+  flex: none;
+}
+
+.shell {
+  display: flex;
+  align-items: stretch;
+  min-height: calc(100vh - 80px);
+}
+
+.sidebar {
+  flex: none;
+  width: 250px;
+  background: var(--tool-panel);
+  border-right: 1px solid var(--tool-border);
+  padding: 14px 10px;
+  position: sticky;
+  top: 37px;
+  align-self: flex-start;
+  height: calc(100vh - 37px);
+  overflow-y: auto;
+}
+
+.sidebar__brand {
+  font-weight: 700;
+  font-size: 16px;
+  padding: 6px 8px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sidebar__brand-sub {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--tool-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.sidebar__group {
+  margin-bottom: 16px;
+}
+.sidebar__group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--tool-text-muted);
+  padding: 6px 8px 4px;
+}
+
+.nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--tool-text);
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  cursor: pointer;
+  margin-bottom: 2px;
+}
+.nav-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.nav-item.is-active {
+  background: var(--tool-accent);
+  color: #0d0d10;
+  font-weight: 600;
+}
+
+.sidebar__footnote {
+  font-size: 11px;
+  color: var(--tool-text-muted);
+  padding: 10px 8px 0;
+  border-top: 1px solid var(--tool-border);
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
+.content {
+  flex: 1;
+  min-width: 0;
+  padding: 28px 32px 60px;
+}
+
+.screen {
+  display: none;
+}
+.screen.is-active {
+  display: block;
+}
+
+.screen-head h1 {
+  margin: 0 0 6px;
+  font-size: 21px;
+}
+.screen-head p {
+  margin: 0 0 20px;
+  color: var(--tool-text-muted);
+  font-size: 13.5px;
+  max-width: 900px;
+  line-height: 1.5;
+}
+
+.stage {
+  display: flex;
+  justify-content: flex-start;
+  margin-bottom: 22px;
+}
+
+.disclaimer-footer {
+  text-align: center;
+  padding: 14px;
+  font-size: 12px;
+  color: var(--tool-text-muted);
+  border-top: 1px solid var(--tool-border);
+  background: var(--tool-panel);
+}
+
+/* -------------------------------------------------------- 2. componentes lab */
+
+.lab {
+  background: var(--tool-panel);
+  border: 1px solid var(--tool-border);
+  border-radius: 10px;
+  padding: 4px 18px 18px;
+  max-width: 1000px;
+}
+.lab summary {
+  cursor: pointer;
+  padding: 12px 0;
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--tool-text);
+  list-style: none;
+}
+.lab summary::-webkit-details-marker {
+  display: none;
+}
+.lab summary::before {
+  content: "\25B8";
+  display: inline-block;
+  margin-right: 8px;
+  transition: transform 0.15s ease;
+}
+.lab[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.lab__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 12px 16px;
+  margin-bottom: 8px;
+}
+.lab__grid-full {
+  grid-column: 1 / -1;
+}
+.lab label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--tool-text-muted);
+}
+.lab input[type="text"],
+.lab input[type="number"],
+.lab select,
+.lab textarea {
+  background: #101014;
+  border: 1px solid var(--tool-border);
+  color: var(--tool-text);
+  border-radius: 5px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+.lab input:focus,
+.lab select:focus,
+.lab textarea:focus {
+  outline: 2px solid var(--tool-accent);
+  outline-offset: 1px;
+}
+
+.lab__subtitle {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--tool-text-muted);
+  margin: 14px 0 8px;
+}
+
+.lab__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.lab__row {
+  display: grid;
+  grid-template-columns: 24px 1fr 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.lab__row input[type="text"] {
+  background: #101014;
+  border: 1px solid var(--tool-border);
+  color: var(--tool-text);
+  border-radius: 5px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.lab__hint {
+  font-size: 12px;
+  color: var(--tool-text-muted);
+  margin: 10px 0 0;
+  line-height: 1.5;
+}
+
+.lab__action-btn {
+  background: var(--tool-accent);
+  color: #0d0d10;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+.lab__action-btn:hover {
+  filter: brightness(1.08);
+}
+
+/* ================================================================
+   3. MOCKUP — Roblox Studio (chrome + painel Vide)
+   Chrome da janela (.studio-window*) permanece neutro — representa o
+   Studio real, não o SyncTeam. O PAINEL (.st-*) segue a paleta/tipografia
+   "Modux Companion" abaixo, briefing do usuário 2026-08-02 (6ª rodada,
+   reskin visual) — ver .claude/agent-memory/ui-dev.md pro raciocínio
+   completo de cada decisão não-óbvia.
+   ================================================================ */
+
+:root {
+  /* Paleta exata do briefing — nomes espelham 1:1 os nomes semânticos do
+     texto original (background/border/text/subtext/muted/green/greenStrong/
+     etc.), prefixados com "mc-" (Modux Companion) pra não colidir com as
+     variáveis --tool-* do chrome desta ferramenta de preview. SEMPRE 2
+     tons por cor semântica: a versão clara é TEXTO/indicador sobre fundo
+     escuro; a "-strong" é só fundo de botão com texto branco em cima —
+     nunca trocar os dois papéis (checklist do briefing). */
+  --mc-bg: rgb(23, 23, 23);
+  --mc-border: rgb(84, 84, 84);
+  --mc-text: rgb(242, 242, 242);
+  --mc-subtext: rgb(199, 199, 199);
+  --mc-muted: rgb(154, 154, 154);
+  --mc-green: rgb(150, 220, 150);
+  --mc-green-strong: rgb(34, 130, 74);
+  --mc-yellow: rgb(235, 200, 120);
+  --mc-yellow-strong: rgb(163, 120, 20);
+  --mc-red: rgb(230, 120, 120);
+  --mc-red-strong: rgb(189, 45, 45);
+  --mc-blue: rgb(130, 170, 230);
+  --mc-purple: rgb(124, 77, 200);
+  /* Aproximação de fonte arredondada tipo Nunito (briefing: "não precisa
+     ser pixel-perfect"). Nunito/Quicksand raramente estão instaladas sem
+     um <link> de webfont (evitado aqui — este arquivo é propositalmente
+     sem build step e sem dependência de rede), então o fallback real na
+     prática é Century Gothic (já usada no chrome do Studio, geométrica/
+     arredondada) antes de cair pro sans-serif do sistema. */
+  --mc-font-rounded: "Nunito", "Quicksand", "Century Gothic", system-ui, sans-serif;
+  --mc-font-mono: "Cascadia Code", "Consolas", "Courier New", monospace;
+}
+
+.studio-window {
+  width: 900px;
+  max-width: 100%;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #000;
+  background: #3a3a3f;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  font-family: "Century Gothic", "Segoe UI", "Trebuchet MS", sans-serif;
+}
+.studio-window__titlebar {
+  background: #2b2b30;
+  color: #d8d8dc;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+.studio-window__menubar {
+  background: #3a3a3f;
+  color: #c4c4ca;
+  font-size: 12px;
+  padding: 5px 12px;
+  display: flex;
+  gap: 16px;
+  border-bottom: 1px solid #29292d;
+}
+.studio-window__toolbar {
+  background: #454549;
+  padding: 6px 10px;
+  border-bottom: 1px solid #29292d;
+}
+.studio-toolbar-btn {
+  background: #565660;
+  color: #e6e6ea;
+  border: 1px solid #6a6a74;
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 5px 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.studio-toolbar-btn.is-active {
+  background: #6b6b78;
+  border-color: #8888a0;
+}
+.studio-toolbar-btn__icon {
+  font-size: 10px;
+}
+
+.studio-window__body {
+  display: flex;
+  height: 460px;
+  position: relative;
+}
+.studio-window__body--toast-demo {
+  height: 420px;
+}
+.studio-viewport {
+  flex: 1;
+  background: repeating-linear-gradient(45deg, #48484f, #48484f 12px, #444449 12px, #444449 24px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.studio-viewport__label {
+  color: #cfcfd6;
+  font-size: 12px;
+  background: rgba(20, 20, 24, 0.55);
+  padding: 6px 12px;
+  border-radius: 6px;
+}
+
+.dock-widget {
+  flex: none;
+  width: 300px;
+  border-left: 1px solid #202024;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ------------------------------------------------ painel Vide (StatusPanel) */
+
+.st-panel,
+.st-panel button,
+.st-panel input,
+.st-panel select {
+  font-family: var(--mc-font-rounded);
+}
+
+.st-panel {
+  flex: 1;
+  background: var(--mc-bg); /* MESMA cor do painel inteiro — sem blocos internos mais claros/escuros (briefing princípio 1) */
+  color: var(--mc-text);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.st-titlebar {
+  height: 36px;
+  background: var(--mc-bg); /* era um tom mais escuro (18,18,21) que destacava a barra como "card" — agora mesma cor do resto */
+  color: var(--mc-text);
+  display: flex;
+  align-items: center;
+  justify-content: center; /* título centralizado (briefing princípio 3) */
+  /* SEM padding próprio — agora vive DENTRO de .st-content/.st-settings-body,
+     que já dão 12px em todos os lados (mesmo inset que INFO/Porta/etc já
+     usam) — padding duplo aqui deixaria o título mais recuado que as outras
+     linhas. */
+  font-weight: 700;
+  font-size: 20px; /* tamanho de referência do briefing pro título */
+  text-align: center;
+  flex: none;
+  /* status square vira position:absolute (ver .st-status-square) — título
+     fica centralizado na barra INTEIRA, ignorando a largura do quadrado
+     (igual ao UI.luau real do Modux Companion: indicator e title são
+     elementos independentes, não um grupo centralizado junto — reportado
+     pelo usuário 2026-08-02, mesmo padrão que .st-back-btn já usa aqui). */
+  position: relative;
+}
+.st-titlebar--settings {
+  position: relative; /* o botão voltar fica em position:absolute pra não descentralizar o título */
+  gap: 0;
+}
+
+/* Indicador de status — quadrado 10x10, SEM corner, cor por estado
+   (verde=conectado, amarelo=conectando, vermelho=erro — reservado pro
+   futuro, não modelado nos 3 estados atuais de connStatus — cinza=neutro/
+   disconnected). Fica ao lado do título, dentro da titlebar. */
+.st-status-square {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  background: var(--mc-muted);
+  /* Posição fixa no canto esquerdo, independente do título — mesma técnica
+     de .st-back-btn (position:absolute só no eixo horizontal, mantém a
+     posição vertical estática do flex já centralizado pelo pai). Título vira
+     o único filho no fluxo normal, então .st-titlebar's justify-content
+     centraliza SÓ ele, na largura inteira da barra. */
+  position: absolute;
+  left: 12px;
+}
+.st-status-square[data-state="connecting"] {
+  background: var(--mc-yellow);
+}
+.st-status-square[data-state="connected"] {
+  background: var(--mc-green);
+}
+.st-status-square[data-state="error"] {
+  background: var(--mc-red);
+}
+
+.st-back-btn {
+  position: absolute;
+  left: 8px;
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  color: var(--mc-text);
+  border: 1px solid var(--mc-border); /* borda fina padrão — única forma de contorno admitida pelo briefing (princípio 2) */
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+}
+.st-back-btn:hover {
+  background: rgba(242, 242, 242, 0.08);
+}
+
+.st-content {
+  /* Bloco de conteúdo abaixo do título, centralizado verticalmente dentro
+     do espaço disponível do painel (briefing princípio-chave) — flex:1 no
+     pai (.st-panel) + justify-content:center aqui. Quando a tabela de
+     sessões tem conteúdo suficiente pra preencher tudo, o efeito é
+     invisível (nada de espaço livre sobrando); com poucas linhas, o bloco
+     inteiro (INFO/Porta/Connect/ReSync/tabela) centraliza em vez de ficar
+     grudado no topo. */
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 12px;
+  overflow: hidden;
+}
+
+.st-divider {
+  /* Linha divisória sutil entre cabeçalho (título) e controles — 1px na
+     cor do texto com ~12% de opacidade, equivalente ao
+     BackgroundTransparency=0.88 do Roblox (briefing). Reusada também no
+     topo do .st-settings-body. */
+  flex: none;
+  height: 1px;
+  background: rgba(242, 242, 242, 0.12);
+  margin-bottom: 10px;
+}
+
+.st-inforow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.st-inforow label {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--mc-subtext);
+  width: 48px;
+  flex: none;
+  text-align: center;
+}
+.st-inforow__seconds {
+  /* Selo dos segundos — mesma ideia de "campo" da caixa de Info: fundo
+     igual ao painel + borda fina padrão (princípio 2), nunca um tom de
+     fundo diferente do resto. */
+  flex: none;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--mc-muted);
+  background: var(--mc-bg);
+  border: 1px solid var(--mc-border);
+  padding: 3px 6px;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.st-portrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  margin-top: 10px;
+}
+.st-portrow label {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--mc-subtext);
+  width: 48px;
+  flex: none;
+  text-align: center;
+}
+.st-textbox {
+  /* Campo tipo "input": fundo IGUAL ao painel (nunca mais claro) + borda
+     fina padrão pra dar o efeito de contorno discreto (briefing princípio
+     2 — única exceção admitida a "sem borda desenhada à mão"). */
+  flex: 1;
+  background: var(--mc-bg);
+  color: var(--mc-text);
+  border: 1px solid var(--mc-border);
+  padding: 6px 8px;
+  font-size: 13px;
+  font-weight: 700;
+  text-align: center;
+  min-width: 0; /* deixa o textbox encolher dentro do flex — sem isso o input readonly da linha INFO empurrava o selo de segundos pra fora */
+}
+.st-textbox::placeholder {
+  color: var(--mc-muted);
+}
+.st-textbox[readonly] {
+  cursor: default;
+}
+/* Linha INFO — cor do texto reflete o estado da última mensagem (sucesso/
+   aviso/erro/neutro), aplicada via data-color pelo app.js (ver
+   applyMainInfoColor). Sem atributo = mesmo tom neutro do resto do texto
+   secundário do painel. */
+#main-info-box {
+  color: var(--mc-subtext);
+}
+#main-info-box[data-color="sucesso"] {
+  color: var(--mc-green);
+}
+#main-info-box[data-color="aviso"] {
+  color: var(--mc-yellow);
+}
+#main-info-box[data-color="erro"] {
+  color: var(--mc-red);
+}
+/* Campo técnico (porta) — monoespaçado, diferente do resto do painel
+   (briefing: "campos técnicos: porta, endereço"). */
+#main-port-box {
+  font-family: var(--mc-font-mono);
+  font-size: 15px;
+}
+
+.st-connectrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  margin-top: 10px;
+}
+
+.st-connect-btn {
+  flex: 1;
+  height: 34px;
+  border: none;
+  font-weight: 700;
+  font-size: 16px;
+  color: #ffffff;
+  cursor: pointer;
+  text-align: center;
+  /* disconnected: verde-forte como call-to-action ("conectar" = ação
+     positiva) — troca deliberada em relação ao azul anterior, ver
+     .claude/agent-memory/ui-dev.md pro raciocínio completo dos 3 estados. */
+  background: var(--mc-green-strong);
+}
+.st-connect-btn:hover {
+  filter: brightness(1.15);
+}
+.st-connect-btn[data-state="connecting"] {
+  background: var(--mc-yellow-strong);
+}
+.st-connect-btn[data-state="connected"] {
+  /* connected: vermelho-forte, porque clicar agora DESCONECTA (ação de
+     parar) — mesma semântica "vermelho = parar" de antes, só recolorido
+     pra paleta nova. */
+  background: var(--mc-red-strong);
+}
+
+.st-icon-btn {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  background: transparent;
+  color: var(--mc-text);
+  border: 1px solid var(--mc-border);
+  cursor: pointer;
+  font-size: 15px;
+}
+.st-icon-btn:hover {
+  background: rgba(242, 242, 242, 0.08);
+}
+
+/* Botão "ReSync" — mockup (2026-08-02 5ª rodada), feature ainda não
+   implementada no produto real (ver descrição no painel lab). Reskin
+   2026-08-02 (6ª rodada): o briefing pede TODOS os botões com texto
+   branco + fundo "Strong" — isso supera a decisão anterior de deixar o
+   idle deliberadamente "sem cor" pra não competir com o CONNECT.
+   Reconciliação: idle usa --mc-border (o único tom acromático do
+   palette, sem parceiro "Strong" porque não é uma cor semântica) —
+   continua lendo como SECUNDÁRIO por ser cinza/dessaturado ao lado do
+   CONNECT colorido, mesmo com texto branco igual. */
+.st-resyncrow {
+  flex: none;
+  margin-top: 8px;
+}
+.st-resync-btn {
+  width: 100%;
+  background: var(--mc-border);
+  color: #ffffff;
+  border: none;
+  padding: 7px 0;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  text-align: center;
+}
+.st-resync-btn:hover {
+  filter: brightness(1.2);
+}
+.st-resync-btn[data-state="syncing"] {
+  background: var(--mc-yellow-strong);
+  color: #ffffff;
+  cursor: default;
+}
+.st-resync-btn[data-state="done"] {
+  background: var(--mc-green-strong);
+  color: #ffffff;
+  cursor: default;
+}
+
+.st-tableheader {
+  display: flex;
+  padding: 10px 4px 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--mc-muted);
+  text-align: center;
+  flex: none;
+}
+.st-col-user {
+  flex: 0 0 45%;
+}
+.st-col-info {
+  flex: 1;
+}
+
+.st-table {
+  /* flex:none (era flex:1) — a tabela agora faz parte do bloco
+     centralizado verticalmente (.st-content), não estica mais pra
+     preencher o painel inteiro; max-height/overflow é só uma rede de
+     segurança se a lista de sessões crescer além do espaço disponível. */
+  flex: none;
+  max-height: 150px;
+  overflow-y: auto;
+  padding: 0 4px;
+}
+.st-row {
+  /* Sem alternância de fundo par/ímpar (era um tom mais claro nas linhas
+     pares) — mesma cor do painel em TODAS as linhas, separadas só por uma
+     linha divisória sutil (briefing princípio 1). */
+  display: flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 0 0 8px;
+  background: var(--mc-bg);
+  border-bottom: 1px solid rgba(242, 242, 242, 0.08);
+  position: relative;
+}
+.st-row:last-child {
+  border-bottom: none;
+}
+.st-row__dot {
+  /* Quadrado, não bolinha — mesma linguagem do indicador de status da
+     titlebar (briefing: "sem corner"). */
+  width: 8px;
+  height: 8px;
+  background: var(--mc-green);
+  margin-right: 8px;
+  flex: none;
+  visibility: hidden;
+}
+.st-row.is-leader .st-row__dot {
+  visibility: visible;
+}
+.st-row__user {
+  /* Texto de linha (dado dinâmico, nome/caminho) em peso normal e
+     alinhado à esquerda — só títulos/labels/botões ficam centralizados +
+     negrito (briefing); centralizar texto de lista longo/truncado
+     prejudicaria a leitura. */
+  flex: 0 0 calc(45% - 16px);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--mc-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-row__info {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--mc-subtext);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ------------------------------------------------------------- settings view */
+
+.st-settings-body {
+  /* Mesmo princípio de centralização vertical do .st-content da tela
+     principal — aqui não precisou de wrapper novo, já é o único bloco
+     entre a titlebar e o fim do painel. */
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0;
+  padding: 12px;
+}
+.st-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  padding: 6px 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--mc-text);
+  border-bottom: 1px solid rgba(242, 242, 242, 0.08);
+}
+.st-settings-row:last-child {
+  border-bottom: none;
+}
+.st-settings-row--disabled {
+  color: var(--mc-muted);
+}
+.st-toggle {
+  flex: none;
+  background: var(--mc-border);
+  color: #ffffff;
+  border: none;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  min-width: 88px;
+  text-align: center;
+}
+.st-toggle:hover {
+  filter: brightness(1.2);
+}
+.st-disabled-tag {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--mc-muted);
+}
+
+/* ------------------------------------------------------------------- toast */
+
+/* Reskin 2026-08-02 (6ª rodada, briefing "Modux Companion"): severidade
+   agora vive só na FAIXA SUPERIOR (fundo na cor *Strong correspondente),
+   nunca em borda ao redor do card inteiro — o corpo abaixo é sempre o
+   mesmo cinza neutro do tema, não muda com a severidade. 4 categorias:
+   sucesso (verde), aviso (amarelo), erro (vermelho) — todas com texto
+   BRANCO — e um fallback "info"/genérico (fundo claro neutro = subtext,
+   texto PRETO — única exceção à regra do texto branco, briefing). Reto
+   (sem border-radius), mesma linguagem do resto do painel. */
+.st-toast {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: 300px;
+  background: var(--mc-bg);
+  border-radius: 0;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: translateX(calc(100% + 40px));
+  transition: transform 0.28s cubic-bezier(0.25, 0.1, 0.25, 1);
+  z-index: 50;
+  font-family: var(--mc-font-rounded);
+}
+.st-toast button {
+  font-family: inherit;
+}
+.st-toast.is-visible {
+  transform: translateX(0);
+}
+.st-toast.is-leaving {
+  transition-duration: 0.22s;
+  transform: translateX(calc(100% + 40px));
+}
+.st-toast__titlebar {
+  flex: none;
+  height: 36px; /* mesmo TITLE_BAND_HEIGHT do painel principal */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  padding: 0 8px;
+  font-weight: 700;
+  font-size: 15px;
+  text-align: center;
+  /* cor de fundo/texto por severidade definida via [data-severity] abaixo;
+     o valor solto aqui é só o default "aviso" pra bater com o <select>
+     antes do app.js rodar. */
+  background: var(--mc-yellow-strong);
+  color: #ffffff;
+}
+.st-toast__titlebar[data-severity="info"] {
+  background: var(--mc-subtext);
+  color: #000000; /* única exceção à regra de texto branco (briefing) */
+}
+.st-toast__titlebar[data-severity="sucesso"] {
+  background: var(--mc-green-strong);
+  color: #ffffff;
+}
+.st-toast__titlebar[data-severity="aviso"] {
+  background: var(--mc-yellow-strong);
+  color: #ffffff;
+}
+.st-toast__titlebar[data-severity="erro"] {
+  background: var(--mc-red-strong);
+  color: #ffffff;
+}
+.st-toast__title {
+  letter-spacing: 0.02em;
+}
+.st-toast__body {
+  flex: 1;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--mc-text);
+  background: var(--mc-bg);
+  line-height: 1.4;
+}
+.st-toast__close {
+  position: absolute;
+  right: 8px;
+  top: 7px;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  color: inherit; /* segue a cor de texto da faixa (branca ou preta no fallback) */
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+}
+.st-toast__close:hover {
+  opacity: 0.7;
+}
+
+/* ================================================================
+   4. MOCKUP — VS Code (chrome + decorações)
+   Paleta Dark+ aproximada onde não há um valor exato definido no
+   código-fonte (ThemeColor se adapta ao tema real; aqui é uma
+   aproximação fixa só para referência visual).
+   ================================================================ */
+
+.vsc-window {
+  width: 900px;
+  max-width: 100%;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #000;
+  background: #1e1e1e;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  position: relative;
+}
+.vsc-titlebar {
+  background: #3c3c3c;
+  color: #cccccc;
+  font-size: 12px;
+  text-align: center;
+  padding: 6px 0;
+}
+.vsc-body {
+  display: flex;
+  height: 430px;
+}
+.vsc-activitybar {
+  flex: none;
+  width: 46px;
+  background: #333333;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 10px;
+  gap: 18px;
+}
+.vsc-activitybar__icon {
+  color: #858585;
+  font-size: 16px;
+}
+.vsc-activitybar__icon.is-active {
+  color: #ffffff;
+  border-left: 2px solid #ffffff;
+  padding-left: 6px;
+  margin-left: -8px;
+}
+.vsc-sidebar {
+  flex: none;
+  width: 210px;
+  background: #252526;
+  color: #cccccc;
+  border-right: 1px solid #1b1b1b;
+  overflow-y: auto;
+}
+.vsc-sidebar--wide {
+  width: 250px;
+}
+.vsc-sidebar__title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 10px 14px 6px;
+  color: #bbbbbb;
+}
+.vsc-tree {
+  font-size: 13px;
+  padding-bottom: 6px;
+}
+.vsc-tree__folder {
+  padding: 3px 14px;
+  color: #cccccc;
+}
+.vsc-tree__file {
+  padding: 3px 14px 3px 28px;
+  color: #cccccc;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: default;
+  position: relative;
+}
+.vsc-tree__file--active {
+  background: #37373d;
+}
+.vsc-tree__file-badge {
+  margin-left: auto;
+  font-size: 13px;
+  line-height: 1;
+  cursor: default;
+}
+
+.vsc-editorarea {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: #1e1e1e;
+}
+.vsc-tabs {
+  display: flex;
+  background: #252526;
+  border-bottom: 1px solid #1b1b1b;
+}
+.vsc-tab {
+  padding: 8px 16px;
+  font-size: 13px;
+  color: #969696;
+  border-right: 1px solid #1b1b1b;
+}
+.vsc-tab.is-active {
+  background: #1e1e1e;
+  color: #ffffff;
+  border-top: 1px solid #6c8cff;
+}
+.vsc-editor {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+}
+.vsc-editor--with-ruler {
+  display: flex;
+}
+.vsc-code {
+  margin: 0;
+  padding: 10px 14px;
+  font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.65;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+  flex: 1;
+  min-width: 0;
+}
+.vsc-code .ln {
+  display: inline-block;
+  width: 22px;
+  color: #6b6b6b;
+  user-select: none;
+  text-align: right;
+  margin-right: 14px;
+}
+.tok-kw { color: #569cd6; }
+.tok-fn { color: #dcdcaa; }
+.tok-str { color: #ce9178; }
+.tok-cm { color: #6a9955; }
+.tok-num { color: #b5cea8; }
+
+.vsc-statusbar {
+  background: #007acc;
+  color: #ffffff;
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 10px;
+  flex: none;
+}
+.vsc-statusbar__left,
+.vsc-statusbar__right {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+.vsc-statusitem {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.vsc-statusitem:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+.vsc-statusitem--warning {
+  background: #7a6400; /* aproximação de statusBarItem.warningBackground do tema Dark+ */
+}
+.vsc-statusitem--warning:hover {
+  background: #8f7500;
+}
+.vsc-icon {
+  display: inline-block;
+}
+
+/* -------------------------------------------------------------- quickpick */
+
+.vsc-quickpick {
+  position: absolute;
+  right: 14px;
+  bottom: 34px;
+  width: 320px;
+  background: #252526;
+  border: 1px solid #454545;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  z-index: 60;
+}
+.vsc-quickpick__input {
+  padding: 8px 10px;
+  font-size: 13px;
+  color: #cccccc;
+  background: #3c3c3c;
+  border-bottom: 1px solid #454545;
+}
+.vsc-quickpick__list {
+  max-height: 240px;
+  overflow-y: auto;
+}
+.vsc-quickpick__item {
+  padding: 7px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid #2d2d2d;
+}
+.vsc-quickpick__item:last-child {
+  border-bottom: none;
+}
+.vsc-quickpick__item:hover,
+.vsc-quickpick__item.is-focused {
+  background: #094771;
+}
+.vsc-quickpick__item-label {
+  font-size: 13px;
+  color: #e6e6e6;
+}
+.vsc-quickpick__item-detail {
+  font-size: 11.5px;
+  color: #9b9b9b;
+  margin-top: 2px;
+}
+
+/* ------------------------------------------------------ lease decoration */
+
+.vsc-ruler {
+  flex: none;
+  width: 12px;
+  background: #1e1e1e;
+  border-left: 1px solid #2d2d2d;
+  position: relative;
+}
+.vsc-ruler.is-locked::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 3px;
+  width: 6px;
+  border-radius: 3px;
+  background: rgba(224, 132, 32, 0.9);
+}
+.lease-label {
+  color: rgba(224, 132, 32, 0.95);
+  font-style: italic;
+  margin-left: 1.5rem;
+}
+.lease-label[hidden] {
+  display: none;
+}
+
+/* --------------------------------------------------------- cursor remoto */
+
+.cursor-caret {
+  display: inline-block;
+  width: 0;
+  border-left: 2px solid #4287f5;
+  height: 1.1em;
+  vertical-align: text-bottom;
+  position: relative;
+}
+.cursor-caret.is-blinking {
+  animation: syncteam-caret-blink 1.06s steps(1) infinite;
+}
+@keyframes syncteam-caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+#cursor-selection-span {
+  border-radius: 2px;
+}
+
+/* ------------------------------------------------------- tooltip custom */
+
+.st-tooltip {
+  position: fixed;
+  z-index: 999;
+  max-width: 320px;
+  background: #252526;
+  color: #cccccc;
+  border: 1px solid #454545;
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  display: none;
+}
+.st-tooltip.is-visible {
+  display: block;
+}
+.st-tooltip__badge {
+  border-radius: 3px;
+  padding: 1px 6px;
+  color: #ffffff;
+  font-weight: 600;
+  display: inline-block;
+}
+
+/* ------------------------------------------------------------ responsivo */
+
+@media (max-width: 980px) {
+  .shell {
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: static;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+  }
+  .sidebar__group {
+    margin-bottom: 0;
+  }
+  .content {
+    padding: 20px 16px 60px;
+  }
+  .stage {
+    overflow-x: auto;
+  }
+}

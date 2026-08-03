@@ -4,15 +4,27 @@ node_modules/
 *.vsix
 dist/
 out/
-# dist-plugin/SyncTeam.rbxmx é rastreado de propósito (companion plugin pronto
-# pro colega usar sem precisar buildar) — exceção às regras acima.
+# Gerados por vscode-extension/scripts/build-icon-font.cjs (prebuild) a
+# partir de vscode-extension/resources/icon.svg — nunca editar/commitar
+# diretamente, ver o script pro porquê.
+vscode-extension/resources/icon-font-src/
+vscode-extension/resources/syncteam-icons.woff
+vscode-extension/resources/syncteam-icons.json
+.caveman
+.codex
+.modux
 !dist-plugin/
 !dist-plugin/SyncTeam.rbxmx
 *.log
 Tools/logs/*
 !Tools/logs/.gitkeep
+spikes/m1.6-source-streaming-rate/logs/*
+!spikes/m1.6-source-streaming-rate/logs/.gitkeep
+spikes/m1.6-source-streaming-rate/package-lock.json
 
-# Config/estado local de ferramentas de IA (não é conteúdo do SyncTeam)
 .caveman/
 .codex/
+.claude/
 AGENTS.md
+/.claude
+/.claude/agent-memory

@@ -488,7 +488,158 @@ export class SyncBridge {
     }
   }
 
+  // --------------------------------------------------------------- ReSync
+
+  /**
+   * "ReSync" (2026-08-02, ver docs/DECISIONS.md "5ª rodada"): reset forçado
+   * pedido pelo Studio (botão no painel do plugin) — apaga TODO Source
+   * sincronizado neste workspace e repuxa tudo de novo do zero via
+   * `runInitialSync`. Mais agressivo que `refreshSync` (reconciliação
+   * não-destrutiva de 3 vias): existe para quando o layout ficou bagunçado o
+   * bastante (arquivo/pasta duplicado) que a reconciliação não resolve.
+   *
+   * Escopo: só mexe nos arquivos que ESTE bridge já rastreia como Source de
+   * script (`diskPathByUuid`) — nunca em `default.project.json`, nunca em
+   * nada fora dessas pastas, nunca em algo que `reconcileDiskOnlyFiles`
+   * trataria como "descoberto externamente" (não são nossos pra apagar).
+   *
+   * A confirmação com o usuário (modal antes de apagar) é responsabilidade de
+   * QUEM CHAMA este método (`SyncTeamService.handleResyncRequest`) — este
+   * método em si nunca pergunta nada, só executa.
+   *
+   * Retorna quantos arquivos foram de fato apagados com sucesso.
+   */
+  async resyncFromScratch(transport: Transport): Promise<number> {
+    this.logger.warn("resyncFromScratch: ReSync solicitado pelo Studio — apagando todo Source sincronizado e repuxando do zero");
+
+    // Snapshot dos diskPaths ANTES de zerar qualquer Map abaixo — os próprios
+    // Maps serão limpos no passo 3, então iterar sobre eles depois estaria vazio.
+    const diskPaths = Array.from(this.diskPathByUuid.values());
+
+    let deletedCount = 0;
+    for (const diskPath of diskPaths) {
+      try {
+        await this.diskIO.deleteFile(diskPath);
+        deletedCount++;
+      } catch (error) {
+        // Arquivo já ausente/locked não pode abortar o resto — logue e continue.
+        this.logger.error(`resyncFromScratch: erro apagando '${diskPath}': ${(error as Error).message}`);
+        continue;
+      }
+      try {
+        await this.diskIO.removeEmptyDirsUpward(posixDirname(diskPath));
+      } catch (error) {
+        this.logger.error(`resyncFromScratch: erro limpando diretório vazio de '${diskPath}': ${(error as Error).message}`);
+      }
+    }
+
+    // Zera todo estado sincronizado — mesmo estado que um bridge recém-criado teria.
+    this.scripts.clear();
+    this.diskPathByUuid.clear();
+    this.uuidByDiskPath.clear();
+    this.contentCache.clear();
+    this.sourceCache.clear();
+
+    this.logger.info(
+      `resyncFromScratch: ${deletedCount}/${diskPaths.length} arquivo(s) apagado(s) — repuxando sincronização inicial do Studio`,
+    );
+    await this.runInitialSync(transport);
+
+    return deletedCount;
+  }
+
   // ------------------------------------------------------ disco -> Studio
+
+  /**
+   * Núcleo compartilhado de "manda writeSource (modo atualizar) para um uuid
+   * JÁ conhecido" — usado tanto por `handleLocalFileChange` (conteúdo lido do
+   * disco, watcher de arquivo) quanto por `handleBufferContentChange`
+   * (conteúdo do BUFFER do editor, 2026-08-02, "handoff quase-instantâneo de
+   * lease" — ver docs/DECISIONS.md "8ª rodada"). O `content` já vem resolvido
+   * pelo chamador; este método não sabe (nem precisa saber) de onde ele veio,
+   * só cuida de cache/exclusão de pacotes Wally/envio/tratamento de ack —
+   * exatamente a mesma mensagem de protocolo (`writeSource {uuid, source}`)
+   * nos dois casos.
+   */
+  private async pushKnownUuidUpdate(
+    relDiskPath: string,
+    key: string,
+    knownUuid: string,
+    content: string,
+    transport: Transport,
+    logPrefix: string,
+  ): Promise<void> {
+    // Pastas de pacotes Wally: script JÁ EXISTE (uuid conhecido) — isto é
+    // uma ATUALIZAÇÃO de conteúdo existente, que fica de fora do
+    // live-edit-sync (ver docs/DECISIONS.md 2026-07-16).
+    const instancePath = this.scripts.get(knownUuid)?.path ?? relDiskPath;
+    if (isInsideExcludedPackageFolder(instancePath)) {
+      this.logger.info(
+        `${logPrefix}: '${relDiskPath}' (uuid '${knownUuid}') dentro de pasta de pacotes Wally — atualização ignorada (live-edit-sync não se aplica)`,
+      );
+      return;
+    }
+
+    this.contentCache.set(key, content);
+    this.sourceCache.set(knownUuid, content);
+    this.logger.info(`${logPrefix}: '${relDiskPath}' (uuid '${knownUuid}') mudou, enviando writeSource (atualizar)`);
+    try {
+      const ack = await transport.request({ kind: "writeSource", uuid: knownUuid, source: content });
+      if (ack.ok) {
+        this.logger.info(`${logPrefix}: '${relDiskPath}' aplicado no Studio (api=${String(ack.api)})`);
+      } else {
+        const errorMsg = String(ack.error ?? "motivo desconhecido");
+        this.logger.error(`${logPrefix}: FALHA aplicando '${relDiskPath}' (uuid '${knownUuid}'): ${errorMsg}`);
+        this.onWriteRejected?.({ diskPath: relDiskPath, error: errorMsg });
+      }
+    } catch (error) {
+      this.logger.error(`${logPrefix}: erro enviando '${relDiskPath}' (uuid '${knownUuid}'): ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * `onDidChangeTextDocument` do buffer do editor (2026-08-02, "handoff
+   * quase-instantâneo de lease" — ver docs/DECISIONS.md "8ª rodada"): mesma
+   * mensagem `writeSource` que `handleLocalFileChange` manda no save, só que
+   * `content` vem do BUFFER do editor (`document.getText()`, resolvido pelo
+   * chamador — este módulo nunca importa `vscode`/toca o editor), não de uma
+   * leitura de disco. Objetivo: o `Pulse` do lease do lado Luau
+   * (`TeamCreateLease.ensureIntent`, chamado a partir de `handleWriteSource`)
+   * passa a atualizar a cada throttle de digitação (~150ms), não só no save —
+   * encurtando a janela em que o dono de uma lease aparenta estar "morto"
+   * (`STALE_AFTER_SECONDS`, agora configurável ~2-3s do lado Luau).
+   *
+   * Pré-condições que quem chama (extension.ts) já garante ANTES de invocar
+   * este método: (a) `relDiskPath` corresponde a um uuid conhecido (arquivo
+   * já sincronizado — a criação de um script novo continua só pelo save via
+   * `handleLocalFileChange`); (b) a lease deste uuid é EXPLICITAMENTE minha
+   * nesta sessão (`LeaseTracker.isExplicitlyOwnedByMe`, não o otimista
+   * `isOwnedByMe` que também libera quando a lease ainda não foi arbitrada).
+   * Aqui dentro só resta uma checagem defensiva (uuid desconhecido — não
+   * deveria acontecer se o chamador seguiu o contrato, mas não custa).
+   *
+   * Dedupe: mesmo `contentCache` que `handleLocalFileChange`/`writeToDisk`
+   * usam — se o buffer ainda bate com o último conteúdo já sincronizado
+   * (nada mudou desde o último pulse OU desde o último save), sai sem mandar
+   * nada. Isso também é o que evita 2 writes redundantes quando um save
+   * (`handleLocalFileChange`) acontece logo depois de um pulse de buffer já
+   * ter mandado o MESMO conteúdo — o segundo encontra o cache já batendo e
+   * sai cedo, mesmo padrão de dedupe-por-cache de sempre (ver
+   * .claude/agent-memory/extension-dev.md).
+   */
+  async handleBufferContentChange(relDiskPath: string, content: string, transport: Transport): Promise<void> {
+    const key = contentCacheKey(relDiskPath);
+    const knownUuid = this.uuidByDiskPath.get(key);
+    if (knownUuid === undefined) {
+      // Defensivo — extension.ts já filtra por uuid resolvido antes de chamar.
+      this.logger.info(`buffer → Studio: '${relDiskPath}' sem uuid conhecido, ignorado`);
+      return;
+    }
+    if (this.contentCache.get(key) === content) {
+      return; // nada mudou desde o último sincronizado (save ou pulse de buffer anterior)
+    }
+    await this.pushKnownUuidUpdate(relDiskPath, key, knownUuid, content, transport, "buffer → Studio");
+  }
 
   /**
    * Chamado pelo watcher de arquivos (fs.watch/FileSystemWatcher) quando
@@ -539,35 +690,7 @@ export class SyncBridge {
 
     const knownUuid = this.uuidByDiskPath.get(key);
     if (knownUuid !== undefined) {
-      // Pastas de pacotes Wally: script JÁ EXISTE (uuid conhecido) — isto é
-      // uma ATUALIZAÇÃO de conteúdo existente, que fica de fora do
-      // live-edit-sync (ver docs/DECISIONS.md 2026-07-16). Note que a
-      // CRIAÇÃO de arquivo novo (branch abaixo, sem uuid conhecido) não
-      // passa por este early-return — continua funcionando normalmente
-      // mesmo dentro dessas pastas.
-      const instancePath = this.scripts.get(knownUuid)?.path ?? relDiskPath;
-      if (isInsideExcludedPackageFolder(instancePath)) {
-        this.logger.info(
-          `disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') dentro de pasta de pacotes Wally — atualização ignorada (live-edit-sync não se aplica)`,
-        );
-        return;
-      }
-
-      this.contentCache.set(key, content);
-      this.sourceCache.set(knownUuid, content);
-      this.logger.info(`disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') mudou, enviando writeSource (atualizar)`);
-      try {
-        const ack = await transport.request({ kind: "writeSource", uuid: knownUuid, source: content });
-        if (ack.ok) {
-          this.logger.info(`disco → Studio: '${relDiskPath}' aplicado no Studio (api=${String(ack.api)})`);
-        } else {
-          const errorMsg = String(ack.error ?? "motivo desconhecido");
-          this.logger.error(`disco → Studio: FALHA aplicando '${relDiskPath}' (uuid '${knownUuid}'): ${errorMsg}`);
-          this.onWriteRejected?.({ diskPath: relDiskPath, error: errorMsg });
-        }
-      } catch (error) {
-        this.logger.error(`disco → Studio: erro enviando '${relDiskPath}' (uuid '${knownUuid}'): ${(error as Error).message}`);
-      }
+      await this.pushKnownUuidUpdate(relDiskPath, key, knownUuid, content, transport, "disco → Studio");
       return;
     }
 

@@ -45,6 +45,13 @@ describe("buildStatusVisual", () => {
     const visual = buildStatusVisual({ running: true, connected: true, port: 2222 });
     expect(visual.text).toContain(":2222");
   });
+
+  test("o logo do SyncTeam aparece em todos os estados, antes do indicador de status", () => {
+    for (const state of [stopped, waiting, connected]) {
+      const visual = buildStatusVisual(state);
+      expect(visual.text.startsWith("$(syncteam-logo) $(")).toBe(true);
+    }
+  });
 });
 
 describe("buildMenuOptions", () => {

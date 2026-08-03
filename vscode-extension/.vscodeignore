@@ -2,10 +2,18 @@
 src/**
 test/**
 tools/**
+scripts/**
 node_modules/**
 **/*.ts
 tsconfig.json
 esbuild.config.mjs
 vitest.config.*
 .gitignore
-*.map
+**/*.map
+dist/run-node-harness.js
+# Intermediários da geração da fonte de ícone (ver scripts/build-icon-font.cjs):
+# input do fantasticon e o JSON de codepoints — nenhum dos dois é lido em
+# runtime pela extensão, só resources/syncteam-icons.woff (referenciado em
+# contributes.icons no package.json) precisa ir no pacote.
+resources/icon-font-src/**
+resources/syncteam-icons.json

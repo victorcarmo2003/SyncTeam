@@ -1,0 +1,8 @@
+{
+  "name": "syncteam-m1.6-rate-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

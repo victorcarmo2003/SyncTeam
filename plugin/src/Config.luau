@@ -41,6 +41,19 @@ Config.NOTIFICATIONS_SETTING_KEY = "SyncTeam_ShowNotifications"
 -- plugin:SetSetting(...) no Command Bar) volta a ter auto-start.
 Config.AUTOSTART_SETTING_KEY = "SyncTeam_AutoStart"
 
+-- Chave de plugin:GetSetting/SetSetting para "Nome de exibição customizado"
+-- (M4.5+, painel de configurações — antes um placeholder "em breve",
+-- implementado de verdade em 2026-08-02). Quando não-vazio, substitui o nome
+-- resolvido via Players:GetNameFromUserIdAsync como Username publicado em
+-- Sessions/<clientId> (ver TeamCreateElection.luau) — é o que
+-- TeamCreateLease.describeClient usa nas mensagens de lease negada e o que a
+-- tabela de sessões do painel mostra na coluna USER. Default "" (string
+-- vazia) = usar o nome do Roblox normalmente. GLOBAL à instalação do Studio,
+-- mesmo grupo de NOTIFICATIONS_SETTING_KEY/AUTOSTART_SETTING_KEY acima — NÃO
+-- confundir com o mecanismo por-place (PLACE_SETTINGS_KEY, mais abaixo),
+-- outra fatia, não relacionada.
+Config.CUSTOM_DISPLAY_NAME_SETTING_KEY = "SyncTeam_CustomDisplayName"
+
 -- Lista de portas candidatas usada SÓ quando não há nenhuma porta
 -- explicitamente persistida em plugin:GetSetting(PORT_SETTING_KEY) (nem por
 -- SetSetting manual, nem por uma descoberta automática de sessão anterior —
@@ -143,20 +156,96 @@ function Config.isInsideExcludedPackageFolder(instance)
 	return false
 end
 
+-- Lista dinâmica de watched roots recebida via mensagem espontânea
+-- `watchedRoots` (extensão -> plugin, 2026-07-29, docs/DECISIONS.md — ver
+-- também vscode-extension/src/protocol.ts WatchedRootsMessage e
+-- SourceWatcher.applyWatchedRoots). `nil` até a 1ª mensagem chegar nesta
+-- sessão do plugin. Module-level: sobrevive a SourceWatcher.stop()/start()
+-- de propósito (mesmo padrão de estado persistente já usado por
+-- ScriptRegistry, ver .claude/agent-memory/luau-dev.md) — uma troca de porta
+-- ou reconexão não deveria esquecer a última lista dinâmica conhecida; a
+-- próxima conexão aceita manda watchedRoots de novo e substitui isto,
+-- normalmente.
+local dynamicRoots = nil
+
+-- Recebe `roots` (lista de nomes de Service, ex.
+-- {"ReplicatedFirst", "ServerScriptService"}) da mensagem watchedRoots e
+-- resolve cada nome via game:GetService, cada chamada em pcall (regra
+-- .claude/rules/luau.md — nome de Service desconhecido/inválido não pode
+-- derrubar o plugin). Substitui INTEIRAMENTE a lista dinâmica anterior (não
+-- acumula entre chamadas — cada watchedRoots é o snapshot completo e atual
+-- dos mount points do project.json no momento em que a extensão a montou).
+-- Devolve a lista de nomes INVÁLIDOS/desconhecidos (pulados, nunca incluídos
+-- em getWatchedRoots) para o chamador (SourceWatcher.applyWatchedRoots) logar
+-- — esta função em si não loga nada (mantém Config livre de Logger).
+function Config.setDynamicWatchedRoots(names)
+	local resolved = {}
+	local invalidNames = {}
+	if type(names) == "table" then
+		local seenNames = {}
+		for _, name in names do
+			if type(name) == "string" and not seenNames[name] then
+				seenNames[name] = true
+				local ok, service = pcall(function()
+					return game:GetService(name)
+				end)
+				if ok and service ~= nil then
+					table.insert(resolved, service)
+				else
+					table.insert(invalidNames, name)
+				end
+			end
+		end
+	end
+	dynamicRoots = resolved
+	return invalidNames
+end
+
 -- Containers observados recursivamente por Script/LocalScript/ModuleScript.
--- Decisão M1 (docs/MILESTONES.md): plugin "burro"/genérico, lista fixa; a
--- extensão é quem mapeia contra o default.project.json do projeto do
+-- Decisão M1 original (docs/MILESTONES.md): plugin "burro"/genérico, lista
+-- fixa; a extensão é quem mapeia contra o default.project.json do projeto do
 -- usuário e ignora caminhos fora de qualquer ponto de montagem.
+--
+-- 2026-07-29 (docs/DECISIONS.md, mensagem watchedRoots): bug real — um mount
+-- point novo (ex. ReplicatedFirst/First) apontando para um Service fora
+-- desta lista fixa simplesmente não sincronizava. Esta função agora devolve a
+-- UNIÃO da lista fixa com Config.setDynamicWatchedRoots(...) (quando já
+-- recebida nesta sessão) — nunca REMOVE um container fixo, só adiciona os que
+-- a extensão reportou e a lista fixa não cobria. A lista fixa em si vira o
+-- FALLBACK/default: se watchedRoots nunca chegar (extensão mais velha, erro),
+-- dynamicRoots continua nil e esta função devolve só a fixa, como sempre
+-- devolveu. Decisão de UNIÃO (não substituição total), justificada em
+-- SourceWatcher.applyWatchedRoots: nunca arriscar "esquecer" um container já
+-- observado só porque a mensagem mais recente não o lista.
 function Config.getWatchedRoots()
 	local StarterPlayer = game:GetService("StarterPlayer")
-	return {
+	local fixed = {
 		game:GetService("ServerScriptService"),
 		StarterPlayer.StarterPlayerScripts,
 		game:GetService("ReplicatedStorage"),
+		game:GetService("ReplicatedFirst"),
 		game:GetService("ServerStorage"),
 		game:GetService("StarterGui"),
 		game:GetService("Workspace"),
 	}
+	if dynamicRoots == nil then
+		return fixed
+	end
+	local seen = {}
+	local merged = {}
+	for _, root in fixed do
+		if not seen[root] then
+			seen[root] = true
+			table.insert(merged, root)
+		end
+	end
+	for _, root in dynamicRoots do
+		if not seen[root] then
+			seen[root] = true
+			table.insert(merged, root)
+		end
+	end
+	return merged
 end
 
 -- Porta efetiva: setting do plugin se presente e válida, senão o default.
@@ -215,6 +304,179 @@ function Config.resolveAutoStartEnabled(pluginObject)
 		return value
 	end
 	return false
+end
+
+-- Preferência efetiva de "Nome de exibição customizado" (M4.5+): setting do
+-- plugin se presente e do tipo string, senão default "" (string vazia =
+-- "usar o nome do Roblox resolvido normalmente"). Diferente de
+-- resolveNotificationsEnabled/resolveAutoStartEnabled (booleanas): aqui
+-- `type(value) == "boolean"` não se aplica — é `type(value) == "string"` —
+-- mesmo esqueleto de validação (GetSetting em pcall; nunca setado ou tipo
+-- errado caem no default), só o tipo esperado muda.
+function Config.resolveCustomDisplayName(pluginObject)
+	local ok, value = pcall(function()
+		return pluginObject:GetSetting(Config.CUSTOM_DISPLAY_NAME_SETTING_KEY)
+	end)
+	if ok and type(value) == "string" then
+		return value
+	end
+	return ""
+end
+
+-- ---------------------------------------------------- settings por-place (M4.5+)
+--
+-- docs/DECISIONS.md (2026-08-02, 3ª rodada, seção 4): usuário pediu novas
+-- settings do painel (Studio) configuráveis "por espaço de trabalho" (por
+-- lugar/place do Roblox) — mas `plugin:GetSetting`/`SetSetting` é GLOBAL à
+-- INSTALAÇÃO do Studio, não por place (não existe API de setting por-place).
+-- Contorno decidido: um ÚNICO slot GetSetting (PLACE_SETTINGS_KEY) guardando
+-- um mapa `{[tostring(placeId)] = {chave -> valor}}`; toda leitura/escrita
+-- passa por game.PlaceId do momento da chamada, nunca por um place
+-- explicitamente passado — sempre "o place atual". As 3 settings GLOBAIS já
+-- existentes (PORT_SETTING_KEY/NOTIFICATIONS_SETTING_KEY/
+-- AUTOSTART_SETTING_KEY) NÃO são afetadas por isto — continuam globais, como
+-- sempre foram; só as settings NOVAS desta rodada nascem por-place.
+--
+-- Escopo desta fatia (luau-dev): só a API de leitura/escrita abaixo. Consumir
+-- de fato estes valores nos loops de runtime (SourceWatcher.pollLoop,
+-- TeamCreatePresence — hoje ambos usam Config.POLL_INTERVAL_SECONDS fixo, ver
+-- comentário de PLACE_SETTINGS_DEFAULTS abaixo) e construir a UI de settings
+-- (StatusPanel.luau) ficam para tarefas separadas (ui-dev) — não tocados
+-- aqui.
+Config.PLACE_SETTINGS_KEY = "SyncTeam_PlaceSettings"
+
+-- Chaves reconhecidas + default sensato de cada uma, usado sempre que a
+-- chave nunca foi setada para o place atual (ou o valor salvo é de tipo
+-- errado — schema corrompido/versão antiga da setting). Mínimo e extensível
+-- por pedido explícito da tarefa: hoje só as 2 settings pedidas pelo usuário
+-- além do toggle de autostart (que já existia antes desta tarefa, GLOBAL, não
+-- por-place, ver AUTOSTART_SETTING_KEY acima). "Preferência sobre posse de
+-- porta" (3ª setting mencionada no pedido original) FICA DE FORA desta lista
+-- de propósito: docs/DECISIONS.md 2026-08-02 seção 4 decide explicitamente
+-- que aquele diálogo roda do lado da EXTENSÃO (é ela quem faz o bind da
+-- porta), não é uma setting persistente do painel do Studio — a extensão
+-- pode guardar sua própria preferência local (ExtensionContext.globalState),
+-- fora do escopo deste arquivo.
+--
+-- `sourcePollIntervalSeconds` ("intervalo de atualização de arquivo") e
+-- `presencePollIntervalSeconds` ("intervalo de cursor") espelham hoje o MESMO
+-- default de Config.POLL_INTERVAL_SECONDS porque, na implementação atual, as
+-- duas cadências (SourceWatcher.pollLoop e
+-- TeamCreatePresence.checkPresenceDrift) COMPARTILHAM essa mesma constante
+-- fixa — esta tarefa não separa os dois loops nem faz nenhum dos dois ler
+-- estas settings novas (ver nota de escopo acima); são expostas já agora
+-- para a UI (ui-dev) e o wiring de runtime (futuro) terem uma chave estável
+-- para desenhar/consumir.
+--
+-- `leaseStaleAfterSeconds` (2026-08-02, docs/DECISIONS.md "8ª rodada" —
+-- handoff quase-instantâneo de lease): substitui, só para
+-- TeamCreateLease.luau (arbitragem de lease por arquivo), o antigo valor
+-- fixo `TeamCreateElection.STALE_AFTER_SECONDS = 8`. Default escolhido = 2
+-- (não 3): o gatilho de detecção de edição do lado extensão passa a incluir
+-- `onDidChangeTextDocument` throttled ~150ms (além do watcher de disco),
+-- então o Pulse do intent de quem está digitando ativamente é renovado bem
+-- mais rápido que antes — 2s já dá ~4 ciclos de folga sobre a nova cadência
+-- de checagem de 0.5s (ver leaderTick em TeamCreateLease.luau) antes de
+-- considerar o intent morto, sem exigir tanta margem quanto 3s pediria.
+-- DELIBERADAMENTE não aplicado a TeamCreateElection.STALE_AFTER_SECONDS (elect/
+-- applyJoinSequenceAssignments/tick) — aquele valor continua fixo em 8s: é
+-- uma constante de SEGURANÇA de coordenação (detecção de sessão/líder morto,
+-- valida o split-brain já corrigido em 2026-07-07), não uma constante de UX
+-- de latência de arquivo; a decisão registrada fala especificamente de LEASE,
+-- não de eleição — ver TeamCreateLease.luau para o ponto de leitura real.
+Config.PLACE_SETTINGS_DEFAULTS = {
+	sourcePollIntervalSeconds = Config.POLL_INTERVAL_SECONDS,
+	presencePollIntervalSeconds = Config.POLL_INTERVAL_SECONDS,
+	leaseStaleAfterSeconds = 2,
+}
+
+-- Lê a sub-tabela de settings do PLACE ATUAL (tostring(game.PlaceId)) dentro
+-- do slot único GetSetting(PLACE_SETTINGS_KEY), já mesclada com
+-- PLACE_SETTINGS_DEFAULTS para qualquer chave ausente. Toda a leitura em
+-- pcall (regra .claude/rules/luau.md) — setting nunca setada, tipo errado, ou
+-- qualquer falha de GetSetting degrada silenciosamente para os defaults,
+-- nunca propaga erro nem derruba o plugin.
+function Config.getPlaceSettings(pluginObject)
+	local result = table.clone(Config.PLACE_SETTINGS_DEFAULTS)
+	local ok, allPlaces = pcall(function()
+		return pluginObject:GetSetting(Config.PLACE_SETTINGS_KEY)
+	end)
+	if not ok or type(allPlaces) ~= "table" then
+		return result
+	end
+	local placeSettings = allPlaces[tostring(game.PlaceId)]
+	if type(placeSettings) ~= "table" then
+		return result
+	end
+	for key in Config.PLACE_SETTINGS_DEFAULTS do
+		local value = placeSettings[key]
+		if value ~= nil then
+			result[key] = value
+		end
+	end
+	return result
+end
+
+-- Getter de UMA chave só (conveniência para chamadores que só precisam de um
+-- valor, sem montar a tabela inteira) — mesma resolução de default de
+-- getPlaceSettings. Chave desconhecida (fora de PLACE_SETTINGS_DEFAULTS)
+-- devolve nil sempre, nunca inventa um default para chave não registrada.
+function Config.getPlaceSetting(pluginObject, key)
+	if Config.PLACE_SETTINGS_DEFAULTS[key] == nil then
+		return nil
+	end
+	return Config.getPlaceSettings(pluginObject)[key]
+end
+
+-- Escreve UMA chave na sub-tabela do place ATUAL, preservando (a) as outras
+-- chaves do MESMO place já salvas e (b) as sub-tabelas de QUALQUER OUTRO
+-- place já salvas no mesmo slot único — read-modify-write completo do mapa
+-- inteiro, porque GetSetting/SetSetting não oferece update parcial (é tudo
+-- ou nada por chamada). `value == nil` REMOVE a chave da sub-tabela do place
+-- (a próxima leitura volta a usar o default) em vez de gravar nil
+-- explicitamente. Validação leve e genérica (não hardcoded por nome de
+-- chave, para continuar extensível a settings futuras de qualquer tipo):
+-- chave fora de PLACE_SETTINGS_DEFAULTS é rejeitada (não deixa o slot
+-- acumular lixo de nome errado); valor não-nil precisa bater o MESMO tipo Lua
+-- do default, e se o default for number, precisa ser > 0 (todas as settings
+-- numéricas hoje são intervalos em segundos — 0/negativo não faz sentido).
+-- Toda a operação em pcall (regra .claude/rules/luau.md); retorna ok, err.
+function Config.setPlaceSetting(pluginObject, key, value)
+	local default = Config.PLACE_SETTINGS_DEFAULTS[key]
+	if default == nil then
+		return false, ("chave de setting desconhecida: %s"):format(tostring(key))
+	end
+	if value ~= nil then
+		local defaultType = type(default)
+		if type(value) ~= defaultType then
+			return false, ("valor inválido para '%s': esperado %s, recebido %s"):format(key, defaultType, type(value))
+		end
+		if defaultType == "number" and value <= 0 then
+			return false, ("valor inválido para '%s': precisa ser um número positivo"):format(key)
+		end
+	end
+
+	local okRead, allPlaces = pcall(function()
+		return pluginObject:GetSetting(Config.PLACE_SETTINGS_KEY)
+	end)
+	if not okRead or type(allPlaces) ~= "table" then
+		allPlaces = {}
+	end
+	local placeKey = tostring(game.PlaceId)
+	local placeSettings = allPlaces[placeKey]
+	if type(placeSettings) ~= "table" then
+		placeSettings = {}
+	end
+	placeSettings[key] = value -- value == nil aqui remove a chave (tabela Lua padrão)
+	allPlaces[placeKey] = placeSettings
+
+	local okWrite, errWrite = pcall(function()
+		pluginObject:SetSetting(Config.PLACE_SETTINGS_KEY, allPlaces)
+	end)
+	if not okWrite then
+		return false, tostring(errWrite)
+	end
+	return true, nil
 end
 
 return Config

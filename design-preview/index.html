@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SyncTeam — Design Preview</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- Banner fixo: deixa explícito que isto é só referência visual solta. -->
+  <header class="disclaimer-banner">
+    <span class="disclaimer-banner__icon" aria-hidden="true">&#9888;</span>
+    <span>
+      <strong>Referência visual solta.</strong>
+      Este site NÃO está conectado ao plugin do Studio nem à extensão VS Code reais.
+      Editar textos/estados aqui não altera o produto — é só pra visualizar e decidir ajustes de copy/layout/cor.
+    </span>
+  </header>
+
+  <div class="shell">
+    <!-- ---------------------------------------------------------- sidebar -->
+    <nav class="sidebar" aria-label="Telas do SyncTeam">
+      <div class="sidebar__brand">SyncTeam<span class="sidebar__brand-sub">design preview</span></div>
+
+      <div class="sidebar__group">
+        <div class="sidebar__group-title">Roblox Studio (plugin)</div>
+        <button class="nav-item" data-target="screen-studio-main" data-group="studio">Painel — Tela principal</button>
+        <button class="nav-item" data-target="screen-studio-settings" data-group="studio">Painel — Configurações</button>
+        <button class="nav-item" data-target="screen-studio-toast" data-group="studio">Notificação flutuante (Toast)</button>
+      </div>
+
+      <div class="sidebar__group">
+        <div class="sidebar__group-title">VS Code (extensão)</div>
+        <button class="nav-item" data-target="screen-vscode-statusbar" data-group="vscode">Barra de status + menu</button>
+        <button class="nav-item" data-target="screen-vscode-lease" data-group="vscode">Aviso de lease (borda)</button>
+        <button class="nav-item" data-target="screen-vscode-cursor" data-group="vscode">Cursor remoto</button>
+        <button class="nav-item" data-target="screen-vscode-presence" data-group="vscode">Presença no Explorer</button>
+      </div>
+
+      <div class="sidebar__footnote">
+        Fonte de verdade: <code>plugin/src/ui/</code> e <code>vscode-extension/src/ui/</code>.
+        Ver <code>.claude/skills/ui-preview/SKILL.md</code>.
+      </div>
+    </nav>
+
+    <!-- ----------------------------------------------------------- main -->
+    <main class="content">
+
+      <!-- ======================= STUDIO — MAIN VIEW ======================= -->
+      <section class="screen" id="screen-studio-main">
+        <div class="screen-head">
+          <h1>Painel do plugin — tela principal</h1>
+          <p>Porta de <code>plugin/src/ui/StatusPanel.luau</code> (MainView) + <code>PluginUI.luau</code> (toolbar/DockWidget) + <code>Theme.luau</code>. Widget acoplado dentro de um chrome simplificado do Roblox Studio.</p>
+        </div>
+
+        <div class="stage">
+          <!-- Chrome do Studio: janela + toolbar + viewport + dock widget -->
+          <div class="studio-window">
+            <div class="studio-window__titlebar">
+              <span>Roblox Studio — MeuJogo.rbxl</span>
+            </div>
+            <div class="studio-window__menubar">
+              <span>Arquivo</span><span>Editar</span><span>Exibir</span><span>Modelo</span><span>Teste</span><span>Widgets</span>
+            </div>
+            <div class="studio-window__toolbar">
+              <button class="studio-toolbar-btn is-active" type="button" title="Mostra/esconde o painel de status do SyncTeam">
+                <span class="studio-toolbar-btn__icon">&#9670;</span>SyncTeam
+              </button>
+            </div>
+            <div class="studio-window__body">
+              <div class="studio-viewport">
+                <div class="studio-viewport__label">viewport 3D (fora de escopo do SyncTeam)</div>
+              </div>
+
+              <!-- DockWidgetPluginGui -->
+              <div class="dock-widget" id="dockwidget-main">
+                <div class="st-panel" id="st-root-main">
+                  <div class="st-content">
+                    <!-- Título AGORA dentro do bloco que centraliza (era irmão fixo
+                         acima de .st-content — bug real reportado pelo usuário
+                         2026-08-02: ficava "preso ao topo" com vão vazio antes da
+                         divisória, só as linhas de baixo centralizavam). Mesma
+                         correção replicada em plugin/src/ui/StatusPanel.luau. -->
+                    <div class="st-titlebar">
+                      <span class="st-status-square" id="main-status-square" data-state="disconnected" title="Indicador de status da conexão"></span>
+                      <span data-bind="main.title">SYNC TEAM</span>
+                    </div>
+                    <div class="st-divider"></div>
+                    <div class="st-inforow">
+                      <label>INFO:</label>
+                      <input class="st-textbox" type="text" id="main-info-box" data-color="neutro" readonly value="painel: inicializado." />
+                      <span class="st-inforow__seconds" id="main-info-seconds">0s atrás</span>
+                    </div>
+                    <div class="st-portrow">
+                      <label>Porta</label>
+                      <input class="st-textbox" type="text" inputmode="numeric" id="main-port-box" value="1400" />
+                    </div>
+                    <div class="st-connectrow">
+                      <button class="st-connect-btn" id="main-connect-btn" type="button">CONNECT</button>
+                      <button class="st-icon-btn" id="main-gear-btn" type="button" title="Abre configurações">&#9881;</button>
+                    </div>
+                    <div class="st-resyncrow">
+                      <button class="st-resync-btn" id="main-resync-btn" type="button" title="Mockup — feature ainda não implementada, ver painel de teste abaixo">RESYNC</button>
+                    </div>
+                    <div class="st-tableheader">
+                      <span class="st-col-user" data-bind="main.colUser">USER</span>
+                      <span class="st-col-info" data-bind="main.colInfo">INFO</span>
+                    </div>
+                    <div class="st-table" id="main-sessions-table">
+                      <!-- linhas injetadas por app.js a partir do estado -->
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="lab" open>
+          <summary>Teste de texto / estado — Painel principal</summary>
+          <div class="lab__grid">
+            <label>Título da barra
+              <input type="text" data-lab="main.title" value="SYNC TEAM" />
+            </label>
+            <label>Linha INFO (texto)
+              <input type="text" data-lab="main.infoText" value="painel: inicializado." />
+            </label>
+            <label>Linha INFO (segundos)
+              <input type="number" min="0" data-lab="main.infoSeconds" value="0" />
+            </label>
+            <label>Cor da linha INFO
+              <select data-lab="main.infoColor">
+                <option value="neutro" selected>neutro (cinza)</option>
+                <option value="sucesso">sucesso (verde)</option>
+                <option value="aviso">aviso (amarelo)</option>
+                <option value="erro">erro (vermelho)</option>
+              </select>
+            </label>
+            <label>Porta
+              <input type="number" min="1" data-lab="main.port" value="1400" />
+            </label>
+            <label>Estado da conexão
+              <select data-lab="main.connStatus">
+                <option value="disconnected">disconnected (verde)</option>
+                <option value="connecting">connecting (amarelo)</option>
+                <option value="connected">connected (vermelho)</option>
+              </select>
+            </label>
+            <label>Texto do botão — disconnected
+              <input type="text" data-lab="main.labelDisconnected" value="CONNECT" />
+            </label>
+            <label>Texto do botão — connecting
+              <input type="text" data-lab="main.labelConnecting" value="CONECTANDO..." />
+            </label>
+            <label>Texto do botão — connected
+              <input type="text" data-lab="main.labelConnected" value="DISCONNECT" />
+            </label>
+            <label>Cabeçalho coluna 1
+              <input type="text" data-lab="main.colUser" value="USER" />
+            </label>
+            <label>Cabeçalho coluna 2
+              <input type="text" data-lab="main.colInfo" value="INFO" />
+            </label>
+          </div>
+
+          <div class="lab__subtitle">Botão "ReSync" — mockup, feature ainda NÃO implementada</div>
+          <p class="lab__hint">
+            Ideia: limpar todo o <code>Source</code> local (lado VS Code) e puxar tudo de novo do
+            Studio (mesma autoridade do Studio já usada na conexão inicial), removendo arquivos de
+            Source duplicados/órfãos no disco — só <code>Source</code> de script, nenhuma outra
+            propriedade de Instance. Implementação real fica para depois da aprovação visual do
+            botão; aqui o clique só atualiza a linha INFO acima como demonstração.
+          </p>
+
+          <div class="lab__subtitle">Linhas da tabela de sessões</div>
+          <div class="lab__rows" id="main-rows-editor"><!-- geradas por app.js --></div>
+          <p class="lab__hint">Dica: clique no botão CONNECT do mockup pra ciclar disconnected → connecting → connected, na engrenagem pra ir pra tela de Configurações, e no ReSync pra ver a linha INFO mudar — igual ao comportamento real (exceto ReSync, que ainda não existe de verdade).</p>
+        </details>
+      </section>
+
+      <!-- ======================= STUDIO — SETTINGS VIEW ======================= -->
+      <section class="screen" id="screen-studio-settings">
+        <div class="screen-head">
+          <h1>Painel do plugin — Configurações</h1>
+          <p>Porta de <code>StatusPanel.luau</code> (SettingsView) — mesma <code>DockWidgetPluginGui</code>, trocada via <code>vide.switch(state.view)</code>, nunca um segundo widget.</p>
+        </div>
+
+        <div class="stage">
+          <div class="studio-window">
+            <div class="studio-window__titlebar"><span>Roblox Studio — MeuJogo.rbxl</span></div>
+            <div class="studio-window__menubar">
+              <span>Arquivo</span><span>Editar</span><span>Exibir</span><span>Modelo</span><span>Teste</span><span>Widgets</span>
+            </div>
+            <div class="studio-window__toolbar">
+              <button class="studio-toolbar-btn is-active" type="button"><span class="studio-toolbar-btn__icon">&#9670;</span>SyncTeam</button>
+            </div>
+            <div class="studio-window__body">
+              <div class="studio-viewport"><div class="studio-viewport__label">viewport 3D (fora de escopo do SyncTeam)</div></div>
+
+              <div class="dock-widget">
+                <div class="st-panel">
+                  <div class="st-settings-body">
+                    <!-- Mesma correção da tela principal: título dentro do bloco
+                         que centraliza, não mais irmão fixo acima dele. -->
+                    <div class="st-titlebar st-titlebar--settings">
+                      <button class="st-back-btn" type="button" title="Voltar">&#8592;</button>
+                      <span data-bind="settings.title">CONFIGURAÇÕES</span>
+                    </div>
+                    <div class="st-divider"></div>
+                    <div class="st-settings-row">
+                      <span data-bind="settings.notifLabel">Mostrar notificações</span>
+                      <button class="st-toggle" id="settings-notif-toggle" type="button">Ativado</button>
+                    </div>
+                    <div class="st-settings-row">
+                      <span data-bind="settings.autoLabel">Reconectar automaticamente ao abrir a place</span>
+                      <button class="st-toggle" id="settings-auto-toggle" type="button">Desativado</button>
+                    </div>
+                    <div class="st-settings-row st-settings-row--disabled">
+                      <span data-bind="settings.disabled1">Nome de exibição customizado</span>
+                      <span class="st-disabled-tag" data-bind="settings.soonText">em breve</span>
+                    </div>
+                    <div class="st-settings-row st-settings-row--disabled">
+                      <span data-bind="settings.disabled2">Containers observados</span>
+                      <span class="st-disabled-tag" data-bind="settings.soonText">em breve</span>
+                    </div>
+                    <div class="st-settings-row st-settings-row--disabled">
+                      <span data-bind="settings.disabled3">Nível de log</span>
+                      <span class="st-disabled-tag" data-bind="settings.soonText">em breve</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="lab" open>
+          <summary>Teste de texto — Configurações</summary>
+          <div class="lab__grid">
+            <label>Título
+              <input type="text" data-lab="settings.title" value="CONFIGURAÇÕES" />
+            </label>
+            <label>Rótulo — notificações
+              <input type="text" data-lab="settings.notifLabel" value="Mostrar notificações" />
+            </label>
+            <label>Rótulo — auto-reconectar
+              <input type="text" data-lab="settings.autoLabel" value="Reconectar automaticamente ao abrir a place" />
+            </label>
+            <label>Item desabilitado 1
+              <input type="text" data-lab="settings.disabled1" value="Nome de exibição customizado" />
+            </label>
+            <label>Item desabilitado 2
+              <input type="text" data-lab="settings.disabled2" value="Containers observados" />
+            </label>
+            <label>Item desabilitado 3
+              <input type="text" data-lab="settings.disabled3" value="Nível de log" />
+            </label>
+            <label>Texto "em breve"
+              <input type="text" data-lab="settings.soonText" value="em breve" />
+            </label>
+          </div>
+          <p class="lab__hint">Os dois toggles reais (Ativado/Desativado) são clicáveis no mockup, igual ao plugin.</p>
+        </details>
+      </section>
+
+      <!-- ======================= STUDIO — TOAST ======================= -->
+      <section class="screen" id="screen-studio-toast">
+        <div class="screen-head">
+          <h1>Notificação flutuante (Toast)</h1>
+          <p>Porta de <code>Toast.luau</code> — <code>ScreenGui</code> independente em <code>CoreGui</code>, flutua sobre o Studio inteiro (não vive dentro do painel). Canto inferior direito, some sozinho em ~5s ou no X.</p>
+        </div>
+
+        <div class="stage">
+          <div class="studio-window">
+            <div class="studio-window__titlebar"><span>Roblox Studio — MeuJogo.rbxl</span></div>
+            <div class="studio-window__menubar">
+              <span>Arquivo</span><span>Editar</span><span>Exibir</span><span>Modelo</span><span>Teste</span><span>Widgets</span>
+            </div>
+            <div class="studio-window__toolbar">
+              <button class="studio-toolbar-btn is-active" type="button"><span class="studio-toolbar-btn__icon">&#9670;</span>SyncTeam</button>
+            </div>
+            <div class="studio-window__body studio-window__body--toast-demo">
+              <div class="studio-viewport"><div class="studio-viewport__label">viewport 3D — o toast flutua por CIMA disto, via CoreGui</div></div>
+
+              <div class="st-toast" id="studio-toast">
+                <div class="st-toast__titlebar" id="studio-toast-titlebar" data-severity="aviso">
+                  <span class="st-toast__title">SYNC TEAM</span>
+                  <button class="st-toast__close" type="button" title="Fechar">X</button>
+                </div>
+                <div class="st-toast__body">
+                  <span data-bind="toast.text">SyncTeam: lease negada — "PlayerController" está sendo editado por Ana.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="lab" open>
+          <summary>Teste de texto — Toast</summary>
+          <div class="lab__grid">
+            <label>Severidade (cor da faixa de título)
+              <select data-lab="toast.severity">
+                <option value="info">info / genérico (neutro, texto preto)</option>
+                <option value="sucesso">sucesso (verde)</option>
+                <option value="aviso" selected>aviso (amarelo)</option>
+                <option value="erro">erro (vermelho)</option>
+              </select>
+            </label>
+            <label class="lab__grid-full">Mensagem do toast
+              <textarea rows="2" data-lab="toast.text">SyncTeam: lease negada — "PlayerController" está sendo editado por Ana.</textarea>
+            </label>
+          </div>
+          <button class="lab__action-btn" id="toast-show-btn" type="button">Mostrar toast agora</button>
+          <p class="lab__hint">Reproduz a animação real: entra deslizando (0.28s), segura ~5s, sai (0.22s) — ou feche no X.</p>
+        </details>
+      </section>
+
+      <!-- ======================= VS CODE — STATUS BAR ======================= -->
+      <section class="screen" id="screen-vscode-statusbar">
+        <div class="screen-head">
+          <h1>VS Code — Barra de status + menu</h1>
+          <p>Porta de <code>statusBarMenu.ts</code> (lógica) + <code>StatusBarItem.ts</code> (widget). Três estados: parado (círculo vazado), no ar/aguardando plugin (ícone de broadcast + fundo de aviso), conectado (círculo cheio).</p>
+        </div>
+
+        <div class="stage">
+          <div class="vsc-window" id="vsc-window-statusbar">
+            <div class="vsc-titlebar"><span>SyncTeam-exemplo — Visual Studio Code</span></div>
+            <div class="vsc-body">
+              <div class="vsc-activitybar">
+                <div class="vsc-activitybar__icon is-active">&#128193;</div>
+                <div class="vsc-activitybar__icon">&#128269;</div>
+                <div class="vsc-activitybar__icon">&#8942;&#8942;</div>
+                <div class="vsc-activitybar__icon">&#9654;</div>
+                <div class="vsc-activitybar__icon">&#129513;</div>
+              </div>
+              <div class="vsc-sidebar">
+                <div class="vsc-sidebar__title">explorador</div>
+                <div class="vsc-tree">
+                  <div class="vsc-tree__folder">&#9660; src</div>
+                  <div class="vsc-tree__file vsc-tree__file--active">&#128196; PlayerController.server.luau</div>
+                  <div class="vsc-tree__file">&#128196; Inventory.module.luau</div>
+                  <div class="vsc-tree__file">&#128196; Shop.client.luau</div>
+                </div>
+              </div>
+              <div class="vsc-editorarea">
+                <div class="vsc-tabs">
+                  <div class="vsc-tab is-active">PlayerController.server.luau</div>
+                </div>
+                <div class="vsc-editor">
+                  <pre class="vsc-code"><span class="ln">1</span><span class="tok-kw">local</span> Players = <span class="tok-fn">game</span>:GetService(<span class="tok-str">"Players"</span>)
+<span class="ln">2</span>
+<span class="ln">3</span><span class="tok-kw">local</span> <span class="tok-kw">function</span> <span class="tok-fn">onPlayerAdded</span>(player)
+<span class="ln">4</span>	<span class="tok-cm">-- TODO: iniciar inventário do jogador</span>
+<span class="ln">5</span><span class="tok-kw">end</span>
+<span class="ln">6</span>
+<span class="ln">7</span>Players.PlayerAdded:Connect(onPlayerAdded)</pre>
+                </div>
+              </div>
+            </div>
+            <div class="vsc-statusbar">
+              <div class="vsc-statusbar__left">
+                <span>&#10003; main</span>
+                <span>&#9888; 0</span>
+              </div>
+              <div class="vsc-statusbar__right">
+                <span class="vsc-statusitem" id="vsc-syncteam-item" title="clique para abrir o menu">
+                  <svg class="vsc-icon" id="vsc-syncteam-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"></svg>
+                  <span id="vsc-syncteam-text">SyncTeam :1400</span>
+                </span>
+                <span>UTF-8</span>
+                <span>Luau</span>
+              </div>
+            </div>
+
+            <!-- QuickPick / menu do clique no item -->
+            <div class="vsc-quickpick" id="vsc-quickpick" hidden>
+              <div class="vsc-quickpick__input" id="vsc-quickpick-placeholder">SyncTeam — escolha uma ação</div>
+              <div class="vsc-quickpick__list" id="vsc-quickpick-list"><!-- gerado por app.js --></div>
+            </div>
+          </div>
+        </div>
+
+        <details class="lab" open>
+          <summary>Teste de texto / estado — Barra de status</summary>
+          <div class="lab__grid">
+            <label>Estado
+              <select data-lab="statusbar.state">
+                <option value="stopped">parado</option>
+                <option value="waiting" selected>no ar, aguardando plugin</option>
+                <option value="connected">conectado</option>
+              </select>
+            </label>
+            <label>Porta
+              <input type="number" min="1" data-lab="statusbar.port" value="1400" />
+            </label>
+            <label>Nome do app
+              <input type="text" data-lab="statusbar.appName" value="SyncTeam" />
+            </label>
+            <label>Item de menu — Iniciar
+              <input type="text" data-lab="statusbar.menuStart" value="$(play) Iniciar" />
+            </label>
+            <label>Item de menu — Parar
+              <input type="text" data-lab="statusbar.menuStop" value="$(debug-stop) Parar" />
+            </label>
+            <label>Item de menu — Trocar porta
+              <input type="text" data-lab="statusbar.menuSetPort" value="$(plug) Trocar porta" />
+            </label>
+            <label>Item de menu — Refresh Sync
+              <input type="text" data-lab="statusbar.menuRefresh" value="$(sync) Refresh Sync" />
+            </label>
+            <label>Item de menu — Mostrar log
+              <input type="text" data-lab="statusbar.menuShowOutput" value="$(output) Mostrar log" />
+            </label>
+          </div>
+          <p class="lab__hint">Clique no item da barra de status (canto inferior direito do mockup) pra abrir o menu — a lista de opções muda de acordo com o estado, igual ao <code>buildMenuOptions</code> real.</p>
+        </details>
+      </section>
+
+      <!-- ======================= VS CODE — LEASE BORDER ======================= -->
+      <section class="screen" id="screen-vscode-lease">
+        <div class="screen-head">
+          <h1>VS Code — Aviso de lease alheia</h1>
+          <p>Porta de <code>LeaseBorderDecoration.ts</code> + <code>leaseBorderState.ts</code>. Sem fundo cobrindo o texto (removido em 2026-08-02 por parecer "erro no arquivo inteiro") — só régua/minimap laranja, rótulo no fim da 1ª linha, hover, e item dedicado na status bar.</p>
+        </div>
+
+        <div class="stage">
+          <div class="vsc-window">
+            <div class="vsc-titlebar"><span>SyncTeam-exemplo — Visual Studio Code</span></div>
+            <div class="vsc-body">
+              <div class="vsc-activitybar">
+                <div class="vsc-activitybar__icon is-active">&#128193;</div>
+                <div class="vsc-activitybar__icon">&#128269;</div>
+                <div class="vsc-activitybar__icon">&#8942;&#8942;</div>
+                <div class="vsc-activitybar__icon">&#9654;</div>
+                <div class="vsc-activitybar__icon">&#129513;</div>
+              </div>
+              <div class="vsc-sidebar">
+                <div class="vsc-sidebar__title">explorador</div>
+                <div class="vsc-tree">
+                  <div class="vsc-tree__folder">&#9660; src</div>
+                  <div class="vsc-tree__file vsc-tree__file--active">&#128196; Inventory.module.luau</div>
+                </div>
+              </div>
+              <div class="vsc-editorarea">
+                <div class="vsc-tabs"><div class="vsc-tab is-active">Inventory.module.luau</div></div>
+                <div class="vsc-editor vsc-editor--with-ruler">
+                  <pre class="vsc-code" id="lease-code-block" title="passe o mouse pra ver o hoverMessage"><span class="ln">1</span><span class="tok-kw">local</span> Inventory = {}<span class="lease-label" id="lease-inline-label"> &#128274; Bloqueado por Ana</span>
+<span class="ln">2</span>
+<span class="ln">3</span><span class="tok-kw">function</span> <span class="tok-fn">Inventory.add</span>(player, itemId, amount)
+<span class="ln">4</span>	<span class="tok-cm">-- adiciona item ao inventário do jogador</span>
+<span class="ln">5</span><span class="tok-kw">end</span>
+<span class="ln">6</span>
+<span class="ln">7</span><span class="tok-kw">return</span> Inventory</pre>
+                  <div class="vsc-ruler" id="lease-ruler" title=""></div>
+                </div>
+              </div>
+            </div>
+            <div class="vsc-statusbar">
+              <div class="vsc-statusbar__left"><span>&#10003; main</span></div>
+              <div class="vsc-statusbar__right">
+                <span class="vsc-statusitem vsc-statusitem--warning" id="lease-statusbar-item">
+                  &#128274; <span id="lease-statusbar-text">Ana</span>
+                </span>
+                <span class="vsc-statusitem">
+                  <svg class="vsc-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="#cccccc" stroke-width="1.4"/></svg>
+                  SyncTeam :1400
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="lab" open>
+          <summary>Teste de texto / estado — Lease</summary>
+          <div class="lab__grid">
+            <label>Arquivo sob lease alheia?
+              <select data-lab="lease.locked">
+                <option value="true" selected>sim (bloqueado)</option>
+                <option value="false">não (livre)</option>
+              </select>
+            </label>
+            <label>Nome do dono da lease
+              <input type="text" data-lab="lease.owner" value="Ana" />
+            </label>
+            <label class="lab__grid-full">Rótulo inline (fim da 1ª linha)
+              <input type="text" data-lab="lease.label" value="&#128274; Bloqueado por {owner}" />
+            </label>
+            <label class="lab__grid-full">Mensagem de hover
+              <textarea rows="2" data-lab="lease.hover">SyncTeam: este arquivo está sob edição de {owner}. Suas alterações locais não serão sincronizadas enquanto a lease não for liberada (inatividade do outro lado) — edite com cuidado.</textarea>
+            </label>
+            <label class="lab__grid-full">Aviso ao salvar (Ctrl+S)
+              <textarea rows="2" data-lab="lease.saveWarning">SyncTeam: '{file}' está bloqueado para edição por {owner} — o Studio vai rejeitar esta alteração quando ela chegar lá.</textarea>
+            </label>
+          </div>
+          <button class="lab__action-btn" id="lease-save-btn" type="button">Simular Ctrl+S</button>
+          <p class="lab__hint">Use <code>{owner}</code> e <code>{file}</code> como placeholders nos textos acima. Passe o mouse na régua à direita do editor ou no rótulo pra ver o hover.</p>
+        </details>
+      </section>
+
+      <!-- ======================= VS CODE — REMOTE CURSOR ======================= -->
+      <section class="screen" id="screen-vscode-cursor">
+        <div class="screen-head">
+          <h1>VS Code — Cursor remoto de colaborador</h1>
+          <p>Porta de <code>RemoteCursorDecorations.ts</code>. Barra vertical pisca na cor do colaborador; nome só aparece em hover (badge colorido via HTML no tooltip), nunca desloca texto; seleção como overlay translúcido.</p>
+        </div>
+
+        <div class="stage">
+          <div class="vsc-window">
+            <div class="vsc-titlebar"><span>SyncTeam-exemplo — Visual Studio Code</span></div>
+            <div class="vsc-body">
+              <div class="vsc-activitybar">
+                <div class="vsc-activitybar__icon is-active">&#128193;</div>
+                <div class="vsc-activitybar__icon">&#128269;</div>
+                <div class="vsc-activitybar__icon">&#8942;&#8942;</div>
+                <div class="vsc-activitybar__icon">&#9654;</div>
+                <div class="vsc-activitybar__icon">&#129513;</div>
+              </div>
+              <div class="vsc-sidebar">
+                <div class="vsc-sidebar__title">explorador</div>
+                <div class="vsc-tree">
+                  <div class="vsc-tree__folder">&#9660; src</div>
+                  <div class="vsc-tree__file vsc-tree__file--active">&#128196; Shop.client.luau</div>
+                </div>
+              </div>
+              <div class="vsc-editorarea">
+                <div class="vsc-tabs"><div class="vsc-tab is-active">Shop.client.luau</div></div>
+                <div class="vsc-editor">
+                  <pre class="vsc-code" id="cursor-code-block"><span class="ln">1</span><span class="tok-kw">local</span> function <span class="tok-fn">openShop</span>(player)
+<span class="ln">2</span>	<span class="tok-kw">local</span> gold<span id="cursor-selection-span"> = player:GetAttribute(</span><span class="tok-str">"Gold"</span>)
+<span class="ln">3</span>	<span class="cursor-caret" id="cursor-caret-el"></span><span class="tok-kw">if</span> gold &gt;= <span class="tok-num">100</span> <span class="tok-kw">then</span>
+<span class="ln">4</span>		<span class="tok-cm">-- desbloqueia item premium</span>
+<span class="ln">5</span>	<span class="tok-kw">end</span>
+<span class="ln">6</span><span class="tok-kw">end</span></pre>
+                </div>
+              </div>
+            </div>
+            <div class="vsc-statusbar">
+              <div class="vsc-statusbar__left"><span>&#10003; main</span></div>
+              <div class="vsc-statusbar__right">
+                <span class="vsc-statusitem">
+                  <svg class="vsc-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="#cccccc"/></svg>
+                  SyncTeam :1400
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="lab" open>
+          <summary>Teste de texto / estado — Cursor remoto</summary>
+          <div class="lab__grid">
+            <label>Nome do colaborador
+              <input type="text" data-lab="cursor.name" value="Bruno" />
+            </label>
+            <label>Cor (paleta cíclica de 8)
+              <select data-lab="cursor.colorIndex">
+                <option value="0">1 — azul</option>
+                <option value="1">2 — vermelho</option>
+                <option value="2">3 — verde</option>
+                <option value="3">4 — amarelo</option>
+                <option value="4">5 — roxo</option>
+                <option value="5">6 — ciano</option>
+                <option value="6">7 — laranja</option>
+                <option value="7">8 — marrom</option>
+              </select>
+            </label>
+            <label>Mostrar seleção?
+              <select data-lab="cursor.showSelection">
+                <option value="true" selected>sim</option>
+                <option value="false">não</option>
+              </select>
+            </label>
+            <label>Pisca ativo?
+              <select data-lab="cursor.blink">
+                <option value="true" selected>sim</option>
+                <option value="false">não</option>
+              </select>
+            </label>
+          </div>
+          <p class="lab__hint">Passe o mouse sobre a barra piscante no código pra ver o badge de hover com o nome.</p>
+        </details>
+      </section>
+
+      <!-- ======================= VS CODE — FILE PRESENCE ======================= -->
+      <section class="screen" id="screen-vscode-presence">
+        <div class="screen-head">
+          <h1>VS Code — Presença no Explorer (badge)</h1>
+          <p>Porta de <code>FilePresenceDecorations.ts</code> — badge <code>●</code> colorido + tooltip no arquivo do Explorer que colaboradores remotos têm aberto.</p>
+        </div>
+
+        <div class="stage">
+          <div class="vsc-window">
+            <div class="vsc-titlebar"><span>SyncTeam-exemplo — Visual Studio Code</span></div>
+            <div class="vsc-body">
+              <div class="vsc-activitybar">
+                <div class="vsc-activitybar__icon is-active">&#128193;</div>
+                <div class="vsc-activitybar__icon">&#128269;</div>
+                <div class="vsc-activitybar__icon">&#8942;&#8942;</div>
+                <div class="vsc-activitybar__icon">&#9654;</div>
+                <div class="vsc-activitybar__icon">&#129513;</div>
+              </div>
+              <div class="vsc-sidebar vsc-sidebar--wide">
+                <div class="vsc-sidebar__title">explorador</div>
+                <div class="vsc-tree" id="presence-tree">
+                  <div class="vsc-tree__folder">&#9660; src</div>
+                  <!-- linhas de arquivo geradas por app.js a partir do estado -->
+                </div>
+              </div>
+              <div class="vsc-editorarea">
+                <div class="vsc-tabs"><div class="vsc-tab is-active">PlayerController.server.luau</div></div>
+                <div class="vsc-editor">
+                  <pre class="vsc-code"><span class="ln">1</span><span class="tok-cm">-- selecione um arquivo no Explorer à esquerda pra ver o badge de presença</span></pre>
+                </div>
+              </div>
+            </div>
+            <div class="vsc-statusbar">
+              <div class="vsc-statusbar__left"><span>&#10003; main</span></div>
+              <div class="vsc-statusbar__right">
+                <span class="vsc-statusitem">
+                  <svg class="vsc-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="#cccccc"/></svg>
+                  SyncTeam :1400
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="lab" open>
+          <summary>Teste de texto / estado — Presença no Explorer</summary>
+          <div class="lab__rows" id="presence-rows-editor"><!-- gerado por app.js --></div>
+          <p class="lab__hint">Deixe o campo de colaboradores vazio pra simular "sem presença" (sem badge). Passe o mouse no badge ● pra ver o tooltip com os nomes.</p>
+        </details>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="disclaimer-footer">
+    SyncTeam — design preview estático · sem build step · sem conexão com o plugin/extensão reais · <code>design-preview/</code>
+  </footer>
+
+  <!-- Tooltip customizado compartilhado (hoje só usado pelo badge de hover do
+       cursor remoto — precisa de HTML/cor, o que o atributo title nativo não
+       permite; ver app.js wireCursorHover). -->
+  <div class="st-tooltip" id="st-shared-tooltip"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

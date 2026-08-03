@@ -2,7 +2,7 @@
 // Ver src/ui/leaseBorderState.ts — não importa `vscode`.
 
 import { describe, test, expect } from "vitest";
-import { computeLeaseBorderState, STRINGS } from "../src/ui/leaseBorderState.js";
+import { computeLeaseBorderState, buildLeaseStatusBarVisual, STRINGS } from "../src/ui/leaseBorderState.js";
 import { LeaseTracker } from "../src/sync/LeaseTracker.js";
 
 describe("computeLeaseBorderState", () => {
@@ -56,5 +56,30 @@ describe("STRINGS (leaseBorderState)", () => {
 
   test("fallbackOwnerName existe para quando describeOwner não tem nome", () => {
     expect(STRINGS.fallbackOwnerName.length).toBeGreaterThan(0);
+  });
+});
+
+// Revisão 2026-08-02 (docs/DECISIONS.md, "3ª rodada" seção 3): item de status
+// bar novo que substitui o overlay de fundo removido de LeaseBorderDecoration.
+describe("buildLeaseStatusBarVisual", () => {
+  test("sem lock (locked: false): item fica oculto, sem texto/tooltip", () => {
+    const visual = buildLeaseStatusBarVisual({ locked: false, ownerName: null });
+    expect(visual.visible).toBe(false);
+    expect(visual.text).toBe("");
+    expect(visual.tooltip).toBe("");
+  });
+
+  test("com lock: visível, texto com codicon $(lock) e nome do dono", () => {
+    const visual = buildLeaseStatusBarVisual({ locked: true, ownerName: "Alice" });
+    expect(visual.visible).toBe(true);
+    expect(visual.text).toContain("$(lock)");
+    expect(visual.text).toContain("Alice");
+    expect(visual.tooltip).toContain("Alice");
+  });
+
+  test("com lock sem ownerName: usa fallbackOwnerName", () => {
+    const visual = buildLeaseStatusBarVisual({ locked: true, ownerName: null });
+    expect(visual.text).toContain(STRINGS.fallbackOwnerName);
+    expect(visual.tooltip).toContain(STRINGS.fallbackOwnerName);
   });
 });

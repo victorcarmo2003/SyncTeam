@@ -10,10 +10,15 @@
 
 import { describe, test, expect } from "vitest";
 import net from "node:net";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { WebSocket } from "ws";
 import { SyncServer } from "../src/sync/SyncServer.js";
 import { PROTOCOL_VERSION, type RawMessage } from "../src/protocol.js";
-import { createNullLogger } from "../src/util/logger.js";
+import { createNullLogger, type Logger } from "../src/util/logger.js";
+import { MAX_PORT } from "../src/util/port.js";
+import { readPortLock } from "../src/sync/PortOwnership.js";
 
 /** Pega uma porta TCP livre pedindo ao SO uma efêmera e fechando em seguida. */
 function getFreePort(): Promise<number> {
@@ -51,6 +56,33 @@ function openClient(port: number): Promise<WebSocket> {
     client.once("open", () => resolve(client));
     client.once("error", reject);
   });
+}
+
+/** Ocupa `port` de verdade com um `net.Server` simples (simula "outro processo" já usando a porta). */
+function occupyPort(port: number): Promise<net.Server> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(port, "127.0.0.1", () => resolve(srv));
+  });
+}
+
+function closeServer(srv: net.Server): Promise<void> {
+  return new Promise((resolve) => srv.close(() => resolve()));
+}
+
+/** Logger que acumula as linhas para os testes de fallback de porta poderem inspecionar o texto exato. */
+class CapturingLogger implements Logger {
+  lines: string[] = [];
+  info(message: string): void {
+    this.lines.push(`INFO ${message}`);
+  }
+  warn(message: string): void {
+    this.lines.push(`WARN ${message}`);
+  }
+  error(message: string): void {
+    this.lines.push(`ERROR ${message}`);
+  }
 }
 
 describe("SyncServer — heartbeat", () => {
@@ -422,6 +454,317 @@ describe("SyncServer — multiSync", () => {
     expect(server.isClientConnected()).toBe(true);
 
     second.terminate();
+    await server.stop();
+  });
+});
+
+// Fallback automático de porta ocupada (2026-08-02, .claude/rules/authority.md
+// — "porta ocupada: cai para porta alternativa, com aviso visível, nunca mata
+// processo alheio"). Esquema exato documentado em docs/DECISIONS.md: em
+// EADDRINUSE, tenta port+1, port+2, ... até `portFallbackAttempts` vezes
+// (default 5), nunca ultrapassando MAX_PORT. Ocupamos a porta de verdade com
+// um `net.Server` simples (simula "outro processo já usando a porta") em vez
+// de mockar `ws` — mesma filosofia de teste já usada neste arquivo (sockets
+// reais em vez de fakes).
+describe("SyncServer — fallback de porta ocupada", () => {
+  test("porta configurada ocupada: cai para a próxima porta livre, reporta getActualPort() correto e loga com clareza", async () => {
+    const port = await getFreePort();
+    const occupier = await occupyPort(port);
+    const logger = new CapturingLogger();
+    const server = new SyncServer(port, logger);
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+
+    expect(server.getConfiguredPort()).toBe(port);
+    expect(server.getActualPort()).toBe(port + 1);
+
+    // Log claro sobre o quê aconteceu: porta original ocupada + porta real em uso — nada de matar processo.
+    const fallbackLine = logger.lines.find((line) => line.includes("estava ocupada"));
+    expect(fallbackLine).toBeDefined();
+    expect(fallbackLine).toContain(String(port));
+    expect(fallbackLine).toContain(String(port + 1));
+    expect(fallbackLine).toContain("nenhum processo de terceiro foi encerrado");
+
+    // O servidor está de fato funcional na porta de fallback, não só nos bookkeeping fields.
+    const client = await openClient(port + 1);
+    client.send(JSON.stringify({ kind: "hello", protocolVersion: PROTOCOL_VERSION, role: "studio" }));
+    await waitFor(() => server.isClientConnected());
+
+    client.terminate();
+    await server.stop();
+    expect(server.getActualPort()).toBeNull();
+    await closeServer(occupier);
+  });
+
+  test("todas as tentativas de fallback esgotadas: rejeita com EADDRINUSE, sem matar nenhum processo", async () => {
+    const port = await getFreePort();
+    const occupiers = [await occupyPort(port), await occupyPort(port + 1), await occupyPort(port + 2)];
+    const logger = new CapturingLogger();
+    // portFallbackAttempts=2 -> tenta port, port+1, port+2 (3 no total) — todas ocupadas.
+    const server = new SyncServer(port, logger, { portFallbackAttempts: 2 });
+
+    let caught: NodeJS.ErrnoException | null = null;
+    try {
+      await server.start();
+    } catch (error) {
+      caught = error as NodeJS.ErrnoException;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught?.code).toBe("EADDRINUSE");
+    expect(server.getActualPort()).toBeNull();
+    expect(server.getConfiguredPort()).toBe(port);
+
+    // As 3 tentativas foram logadas, e a mensagem final confirma que nenhum processo foi encerrado.
+    expect(logger.lines.some((line) => line.includes(String(port)) && line.includes("ocupada"))).toBe(true);
+    expect(logger.lines.some((line) => line.includes(String(port + 1)) && line.includes("ocupada"))).toBe(true);
+    expect(logger.lines.some((line) => line.includes(String(port + 2)) && line.includes("esgotadas"))).toBe(true);
+    expect(logger.lines.some((line) => line.includes("nenhum processo de terceiro foi encerrado"))).toBe(true);
+
+    for (const occupier of occupiers) {
+      await closeServer(occupier);
+    }
+  });
+
+  test("portFallbackAttempts: 0 desliga o fallback por completo (falha na porta ocupada mesmo com a próxima livre)", async () => {
+    const port = await getFreePort();
+    const occupier = await occupyPort(port);
+    const logger = new CapturingLogger();
+    const server = new SyncServer(port, logger, { portFallbackAttempts: 0 });
+
+    let caught: NodeJS.ErrnoException | null = null;
+    try {
+      await server.start();
+    } catch (error) {
+      caught = error as NodeJS.ErrnoException;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught?.code).toBe("EADDRINUSE");
+    expect(server.getActualPort()).toBeNull();
+    // Nunca tentou a porta alternativa — nenhuma linha de log de tentativa de fallback.
+    expect(logger.lines.some((line) => line.includes("tentando a porta alternativa"))).toBe(false);
+
+    await closeServer(occupier);
+  });
+
+  test("erro de bind que NÃO é EADDRINUSE (porta inválida) rejeita imediatamente, sem tentar fallback", async () => {
+    const logger = new CapturingLogger();
+    // Porta fora do intervalo válido de TCP/IP: Node rejeita antes mesmo de
+    // emitir 'error' (validação síncrona), então nunca chega a existir uma
+    // condição "EADDRINUSE" — exercita o mesmo contrato observável (rejeita
+    // sem NENHUMA tentativa de fallback), sem depender de EACCES específico
+    // de SO (não portável entre Windows/Unix).
+    const server = new SyncServer(70000, logger);
+
+    let caught: Error | null = null;
+    try {
+      await server.start();
+    } catch (error) {
+      caught = error as Error;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(server.getActualPort()).toBeNull();
+    expect(logger.lines.some((line) => line.includes("tentando a porta alternativa"))).toBe(false);
+  });
+
+  test("respeita MAX_PORT: não tenta uma porta acima do limite válido", async () => {
+    const occupier = await occupyPort(MAX_PORT);
+    const logger = new CapturingLogger();
+    const server = new SyncServer(MAX_PORT, logger, { portFallbackAttempts: 3 });
+
+    let caught: NodeJS.ErrnoException | null = null;
+    try {
+      await server.start();
+    } catch (error) {
+      caught = error as NodeJS.ErrnoException;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught?.code).toBe("EADDRINUSE");
+    expect(server.getActualPort()).toBeNull();
+    expect(logger.lines.some((line) => line.includes("não há mais portas candidatas"))).toBe(true);
+
+    await closeServer(occupier);
+  });
+});
+
+// "Posse de porta" (2026-08-02, docs/DECISIONS.md 3ª rodada,
+// .claude/rules/authority.md "Matar processo de terceiro"): antes de cair no
+// fallback automático de sempre (port+1...), a porta CONFIGURADA ocupada dá
+// ao hook `onPortOccupied` uma chance de identificar+encerrar o processo e
+// pedir um retry na MESMA porta. A decisão real (probe/detecção/diálogo) vive
+// em `PortOwnership.ts` (testada em `test/portOwnership.test.ts`) — aqui só
+// testamos a ORQUESTRAÇÃO do hook dentro de `tryListen` (quando é chamado,
+// quantas vezes, o que acontece com cada decisão), com um hook FAKE simples
+// (nunca mata processo de verdade — só fecha o `net.Server` de teste que
+// ocupava a porta, simulando "o processo foi encerrado com sucesso").
+describe("SyncServer — posse de porta (onPortOccupied hook)", () => {
+  test("retrySamePort reconquista a porta CONFIGURADA (nunca cai para port+1) e expõe getLastReclaimed()", async () => {
+    const port = await getFreePort();
+    const occupier = await occupyPort(port);
+    const logger = new CapturingLogger();
+    let hookCalls = 0;
+    const server = new SyncServer(port, logger, {
+      onPortOccupied: async (info) => {
+        hookCalls++;
+        expect(info).toEqual({ requestedPort: port, occupiedPort: port });
+        await closeServer(occupier); // simula "processo identificado foi encerrado com sucesso"
+        return { action: "retrySamePort", reclaimed: { pid: 4242, processName: "Code.exe" } };
+      },
+    });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+
+    expect(hookCalls).toBe(1);
+    expect(server.getActualPort()).toBe(port); // a MESMA porta configurada, nunca port+1
+    expect(server.getLastReclaimed()).toEqual({ pid: 4242, processName: "Code.exe" });
+
+    await server.stop();
+  });
+
+  test('decisão "fallback" do hook preserva o comportamento automático de sempre (port+1), getLastReclaimed() fica null', async () => {
+    const port = await getFreePort();
+    const occupier = await occupyPort(port);
+    const logger = new CapturingLogger();
+    let hookCalls = 0;
+    const server = new SyncServer(port, logger, {
+      onPortOccupied: async () => {
+        hookCalls++;
+        return { action: "fallback" };
+      },
+    });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+
+    expect(hookCalls).toBe(1);
+    expect(server.getActualPort()).toBe(port + 1);
+    expect(server.getLastReclaimed()).toBeNull();
+
+    await server.stop();
+    await closeServer(occupier);
+  });
+
+  test("o hook NUNCA é chamado para portas já de fallback — só para a porta CONFIGURADA", async () => {
+    const port = await getFreePort();
+    const occupiers = [await occupyPort(port), await occupyPort(port + 1)];
+    const logger = new CapturingLogger();
+    let hookCalls = 0;
+    const server = new SyncServer(port, logger, {
+      portFallbackAttempts: 3,
+      onPortOccupied: async (info) => {
+        hookCalls++;
+        expect(info.occupiedPort).toBe(port);
+        return { action: "fallback" };
+      },
+    });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+
+    expect(hookCalls).toBe(1); // nunca chamado de novo para port+1 (também ocupada)
+    expect(server.getActualPort()).toBe(port + 2);
+
+    await server.stop();
+    for (const occupier of occupiers) {
+      await closeServer(occupier);
+    }
+  });
+
+  test("hook que rejeita (lança) cai no fallback automático sem travar nem propagar o erro", async () => {
+    const port = await getFreePort();
+    const occupier = await occupyPort(port);
+    const logger = new CapturingLogger();
+    const server = new SyncServer(port, logger, {
+      onPortOccupied: async () => {
+        throw new Error("falha simulada ao tentar posse da porta");
+      },
+    });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+
+    expect(server.getActualPort()).toBe(port + 1);
+    expect(logger.lines.some((line) => line.includes("falha simulada ao tentar posse da porta"))).toBe(true);
+
+    await server.stop();
+    await closeServer(occupier);
+  });
+
+  test("retrySamePort otimista que NÃO libera a porta de fato cai no fallback normal, hook chamado no máximo 1 vez (nunca em loop)", async () => {
+    const port = await getFreePort();
+    const occupier = await occupyPort(port); // nunca fechado — a porta continua ocupada de verdade
+    const logger = new CapturingLogger();
+    let hookCalls = 0;
+    const server = new SyncServer(port, logger, {
+      onPortOccupied: async () => {
+        hookCalls++;
+        return { action: "retrySamePort" }; // otimista, mas ninguém liberou a porta de verdade
+      },
+    });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+
+    expect(hookCalls).toBe(1);
+    expect(server.getActualPort()).toBe(port + 1); // caiu no fallback normal depois do retry falhar de novo
+
+    await server.stop();
+    await closeServer(occupier);
+  });
+});
+
+// Lockfile de "posse de porta" (2026-08-02): grava PID+porta a cada bind
+// bem-sucedido para uma tentativa FUTURA de bind na mesma porta reconhecer
+// "isto é uma instância órfã do próprio SyncTeam" (ver `PortOwnership.ts`).
+describe("SyncServer — portLockDir (lockfile de posse)", () => {
+  test("grava o lockfile (PID desta instância) no bind bem-sucedido e remove no stop()", async () => {
+    const port = await getFreePort();
+    const lockDir = fs.mkdtempSync(path.join(os.tmpdir(), "syncteam-portlock-server-"));
+    const server = new SyncServer(port, createNullLogger(), { portLockDir: lockDir });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+    const lock = readPortLock(lockDir, port);
+    expect(lock).not.toBeNull();
+    expect(lock?.pid).toBe(process.pid);
+    expect(lock?.port).toBe(port);
+
+    await server.stop();
+    expect(readPortLock(lockDir, port)).toBeNull();
+  });
+
+  test("o lockfile reflete a porta REAL (fallback), não a configurada", async () => {
+    const port = await getFreePort();
+    const occupier = await occupyPort(port);
+    const lockDir = fs.mkdtempSync(path.join(os.tmpdir(), "syncteam-portlock-fallback-"));
+    const server = new SyncServer(port, createNullLogger(), { portLockDir: lockDir });
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+    expect(server.getActualPort()).toBe(port + 1);
+    expect(readPortLock(lockDir, port)).toBeNull(); // nunca conseguiu bindar a porta configurada
+    const lock = readPortLock(lockDir, port + 1);
+    expect(lock?.pid).toBe(process.pid);
+    expect(lock?.port).toBe(port + 1);
+
+    await server.stop();
+    await closeServer(occupier);
+  });
+
+  test("sem portLockDir (padrão): nenhum lockfile é gravado — comportamento anterior à feature preservado", async () => {
+    const port = await getFreePort();
+    const lockDir = fs.mkdtempSync(path.join(os.tmpdir(), "syncteam-portlock-off-"));
+    const server = new SyncServer(port, createNullLogger()); // sem portLockDir
+    server.setHandlers({ onClientConnected: () => {}, onClientDisconnected: () => {}, onSpontaneous: () => {} });
+
+    await server.start();
+    expect(readPortLock(lockDir, port)).toBeNull(); // diretório nem foi tocado
+
     await server.stop();
   });
 });

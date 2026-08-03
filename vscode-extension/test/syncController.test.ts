@@ -267,3 +267,310 @@ describe("SyncController — feedback visível de setPort", () => {
     expect(host.startCalls).toBe(0);
   });
 });
+
+// Fallback automático de porta ocupada (2026-08-02, .claude/rules/authority.md):
+// quando startService() reporta uma actualPort diferente da pedida, o
+// controlador precisa (a) anunciar isso de forma clara e diferente do sucesso
+// normal, (b) atualizar getConnectionState().port para a porta REAL (é o que
+// a status bar/ui-dev consulta), e (c) expor portFallbackFrom para quem quiser
+// destacar a diferença.
+describe("SyncController — fallback automático de porta ocupada", () => {
+  let host: FakeHost;
+  let controller: SyncController;
+
+  beforeEach(() => {
+    host = new FakeHost();
+    controller = makeController(host);
+  });
+
+  test("start com fallback: anuncia a porta original ocupada e a porta real, e getConnectionState reflete a porta real", async () => {
+    host.configuredPort = 1400;
+    host.nextStartResult = { ok: true, actualPort: 1401 };
+
+    await controller.start();
+
+    expect(host.errors).toHaveLength(0);
+    expect(host.infos).toHaveLength(1);
+    expect(host.infos[0]).toContain("1400");
+    expect(host.infos[0]).toContain("1401");
+    expect(host.infos[0]).toContain("ocupada");
+
+    const state = controller.getConnectionState();
+    expect(state.running).toBe(true);
+    expect(state.port).toBe(1401); // a porta REAL, não a configurada
+    expect(state.portFallbackFrom).toBe(1400);
+  });
+
+  test("start sem fallback (actualPort igual à pedida, ou ausente): mensagem normal, sem portFallbackFrom", async () => {
+    host.configuredPort = 1400;
+    host.nextStartResult = { ok: true, actualPort: 1400 }; // host devolveu explicitamente igual à pedida
+
+    await controller.start();
+
+    expect(host.infos[0]).toContain("iniciado na porta 1400");
+    expect(host.infos[0]).not.toContain("ocupada");
+    expect(controller.getConnectionState().port).toBe(1400);
+    expect(controller.getConnectionState().portFallbackFrom).toBeUndefined();
+  });
+
+  test("start que falha nunca define portFallbackFrom", async () => {
+    host.nextStartResult = { ok: false, reason: "todas as portas ocupadas" };
+
+    await controller.start();
+
+    expect(controller.getConnectionState().portFallbackFrom).toBeUndefined();
+  });
+
+  test("restart com fallback também anuncia e atualiza a porta real", async () => {
+    host.configuredPort = 2000;
+    host.nextStartResult = { ok: true, actualPort: 2003 };
+
+    await controller.restart();
+
+    expect(host.infos.some((m) => m.includes("2000") && m.includes("2003"))).toBe(true);
+    expect(controller.getConnectionState().port).toBe(2003);
+    expect(controller.getConnectionState().portFallbackFrom).toBe(2000);
+  });
+
+  test("um start com fallback seguido de outro SEM fallback limpa portFallbackFrom", async () => {
+    host.configuredPort = 1400;
+    host.nextStartResult = { ok: true, actualPort: 1401 };
+    await controller.start();
+    expect(controller.getConnectionState().portFallbackFrom).toBe(1400);
+
+    await controller.stop();
+    host.nextStartResult = { ok: true }; // porta livre desta vez, sem fallback
+    await controller.start();
+
+    expect(controller.getConnectionState().portFallbackFrom).toBeUndefined();
+    expect(controller.getConnectionState().port).toBe(1400);
+  });
+
+  // Bug real achado pelo code-reviewer (2026-08-02, rodando teste de verdade,
+  // não só leitura de código): stop() zerava `running` mas nunca recalculava
+  // currentPort/portFallbackFrom de volta para a porta CONFIGURADA — depois de
+  // um start com fallback seguido de stop(), getConnectionState() continuava
+  // devolvendo a porta de fallback com running:false, contradizendo o próprio
+  // doc-comment de ConnectionState.port ("enquanto parado, é a última porta
+  // CONFIGURADA lida").
+  test("start com fallback seguido de stop: getConnectionState volta para a porta CONFIGURADA, sem portFallbackFrom", async () => {
+    host.configuredPort = 1400;
+    host.nextStartResult = { ok: true, actualPort: 1401 };
+    await controller.start();
+    expect(controller.getConnectionState()).toMatchObject({
+      running: true,
+      port: 1401,
+      portFallbackFrom: 1400,
+    });
+
+    await controller.stop();
+
+    expect(controller.getConnectionState()).toMatchObject({
+      running: false,
+      port: 1400, // a porta CONFIGURADA original, não a de fallback
+    });
+    expect(controller.getConnectionState().portFallbackFrom).toBeUndefined();
+  });
+});
+
+// "Posse de porta" (2026-08-02, docs/DECISIONS.md 3ª rodada,
+// .claude/rules/authority.md "Matar processo de terceiro"): quando o host
+// reporta `portReclaimed` (um processo foi identificado e encerrado com
+// sucesso para liberar a porta CONFIGURADA), o controlador mostra uma
+// mensagem DISTINTA da de fallback — o servidor está na porta ORIGINALMENTE
+// pedida (nunca numa alternativa), então "fallback automático" seria
+// enganoso aqui.
+describe("SyncController — posse de porta reclamada (processo encerrado)", () => {
+  let host: FakeHost;
+  let controller: SyncController;
+
+  beforeEach(() => {
+    host = new FakeHost();
+    controller = makeController(host);
+  });
+
+  test("start com portReclaimed anuncia o PID/nome encerrado e a porta assumida — nunca menciona fallback", async () => {
+    host.configuredPort = 1400;
+    host.nextStartResult = { ok: true, portReclaimed: { pid: 4242, processName: "Code.exe" } };
+
+    await controller.start();
+
+    expect(host.errors).toHaveLength(0);
+    expect(host.infos).toHaveLength(1);
+    expect(host.infos[0]).toContain("1400");
+    expect(host.infos[0]).toContain("4242");
+    expect(host.infos[0]).toContain("Code.exe");
+    expect(host.infos[0]).toContain("encerrado com sucesso");
+    expect(host.infos[0]).not.toContain("fallback");
+
+    const state = controller.getConnectionState();
+    expect(state.running).toBe(true);
+    expect(state.port).toBe(1400); // a porta ORIGINALMENTE pedida, nunca uma alternativa
+    expect(state.portFallbackFrom).toBeUndefined();
+  });
+
+  test("start com portReclaimed sem processName (só PID) ainda mostra o PID claramente", async () => {
+    host.nextStartResult = { ok: true, portReclaimed: { pid: 999, processName: null } };
+
+    await controller.start();
+
+    expect(host.infos[0]).toContain("PID 999");
+  });
+
+  test("start sem portReclaimed (sucesso normal) continua com a mensagem de sempre, sem menção a processo encerrado", async () => {
+    host.configuredPort = 1400;
+    host.nextStartResult = { ok: true };
+
+    await controller.start();
+
+    expect(host.infos[0]).toContain("iniciado na porta 1400");
+    expect(host.infos[0]).not.toContain("encerrado");
+  });
+
+  test("restart com portReclaimed também anuncia a mensagem distinta", async () => {
+    host.configuredPort = 1400;
+    host.nextStartResult = { ok: true, portReclaimed: { pid: 555, processName: "python.exe" } };
+
+    await controller.restart();
+
+    expect(host.infos.some((m) => m.includes("555") && m.includes("python.exe") && m.includes("encerrado com sucesso"))).toBe(
+      true,
+    );
+  });
+});
+
+// Bug real achado pelo code-reviewer (2026-08-02, revisão da feature de
+// "posse de porta"): `running` só vira `true` DEPOIS que `host.startService`
+// resolve. Durante a janela em que o usuário está olhando o diálogo modal
+// "Encerrar processo / Usar porta alternativa" (que pode ficar bloqueado por
+// tempo arbitrário), nenhuma guarda barrava um segundo start/restart/setPort
+// — criava-se um SEGUNDO serviço, deixando o primeiro órfão se o diálogo
+// antigo fosse confirmado depois. Estes testes seguram a resolução de
+// `host.startService` manualmente (uma Promise controlada de fora, o mesmo
+// papel que `host.confirmKill` bloqueado cumpriria em produção) para simular
+// exatamente essa janela e confirmar que uma segunda chamada é rejeitada.
+describe("SyncController — reentrância durante start/restart/setPort pendente", () => {
+  let host: FakeHost;
+  let controller: SyncController;
+
+  function makeStartServiceGate(): {
+    install: () => void;
+    resolve: (result: StartServiceResult) => void;
+    getCalls: () => number;
+  } {
+    let resolveFn!: (result: StartServiceResult) => void;
+    const pending = new Promise<StartServiceResult>((resolve) => {
+      resolveFn = resolve;
+    });
+    let calls = 0;
+    return {
+      install: () => {
+        host.startService = async (port: number) => {
+          void port;
+          calls += 1;
+          return pending;
+        };
+      },
+      resolve: (result: StartServiceResult) => resolveFn(result),
+      getCalls: () => calls,
+    };
+  }
+
+  beforeEach(() => {
+    host = new FakeHost();
+    controller = makeController(host);
+  });
+
+  test("um segundo start() chamado enquanto o primeiro aguarda host.startService é rejeitado — só UM startService é chamado e só UM serviço acaba existindo", async () => {
+    const gate = makeStartServiceGate();
+    gate.install();
+
+    const firstStart = controller.start();
+    // Enquanto o primeiro start ainda está pendente (equivalente ao usuário
+    // olhando o diálogo "Encerrar processo / Usar porta alternativa"), um
+    // segundo start é disparado — deve ser rejeitado IMEDIATAMENTE, sem
+    // esperar o primeiro.
+    await controller.start();
+
+    expect(gate.getCalls()).toBe(1); // segunda chamada NÃO criou um segundo serviço
+    expect(host.infos.some((m) => m.includes("andamento"))).toBe(true);
+    expect(controller.getConnectionState().running).toBe(false); // primeiro ainda pendente
+
+    gate.resolve({ ok: true });
+    await firstStart;
+
+    expect(controller.getConnectionState().running).toBe(true);
+    // Depois que o primeiro terminou, a flag foi liberada — um novo start
+    // funciona normalmente (não fica travado para sempre).
+    host.infos.length = 0;
+    await controller.stop();
+    host.nextStartResult = { ok: true };
+    await controller.start();
+    expect(controller.getConnectionState().running).toBe(true);
+  });
+
+  test("restart() chamado enquanto um start() está pendente é rejeitado — não chama stopService nem um segundo startService", async () => {
+    const gate = makeStartServiceGate();
+    gate.install();
+
+    const firstStart = controller.start();
+    await controller.restart();
+
+    expect(gate.getCalls()).toBe(1);
+    expect(host.stopCalls).toBe(0); // restart rejeitado não chegou a chamar stopService
+    expect(host.infos.some((m) => m.includes("andamento"))).toBe(true);
+
+    gate.resolve({ ok: true });
+    await firstStart;
+    expect(controller.getConnectionState().running).toBe(true);
+  });
+
+  test("setPort() chamado enquanto um start() está pendente é rejeitado — nem prompta a porta nem persiste config", async () => {
+    const gate = makeStartServiceGate();
+    gate.install();
+
+    const firstStart = controller.start();
+    host.promptResult = "5555";
+    await controller.setPort();
+
+    expect(gate.getCalls()).toBe(1);
+    expect(host.setPortCalls).toHaveLength(0); // setPort rejeitado não persistiu nada
+    expect(host.infos.some((m) => m.includes("andamento"))).toBe(true);
+
+    gate.resolve({ ok: true });
+    await firstStart;
+    expect(controller.getConnectionState().running).toBe(true);
+  });
+
+  test("um segundo restart() chamado enquanto o primeiro restart está pendente é rejeitado — só UM startService é chamado", async () => {
+    const gate = makeStartServiceGate();
+    gate.install();
+
+    const firstRestart = controller.restart();
+    await controller.restart();
+
+    expect(gate.getCalls()).toBe(1);
+    expect(host.stopCalls).toBe(1); // só o primeiro restart chegou a chamar stopService
+
+    gate.resolve({ ok: true });
+    await firstRestart;
+    expect(controller.getConnectionState().running).toBe(true);
+  });
+
+  test("autostart (announce:false) pendente também bloqueia um start() explícito subsequente, mas sem popar mensagem para a checagem em si", async () => {
+    const gate = makeStartServiceGate();
+    gate.install();
+
+    const autostart = controller.start({ announce: false });
+    await controller.start(); // comando explícito do usuário, announce:true
+
+    expect(gate.getCalls()).toBe(1);
+    // A rejeição do segundo `start()` (announce:true) ainda avisa, mesmo o
+    // primeiro tendo sido silencioso.
+    expect(host.infos.some((m) => m.includes("andamento"))).toBe(true);
+
+    gate.resolve({ ok: true });
+    await autostart;
+    expect(controller.getConnectionState().running).toBe(true);
+  });
+});

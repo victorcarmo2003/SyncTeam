@@ -54,6 +54,7 @@ O que o RojoCoop **não** validou (e é a hipótese central do SyncTeam): replic
 - `spikes/` — código de validação descartável, um diretório por spike.
 - `plugin/` — (a partir do M1) plugin Studio em Luau, buildado com Rojo (`rojo build`) apenas como ferramenta de build.
 - `vscode-extension/` — (a partir do M1) extensão em TypeScript.
+- `cli/` — (a partir de 2026-08-03) `syncteam-cli`, CLI standalone em TypeScript/Bun distribuído via Rokit (mesmo mecanismo de `rojo`/`selene`/`stylua`/`lune`, ver `rokit.toml`). Projeto independente (não depende de `vscode-extension/`); compilado com `bun build --compile` para binário nativo por plataforma (`.rbxm` do plugin embutido em build time). Comandos hoje: `syncteam plugin install`, `syncteam extension install`, `syncteam port <porta>`, `syncteam start [--dir <pasta>]`, `syncteam stop`. Ver `cli/README.md`.
 - `.claude/` — agentes, regras, memória de agentes e resultados de pesquisa (ver abaixo).
 - `Tools/` — scripts para eu (a IA) testar sozinha contra os 2 Studios reais que o usuário deixa abertos (build+deploy do plugin, subir harness Node, ler log do Studio sem copiar/colar). Ver [Tools/README.md](Tools/README.md) antes de pedir ao usuário para colar Output — pode já dar pra ler direto.
 
@@ -62,6 +63,7 @@ O que o RojoCoop **não** validou (e é a hipótese central do SyncTeam): replic
 Regras que valem para toda sessão:
 
 @.claude/rules/workflow.md
+@.claude/rules/authority.md
 
 Regras por stack (carregar quando for tocar na área): [.claude/rules/luau.md](.claude/rules/luau.md) e [.claude/rules/typescript.md](.claude/rules/typescript.md).
 
@@ -71,8 +73,12 @@ Regras por stack (carregar quando for tocar na área): [.claude/rules/luau.md](.
 - `luau-dev` — plugin Studio, Luau, schema Team Create.
 - `extension-dev` — extensão VS Code, TypeScript, harness Node.
 - `ui-dev` — tudo que o usuário vê (decorações, painéis, widgets, textos de UI).
+- `code-reviewer` — revisão de diff/PR nas duas stacks; só reporta, nunca corrige.
+- `qa-tester` — roda/expande testes, tooling de teste e debug (skill [ts-debug-tests](.claude/skills/ts-debug-tests/SKILL.md) já disponível pro lado TS; lado Luau pendente pesquisa).
 
 Cada agente mantém memória própria em `.claude/agent-memory/<nome>.md`. Antes de codar sobre API nova, os agentes de código consultam `.claude/research/`; sem resposta lá, a tarefa volta ao `researcher`.
+
+Obstáculo recuperável (porta ocupada, cache sujo, retry transitório): agentes têm autoridade limitada pra decidir e seguir sozinhos — ver `.claude/rules/authority.md`. Ação destrutiva/irreversível continua exigindo o usuário.
 
 ## Disciplina de trabalho
 

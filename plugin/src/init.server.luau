@@ -20,12 +20,15 @@
 -- alterna um DockWidgetPluginGui (painel de status construído com Vide, ver
 -- plugin/src/ui/PluginUI.luau) — este arquivo continua sendo o ÚNICO dono da
 -- lógica de conexão/sessão; PluginUI só invoca callbacks (onConnect/
--- onDisconnect/onPortChange/onAutoReconnectToggle) e reflete estado
--- (setConnectionStatus/setPort), nunca reimplementa nada de
--- start()/stop()/troca de porta. 2026-07-20: a tela de configurações do
--- painel ganhou um toggle real para Config.AUTOSTART_SETTING_KEY
+-- onDisconnect/onPortChange/onAutoReconnectToggle/onResyncRequest) e reflete
+-- estado (setConnectionStatus/setPort/setResyncState), nunca reimplementa
+-- nada de start()/stop()/troca de porta. 2026-07-20: a tela de configurações
+-- do painel ganhou um toggle real para Config.AUTOSTART_SETTING_KEY
 -- (onAutoReconnectToggle abaixo, perto de PluginUI.init) — a setting já
--- existia desde 2026-07-16, só sem UI dedicada.
+-- existia desde 2026-07-16, só sem UI dedicada. 2026-08-02 (docs/DECISIONS.md
+-- "5ª rodada"): botão RESYNC — onResyncRequest envia a mensagem espontânea
+-- resyncRequest e handleMessage trata a resposta resyncResult (ver os dois,
+-- mais abaixo).
 --
 -- Fora de escopo aqui (ver docs/MILESTONES.md): UX de lease no VS Code
 -- (M3.3, delegado a ui-dev); renderização de cursores/seleções na extensão
@@ -56,7 +59,15 @@ local SourceWatcher = require(script.SourceWatcher)
 local TeamCreateElection = require(script.TeamCreateElection)
 local TeamCreateLease = require(script.TeamCreateLease)
 local TeamCreatePresence = require(script.TeamCreatePresence)
+local TeamCreateUndoGuard = require(script.TeamCreateUndoGuard)
 local PluginUI = require(script.ui.PluginUI)
+-- ReSync (2026-08-02, docs/DECISIONS.md "5ª rodada"): usado só para o toast
+-- de erro do resyncResult (ok=false) abaixo, em handleMessage — chamada
+-- DIRETA (Toast.show(text, severity)), não via Logger.notify/PluginUI.notify
+-- (que é incondicional à preferência "Mostrar notificações" e sem conceito
+-- de severidade): aqui é resposta imediata a uma ação explícita do usuário
+-- (clique no botão RESYNC), então sempre aparece.
+local Toast = require(script.ui.Toast)
 
 local enabled = false
 local currentToken = 0
@@ -147,24 +158,39 @@ local log = Logger.log
 local notify = Logger.notify
 
 -- sendMessage é a própria função que o Logger usa para encaminhar logs pela
--- conexão WS (injetada em Logger.init(sendMessage) dentro de start()) — os
--- dois logs internos abaixo usam `print` PURO, nunca `log`/`Logger.log`.
--- Motivo (evitar recursão, ver Logger.luau): se usassem `log`, uma falha de
--- envio disparia Logger.log -> sendMessage -> (falha de novo) -> log da
--- falha via Logger.log -> sendMessage de novo, sem saída natural do ciclo.
--- Formato do print mantido idêntico ao de antes desta tarefa.
+-- conexão WS (injetada em Logger.init(sendMessage) dentro de start()) — o log
+-- de falha de envio abaixo usa `print` PURO, nunca `log`/`Logger.log`. Motivo
+-- (evitar recursão, ver Logger.luau): se usasse `log`, uma falha de :Send()
+-- disparia Logger.log -> sendMessage -> (a MESMA falha de novo, ainda
+-- quebrada) -> log da falha via Logger.log -> sendMessage de novo, sem saída
+-- natural do ciclo (este branch não tem nenhum guard por `kind`).
+--
+-- 2026-08-02 (pedido do usuário: "limpar os prints do output, pode retirar
+-- todos" — ver docs/DECISIONS.md): o branch "sem conexão" (client == nil)
+-- abaixo DEIXOU de imprimir por completo — antes avisava "descartado (sem
+-- conexão): <kind>" via print PURO para toda mensagem de protocolo (não-log)
+-- descartada. Removido, e não só rebaixado, porque (a) é ALTA FREQUÊNCIA na
+-- prática: dispara a cada mensagem espontânea de qualquer módulo
+-- (sourceChanged, presenceUpdate, leaseChanged, scriptAdded...) sempre que o
+-- plugin roda com a sessão Team Create ativa mas sem a extensão VS Code
+-- conectada (ex.: antes do usuário abrir o VS Code, ou durante qualquer
+-- janela de reconexão com um colega ativo do outro lado) — exatamente o
+-- padrão "rotineiro" que o resto desta tarefa suprimiu, não um "erro raro";
+-- e (b) não existe PERDA de observabilidade real: `client == nil` significa,
+-- por definição, que o encaminhamento por WS já está indisponível NESTE
+-- exato instante, então não havia nenhum canal (Output ou WS/Tools) capaz de
+-- reportar isso de forma diferente de um print cru mesmo antes desta
+-- mudança. Mantido só o early return (mensagem descartada em silêncio).
+--
+-- O branch de "falha ao enviar" logo abaixo é DIFERENTE e foi mantido como
+-- print cru de propósito: `client` existe (parecia conectado) e a própria
+-- chamada `:Send()` lançou erro — um caminho de erro genuíno e raro (WS
+-- quebrou sem que Closed/Error tivessem disparado ainda), não ruído
+-- rotineiro, e é o ÚNICO canal restante para relatar essa falha específica
+-- (o próprio envio, inclusive de um log via WS, é o que está falhando no
+-- instante exato do erro).
 local function sendMessage(message)
 	if client == nil then
-		-- kind == "log" é o próprio Logger.log tentando se auto-encaminhar
-		-- pela conexão WS (ver Logger.luau) — o conteúdo já apareceu no
-		-- Output via print() dentro de Logger.log; avisar "descartado" aqui
-		-- é só ruído duplicado, não uma falha real. Mensagens de protocolo de
-		-- verdade (scriptAdded, presenceUpdate, etc.) continuam avisando,
-		-- porque isso é informação útil para depurar por que algo não
-		-- chegou na extensão.
-		if message.kind ~= "log" then
-			print(("[SyncTeam %s]"):format(os.date("%H:%M:%S")), "descartado (sem conexão):", tostring(message.kind))
-		end
 		return
 	end
 	local ok, err = pcall(function()
@@ -211,7 +237,8 @@ local function handleWriteSource(message)
 		-- afetado por esta checagem — é assim que um pacote novo chega ao
 		-- Studio pela 1ª vez.
 		if Config.isInsideExcludedPackageFolder(instance) then
-			local blockedMessage = "edição bloqueada: script dentro de pasta de pacote vendorizado (Packages/ServerPackages/DevPackages) — não sincronizado ao vivo"
+			local blockedMessage =
+				"edição bloqueada: script dentro de pasta de pacote vendorizado (Packages/ServerPackages/DevPackages) — não sincronizado ao vivo"
 			sendMessage({
 				kind = "writeAck",
 				requestId = message.requestId,
@@ -219,10 +246,12 @@ local function handleWriteSource(message)
 				uuid = message.uuid,
 				error = blockedMessage,
 			})
-			log(("writeSource (update) uuid=%s -> BLOQUEADO (pasta vendorizada): %s"):format(
-				tostring(message.uuid),
-				instance:GetFullName()
-			))
+			log(
+				("writeSource (update) uuid=%s -> BLOQUEADO (pasta vendorizada): %s"):format(
+					tostring(message.uuid),
+					instance:GetFullName()
+				)
+			)
 			return
 		end
 
@@ -264,10 +293,12 @@ local function handleWriteSource(message)
 		-- no Output do Studio a cada edição. Erros de uuid desconhecido/bloqueio
 		-- de pasta vendorizada (acima, ainda `log`) continuam visíveis — são
 		-- raros/acionáveis, não rotina.
-		Logger.debug(("writeSource (update) uuid=%s -> %s"):format(
-			tostring(message.uuid),
-			if ok then detail else "ERRO: " .. tostring(detail)
-		))
+		Logger.debug(
+			("writeSource (update) uuid=%s -> %s"):format(
+				tostring(message.uuid),
+				if ok then detail else "ERRO: " .. tostring(detail)
+			)
+		)
 		return
 	end
 
@@ -301,11 +332,13 @@ local function handleWriteSource(message)
 	})
 	-- 2026-07-20 (BUG 2, mesmo critério do writeSource (update) acima):
 	-- rotineiro/alta frequência -> Logger.debug.
-	Logger.debug(("writeSource (create) '%s' -> uuid=%s %s"):format(
-		tostring(message.path),
-		tostring(uuid),
-		if ok then detail else "ERRO: " .. tostring(detail)
-	))
+	Logger.debug(
+		("writeSource (create) '%s' -> uuid=%s %s"):format(
+			tostring(message.path),
+			tostring(uuid),
+			if ok then detail else "ERRO: " .. tostring(detail)
+		)
+	)
 end
 
 -- Contrato aditivo (extensão -> plugin, docs/DECISIONS.md): o dev deleta um
@@ -350,7 +383,8 @@ local function handleDeleteScript(message)
 	-- também é bloqueado, para não destruir/perturbar uma árvore vendorizada
 	-- que pode divergir entre devs.
 	if Config.isInsideExcludedPackageFolder(instance) then
-		local blockedMessage = "delete bloqueado: script dentro de pasta de pacote vendorizado (Packages/ServerPackages/DevPackages) — não sincronizado ao vivo"
+		local blockedMessage =
+			"delete bloqueado: script dentro de pasta de pacote vendorizado (Packages/ServerPackages/DevPackages) — não sincronizado ao vivo"
 		sendMessage({
 			kind = "writeAck",
 			requestId = message.requestId,
@@ -358,10 +392,12 @@ local function handleDeleteScript(message)
 			uuid = message.uuid,
 			error = blockedMessage,
 		})
-		log(("deleteScript uuid=%s -> BLOQUEADO (pasta vendorizada): %s"):format(
-			tostring(message.uuid),
-			instance:GetFullName()
-		))
+		log(
+			("deleteScript uuid=%s -> BLOQUEADO (pasta vendorizada): %s"):format(
+				tostring(message.uuid),
+				instance:GetFullName()
+			)
+		)
 		return
 	end
 
@@ -400,10 +436,12 @@ local function handleDeleteScript(message)
 	-- (evento destrutivo) — mesmo critério já estabelecido
 	-- ("rotineiro/alta frequência = debug; raro/acionável = log") aponta para
 	-- manter Logger.log tanto no sucesso quanto no erro.
-	log(("deleteScript uuid=%s -> %s"):format(
-		tostring(message.uuid),
-		if ok then "destruído" else "ERRO: " .. tostring(err)
-	))
+	log(
+		("deleteScript uuid=%s -> %s"):format(
+			tostring(message.uuid),
+			if ok then "destruído" else "ERRO: " .. tostring(err)
+		)
+	)
 end
 
 local function handleReadSource(message)
@@ -433,6 +471,46 @@ local function handleListScripts(message)
 	})
 end
 
+-- ReSync (2026-08-02, docs/DECISIONS.md "5ª rodada"): espontânea, sem
+-- requestId (mesmo padrão de presenceUpdate/watchedRoots) — resposta da
+-- extensão ao `resyncRequest` disparado pelo clique no botão RESYNC do painel
+-- (ver `onResyncRequest` em PluginUI.init, mais abaixo). `message.ok == true`:
+-- a extensão apagou e repuxou tudo do Studio com sucesso — painel vai a
+-- "done" e volta sozinho a "idle" depois de RESYNC_DONE_HOLD_SECONDS (mesmo
+-- timing do mockup aprovado). `message.ok == false`: painel volta DIRETO a
+-- "idle" (nunca passa por "done") e um toast de erro avisa o motivo —
+-- `message.reason` é "cancelled_by_user" (usuário recusou o modal de
+-- confirmação do lado da extensão) ou uma mensagem de erro livre (falha real
+-- durante o reset). Mensagem ADITIVA — não bumpa Config.PROTOCOL_VERSION
+-- (mesmo precedente de watchedRoots/ping/leaseChanged).
+local RESYNC_DONE_HOLD_SECONDS = 1.2
+
+local function handleResyncResult(message)
+	if message.ok == true then
+		PluginUI.setResyncState("done")
+		log(("resyncResult: sucesso (%s arquivo(s) apagado(s)/repuxado(s))"):format(tostring(message.deletedCount)))
+		task.delay(RESYNC_DONE_HOLD_SECONDS, function()
+			PluginUI.setResyncState("idle")
+		end)
+		return
+	end
+
+	PluginUI.setResyncState("idle")
+	local reason = message.reason
+	local friendlyMessage
+	if reason == "cancelled_by_user" then
+		friendlyMessage = "ReSync cancelado: confirmação recusada no VS Code."
+	else
+		friendlyMessage = ("ReSync falhou: %s"):format(tostring(reason or "motivo desconhecido"))
+	end
+	-- Chamada DIRETA a Toast.show (ver comentário do require de Toast, no
+	-- topo do arquivo) — sempre visível, independente da preferência "Mostrar
+	-- notificações" (que só governa o canal Logger.notify/PluginUI.notify):
+	-- é resposta imediata a um clique explícito do usuário no botão RESYNC.
+	Toast.show(friendlyMessage, "erro")
+	log(("resyncResult: falha — %s"):format(tostring(reason)))
+end
+
 local function handleMessage(raw)
 	local ok, message = pcall(function()
 		return HttpService:JSONDecode(raw)
@@ -452,6 +530,22 @@ local function handleMessage(raw)
 		handleReadSource(message)
 	elseif message.kind == "listScripts" then
 		handleListScripts(message)
+	elseif message.kind == "watchedRoots" then
+		-- Extensão -> plugin, espontânea, 2026-07-29 (aditiva — NÃO bumpa
+		-- Config.PROTOCOL_VERSION, mesmo precedente de
+		-- ping/leaseChanged/presenceUpdate/connectionRejected). Contrato
+		-- completo em docs/DECISIONS.md e vscode-extension/src/protocol.ts
+		-- (WatchedRootsMessage): mandada 1x por conexão aceita, logo após o
+		-- hello ser validado e ANTES do primeiro listScripts. `roots` é uma
+		-- lista de nomes de Service (ex. "ReplicatedFirst") — ver
+		-- SourceWatcher.applyWatchedRoots para o que o plugin faz com ela
+		-- (substitui a fonte de verdade da lista fixa hardcoded de
+		-- Config.getWatchedRoots() por uma união fixa+dinâmica).
+		if type(message.roots) == "table" then
+			SourceWatcher.applyWatchedRoots(message.roots)
+		else
+			log("watchedRoots: campo 'roots' ausente/inválido, ignorado.")
+		end
 	elseif message.kind == "presenceUpdate" then
 		-- M4: espontânea, sem requestId, sem ack (spec docs/MILESTONES.md) —
 		-- só grava a própria Presence; TeamCreatePresence.updateOwnPresence já
@@ -482,8 +576,17 @@ local function handleMessage(raw)
 			lastRejectedPortToasted = activePort
 			notify(("porta %d já está em uso por outro Studio"):format(activePort or 0))
 		else
-			log(("porta %d já está em uso por outro Studio (rejeição repetida; toast já exibido)"):format(activePort or 0))
+			log(
+				("porta %d já está em uso por outro Studio (rejeição repetida; toast já exibido)"):format(
+					activePort or 0
+				)
+			)
 		end
+	elseif message.kind == "resyncResult" then
+		-- Mensagem ADITIVA (extensão -> plugin, espontânea, docs/DECISIONS.md
+		-- "5ª rodada") — mesmo padrão de "ping"/"watchedRoots": não bumpa
+		-- Config.PROTOCOL_VERSION.
+		handleResyncResult(message)
 	else
 		log("kind desconhecido/ignorado:", tostring(message.kind))
 	end
@@ -586,10 +689,12 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 			return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = url })
 		end)
 		if not ok then
-			log(("falha ao criar cliente WS (%s); nova tentativa em %ds"):format(
-				tostring(newClient),
-				Config.RECONNECT_SECONDS
-			))
+			log(
+				("falha ao criar cliente WS (%s); nova tentativa em %ds"):format(
+					tostring(newClient),
+					Config.RECONNECT_SECONDS
+				)
+			)
 			task.wait(Config.RECONNECT_SECONDS)
 			continue
 		end
@@ -605,22 +710,31 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 		-- (heartbeat da extensão a cada 5s) e para toda outra mensagem por igual.
 		local lastMessageAt = connectedAt
 		local connections = {}
-		table.insert(connections, newClient.MessageReceived:Connect(function(raw)
-			receivedAnyMessage = true
-			lastMessageAt = os.clock()
-			handleMessage(raw)
-		end))
-		table.insert(connections, newClient.Closed:Connect(function()
-			closed = true
-		end))
-		table.insert(connections, newClient.Error:Connect(function(code, errorMessage)
-			-- 2026-07-16: Logger.debug (ver Logger.luau) — um ConnectFail isolado
-			-- é ruído rotineiro do loop de reconexão (a linha visível de verdade
-			-- é "desconectado; reconectando em Xs" logo abaixo, categoria
-			-- "reconectando"); continua encaminhado por WS para diagnóstico.
-			Logger.debug(("erro WS %s %s"):format(tostring(code), tostring(errorMessage)))
-			closed = true
-		end))
+		table.insert(
+			connections,
+			newClient.MessageReceived:Connect(function(raw)
+				receivedAnyMessage = true
+				lastMessageAt = os.clock()
+				handleMessage(raw)
+			end)
+		)
+		table.insert(
+			connections,
+			newClient.Closed:Connect(function()
+				closed = true
+			end)
+		)
+		table.insert(
+			connections,
+			newClient.Error:Connect(function(code, errorMessage)
+				-- 2026-07-16: Logger.debug (ver Logger.luau) — um ConnectFail isolado
+				-- é ruído rotineiro do loop de reconexão (a linha visível de verdade
+				-- é "desconectado; reconectando em Xs" logo abaixo, categoria
+				-- "reconectando"); continua encaminhado por WS para diagnóstico.
+				Logger.debug(("erro WS %s %s"):format(tostring(code), tostring(errorMessage)))
+				closed = true
+			end)
+		)
 
 		client = newClient
 		sendHello()
@@ -655,9 +769,11 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 			-- por sua vez repõe o painel em "connecting" sozinho — não duplicamos
 			-- setConnectionStatus aqui).
 			if os.clock() - lastMessageAt >= Config.DEAD_CONNECTION_TIMEOUT_SECONDS then
-				log(("sem mensagens da extensão há %ds (provável queda sem close do WS); forçando reconexão"):format(
-					Config.DEAD_CONNECTION_TIMEOUT_SECONDS
-				))
+				log(
+					("sem mensagens da extensão há %ds (provável queda sem close do WS); forçando reconexão"):format(
+						Config.DEAD_CONNECTION_TIMEOUT_SECONDS
+					)
+				)
 				closed = true
 			end
 
@@ -673,8 +789,7 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 			-- como porta descoberta (SetSetting abaixo) — os dois errados. Ver
 			-- handleMessage/connectionRejected.
 			local stabilized = not connectionRejected
-				and (receivedAnyMessage
-					or (os.clock() - connectedAt) >= Config.PROBABLE_REJECTION_WINDOW_SECONDS)
+				and (receivedAnyMessage or (os.clock() - connectedAt) >= Config.PROBABLE_REJECTION_WINDOW_SECONDS)
 
 			-- Estado visual (item 1 da tarefa): só vira "connected" (vermelho)
 			-- ao estabilizar. Um ConnectFail nunca estabiliza (cai em
@@ -703,7 +818,7 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 				-- em que a conexão WS estabiliza — "sou o líder agora (term N)"
 				-- continua sendo logado separadamente por TeamCreateElection quando
 				-- de fato acontecer.
-				log(("conectado em %s (%d scripts observados)"):format(url, SourceWatcher.getWatchedCount()))
+				notify(("conectado em %s (%d scripts observados)"):format(url, SourceWatcher.getWatchedCount()))
 			end
 
 			-- Persistir assim que estabilizar (não espera a conexão cair) para
@@ -782,11 +897,13 @@ local function runConnection(myToken, ports, explicitAtStart, pluginObject)
 				-- Esgotou todas as candidatas nesta volta sem sucesso: volta
 				-- pro início da lista, mas com o RECONNECT_SECONDS normal (evita
 				-- busy-loop se nenhum harness estiver de pé em porta nenhuma).
-				log(("porta %d parece ocupada; todas as %d candidatas falharam, aguardando %ds antes de recomeçar"):format(
-					port,
-					#ports,
-					Config.RECONNECT_SECONDS
-				))
+				log(
+					("porta %d parece ocupada; todas as %d candidatas falharam, aguardando %ds antes de recomeçar"):format(
+						port,
+						#ports,
+						Config.RECONNECT_SECONDS
+					)
+				)
 				attemptsInLap = 0
 				index = nextIndex
 				task.wait(Config.RECONNECT_SECONDS)
@@ -805,7 +922,13 @@ end
 
 -- ------------------------------------------------------------ start/stop
 
-local function stop()
+-- item 2a da tarefa 2026-07-21: `silent` é true só quando quem chama é o guard
+-- de Run/Play (F8/F5) — suspender o sync por causa de um teste não é uma
+-- desconexão que o usuário pediu, então fica só no log (sem toast). Os outros
+-- 3 chamadores (Desconectar manual, o ciclo de troca de porta,
+-- plugin.Unloading) chamam stop() sem argumento (silent fica falsy) e
+-- continuam disparando o toast, já que são desconexões reais/deliberadas.
+local function stop(silent)
 	if not enabled then
 		return
 	end
@@ -846,7 +969,19 @@ local function stop()
 	-- cedo ao notar isso). runConnection NUNCA seta "disconnected" sozinho:
 	-- esse estado parado é responsabilidade exclusiva do stop().
 	PluginUI.setConnectionStatus("disconnected")
-	log("parado.")
+	-- BUG CORRIGIDO (2026-08-02, achado em auditoria de UI): sem isto, uma
+	-- desconexão (WS cai, extensão fecha, DISCONNECT manual) NO MEIO de um
+	-- RESYNC deixava o botão preso em "syncing" (amarelo, não clicável) pra
+	-- sempre — só resyncResult ou o próprio clique setavam "idle", e nenhum
+	-- dos dois chega se a conexão já caiu. stop() é o único ponto que sabe
+	-- com certeza que nenhum resyncResult vai mais chegar para o resync em
+	-- andamento, então é quem precisa resetar.
+	PluginUI.setResyncState("idle")
+	if silent then
+		log("parado.")
+	else
+		notify("parado.")
+	end
 end
 
 local function start(pluginObject)
@@ -895,14 +1030,20 @@ local function start(pluginObject)
 	Logger.initNotify(PluginUI.notify)
 	SourceWatcher.init(sendMessage)
 	SourceWatcher.start()
-	TeamCreateElection.start(if okUserId then resolvedUserId else 0)
+	-- pluginObject repassado (M4.5+, "Nome de exibição customizado") — TeamCreateElection
+	-- usa para Config.resolveCustomDisplayName no boot desta sessão de eleição.
+	TeamCreateElection.start(if okUserId then resolvedUserId else 0, pluginObject)
 	-- TeamCreateLease depois de TeamCreateElection: ensureIntent (chamado só
 	-- durante handleWriteSource, não aqui) depende de
 	-- TeamCreateElection.getSessionFolder() já existir. init() (M3.3) injeta o
 	-- mesmo callback sendMessage que SourceWatcher já usa, para o ciclo de
-	-- checkLeaseDrift poder emitir `leaseChanged` espontâneo.
+	-- checkLeaseDrift poder emitir `leaseChanged` espontâneo. pluginObject
+	-- repassado (2026-08-02, docs/DECISIONS.md "8ª rodada", handoff
+	-- quase-instantâneo de lease) — mesmo padrão de TeamCreateElection.start
+	-- acima: TeamCreateLease usa para Config.getPlaceSetting(...,
+	-- "leaseStaleAfterSeconds") a cada ciclo do líder.
 	TeamCreateLease.init(sendMessage)
-	TeamCreateLease.start()
+	TeamCreateLease.start(pluginObject)
 	-- TeamCreatePresence depois de TeamCreateElection, mesmo motivo de
 	-- TeamCreateLease acima: updateOwnPresence/checkPresenceDrift dependem de
 	-- TeamCreateElection.getSessionFolder()/getClientId() já existirem.
@@ -937,7 +1078,7 @@ local function checkRunModeTransition()
 		if enabled then
 			runGuardStoppedSync = true
 			log("F8/F5 (Run/Play) detectado; sync suspenso durante o teste.")
-			stop()
+			stop(true)
 		end
 	elseif not nowInRunOrPlayMode and wasInRunOrPlayMode then
 		-- Transição Run/Play -> edição (ressalva: também dispara em falso se o
@@ -1009,10 +1150,12 @@ PluginUI.init(plugin, {
 			return
 		end
 		if lastPortChangeValue == newPort and (os.clock() - lastPortChangeAt) < PORT_CHANGE_DEDUPE_SECONDS then
-			log(("troca de porta para %d ignorada: repetição do mesmo valor em <%ds"):format(
-				newPort,
-				PORT_CHANGE_DEDUPE_SECONDS
-			))
+			log(
+				("troca de porta para %d ignorada: repetição do mesmo valor em <%ds"):format(
+					newPort,
+					PORT_CHANGE_DEDUPE_SECONDS
+				)
+			)
 			return
 		end
 		portChangeInFlight = true
@@ -1094,6 +1237,27 @@ PluginUI.init(plugin, {
 		end
 		task.spawn(start, plugin)
 	end,
+	-- ReSync (2026-08-02, docs/DECISIONS.md "5ª rodada"): clique no botão
+	-- RESYNC do painel. Este arquivo só avisa visualmente ("syncing") e envia
+	-- a mensagem espontânea (sem requestId, mesmo padrão de
+	-- presenceUpdate/watchedRoots) pelo MESMO `sendMessage` que qualquer
+	-- outra mensagem espontânea do plugin já usa — quem decide/confirma/
+	-- executa o reset (apagar o Source já sincronizado no disco do dev e
+	-- repuxar tudo de novo do Studio) é 100% a extensão
+	-- (SyncTeamService.ts/extension-dev): é uma ação destrutiva do lado de
+	-- quem vai perder o arquivo local, não deste lado.
+	onResyncRequest = function()
+		if client == nil then
+			-- Sem esta guarda o painel ficaria travado em "syncing" para
+			-- sempre: sem conexão a mensagem nunca chega à extensão, então
+			-- nenhum resyncResult voltaria para tirar o estado visual de
+			-- "syncing" (ver handleResyncResult acima).
+			notify("RESYNC ignorado: sem conexão com a extensão VS Code no momento.")
+			return
+		end
+		PluginUI.setResyncState("syncing")
+		sendMessage({ kind = "resyncRequest" })
+	end,
 })
 PluginUI.setPort(Config.resolvePort(plugin))
 
@@ -1108,6 +1272,17 @@ plugin.Unloading:Connect(PluginUI.stop)
 plugin.Unloading:Connect(function()
 	runModeMonitorEnabled = false
 end)
+
+-- Mitigação de undo (2026-07-26, docs/DECISIONS.md — ver TeamCreateUndoGuard.luau
+-- para o detalhe completo): escuta ChangeHistoryService.OnUndo/OnRedo pela
+-- vida INTEIRA do plugin, independente de estar conectado (enabled) no
+-- momento — Ctrl+Z pode acontecer a qualquer momento com a place aberta, e
+-- cada checkIntegrity() já degrada sozinho pra no-op se o módulo
+-- correspondente não estiver rodando. Por isso fica fora de start()/stop(),
+-- no mesmo espírito do guard de Run/Play acima (loop independente do ciclo
+-- de conexão).
+TeamCreateUndoGuard.start()
+plugin.Unloading:Connect(TeamCreateUndoGuard.stop)
 
 log("plugin carregado. Toolbar 'SyncTeam' alterna o painel de status; use o botão CONNECT para conectar.")
 

@@ -90,3 +90,44 @@ describe("LeaseTracker", () => {
     expect(tracker.getLease("unknown-uuid")).toBeUndefined();
   });
 });
+
+// isExplicitlyOwnedByMe (2026-08-02, "handoff quase-instantâneo de lease" —
+// ver docs/DECISIONS.md "8ª rodada"): diferente de isOwnedByMe (otimista),
+// só true quando a lease foi arbitrada de fato E o dono sou eu.
+describe("LeaseTracker.isExplicitlyOwnedByMe", () => {
+  test("false quando nenhuma lease foi arbitrada ainda (isOwnedByMe seria true aqui, este não)", () => {
+    const tracker = new LeaseTracker("my-client-id");
+
+    expect(tracker.isOwnedByMe("uuid-1")).toBe(true); // otimista
+    expect(tracker.isExplicitlyOwnedByMe("uuid-1")).toBe(false); // estrito
+  });
+
+  test("true quando a lease foi arbitrada e o dono sou eu", () => {
+    const tracker = new LeaseTracker("my-client-id");
+    tracker.updateLease("uuid-1", "my-client-id", "My Name");
+
+    expect(tracker.isExplicitlyOwnedByMe("uuid-1")).toBe(true);
+  });
+
+  test("false quando a lease é de outro dono", () => {
+    const tracker = new LeaseTracker("my-client-id");
+    tracker.updateLease("uuid-1", "other-client-id", "Other Name");
+
+    expect(tracker.isExplicitlyOwnedByMe("uuid-1")).toBe(false);
+  });
+
+  test("false quando a lease foi liberada (null) — livre não é 'explicitamente minha' (isOwnedByMe seria true aqui, este não)", () => {
+    const tracker = new LeaseTracker("my-client-id");
+    tracker.updateLease("uuid-1", null, null);
+
+    expect(tracker.isOwnedByMe("uuid-1")).toBe(true); // otimista
+    expect(tracker.isExplicitlyOwnedByMe("uuid-1")).toBe(false); // estrito
+  });
+
+  test("false quando meu próprio clientId é null, mesmo com lease reportando ownerClientId null", () => {
+    const tracker = new LeaseTracker(null);
+    tracker.updateLease("uuid-1", null, null);
+
+    expect(tracker.isExplicitlyOwnedByMe("uuid-1")).toBe(false);
+  });
+});

@@ -255,6 +255,81 @@ export interface ConnectionRejectedMessage {
 }
 
 /**
+ * Extensão → plugin (2026-07-29, aditiva — NÃO muda `PROTOCOL_VERSION`, mesmo
+ * precedente de `ping`/`leaseChanged`/`presenceUpdate`/`connectionRejected`).
+ *
+ * Contexto: o plugin Studio (Luau) roda no sandbox do Roblox e não tem acesso
+ * ao `default.project.json` — só a extensão VS Code lê/parseia esse arquivo
+ * (ver `mapping/projectMapping.ts::parseMountPoints`). Até aqui o plugin
+ * dependia de uma tabela FIXA hardcoded de "watched roots"
+ * (`plugin/src/Config.luau`, `Config.getWatchedRoots()`) para saber quais
+ * serviços do DataModel escanear — qualquer mount point novo apontando para um
+ * serviço fora dessa lista fixa (ex.: `ReplicatedFirst`, `Lighting`, `Teams`,
+ * `Chat`, `SoundService`) simplesmente não sincronizava (bug real relatado
+ * 2026-07-29, ver docs/DECISIONS.md mesma data).
+ *
+ * `roots`: lista ÚNICA (sem duplicata) dos nomes de serviço de TOPO (primeiro
+ * segmento de `dataModelPath`, ex.: "ReplicatedFirst" de
+ * "ReplicatedFirst/First") referenciados por qualquer ponto de montagem do
+ * `default.project.json` do projeto ATUAL — ver
+ * `mapping/projectMapping.ts::computeWatchedRoots`.
+ *
+ * QUANDO é mandada: exatamente UMA vez por conexão aceita, logo depois que o
+ * `hello` do plugin é validado (protocolVersion compatível) — e sempre ANTES
+ * do primeiro `listScripts` da sincronização inicial (`runInitialSync`), para
+ * que o plugin já saiba quais containers escanear antes de precisar reportar
+ * `scriptList`. Ver `SyncTeamService`'s `onClientConnected` handler (chamado
+ * de dentro de `SyncServer.handleHello`) — a mensagem é enviada via
+ * `server.sendSpontaneous(...)` IMEDIATAMENTE antes de enfileirar
+ * `bridge.runInitialSync(...)`.
+ *
+ * O QUE o plugin deve fazer com ela (a implementar pelo luau-dev): usar esta
+ * lista EM VEZ da tabela fixa local dele para decidir quais serviços do
+ * DataModel escanear/observar. A tabela fixa (`Config.getWatchedRoots()`)
+ * deve virar só um FALLBACK/default para quando esta mensagem nunca chegar
+ * (ex.: plugin mais novo/mais velho que a extensão, ou algum erro que impeça
+ * o recebimento) — nunca mais a fonte de verdade quando a mensagem chegou.
+ */
+export interface WatchedRootsMessage {
+  kind: "watchedRoots";
+  roots: string[];
+}
+
+/**
+ * Plugin → extensão (2026-08-02, "ReSync" — ver docs/DECISIONS.md, entrada
+ * "5ª rodada", aditiva — NÃO muda `PROTOCOL_VERSION`, mesmo precedente de
+ * `ping`/`leaseChanged`/`watchedRoots`). Espontânea, sem `requestId`/ack:
+ * disparada quando o usuário clica no botão "RESYNC" do painel do plugin no
+ * Studio. Pede um reset forçado — apagar TODO Source sincronizado no
+ * workspace do VS Code e repuxar tudo de novo do Studio (autoritativo),
+ * eliminando qualquer arquivo duplicado/órfão. Mais agressivo que
+ * `refreshSync`/comando "Refresh Sync" (reconciliação de 3 vias,
+ * não-destrutiva) — este é um reset completo para quando o estado ficou
+ * bagunçado o bastante (duplicatas) que a reconciliação não resolve. A
+ * extensão SEMPRE confirma com o usuário local (modal nativa) antes de
+ * apagar qualquer coisa — ver `SyncTeamService`'s `handleResyncRequest`.
+ */
+export interface ResyncRequestMessage {
+  kind: "resyncRequest";
+}
+
+/**
+ * Extensão → plugin (2026-08-02, "ReSync"), espontânea: resposta ao
+ * `resyncRequest`. `ok: false` cobre tanto "usuário cancelou a confirmação"
+ * (`reason: "cancelled_by_user"`) quanto qualquer erro real durante o reset
+ * (`reason` = mensagem do erro) — nunca deixamos o pedido sem resposta,
+ * senão o botão do painel do Studio fica travado em "syncing" para sempre.
+ * `deletedCount` só está presente quando `ok === true` (quantos arquivos
+ * foram de fato apagados antes de repuxar tudo do zero).
+ */
+export interface ResyncResultMessage {
+  kind: "resyncResult";
+  ok: boolean;
+  deletedCount?: number;
+  reason?: string;
+}
+
+/**
  * Mensagem recebida crua, só com a garantia de que `kind` é uma string não
  * vazia — todo o resto é validado por quem consome cada `kind` específico
  * (nunca confiar na forma do payload sem checar os campos).

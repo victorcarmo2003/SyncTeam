@@ -86,8 +86,6 @@ local ROOT_VALUES = {
 -- Atributo de desempate determinístico e REPLICADO (ver comentário de cabeçalho).
 local ORIGIN_ATTRIBUTE = "SyncTeamOrigin"
 
-local log = Logger.log
-
 local function originOf(instance)
 	return instance:GetAttribute(ORIGIN_ATTRIBUTE) or ""
 end
@@ -135,6 +133,14 @@ local function getOrCreate(parent, className, name)
 	if #candidates == 0 then
 		local value = Instance.new(className)
 		value.Name = name
+		-- Mitigação de undo (2026-07-26, docs/DECISIONS.md,
+		-- .claude/research/2026-07-26-changehistoryservice-undo-exclusion.md):
+		-- camada 1 (fast-path best-effort, NÃO garantida) contra Ctrl+Z do
+		-- usuário destruindo instances de coordenação — relato de comunidade
+		-- não confirmado por staff da Roblox, mas sem custo conhecido; a
+		-- camada garantida é o self-healing reativo via
+		-- ChangeHistoryService.OnUndo/OnRedo (ver TeamCreateUndoGuard.luau).
+		value.Archivable = false
 		-- Atributo gravado ANTES de .Parent: melhor esforço para replicar
 		-- junto com a criação (mesmo princípio de "registrar antes de agir"
 		-- já usado no projeto para baseline de Source/uuid) — não é garantia
@@ -196,12 +202,14 @@ local function getOrCreate(parent, className, name)
 	-- perceber que algo estranho (mas autocorrigido) aconteceu. Continua
 	-- logando no Output incondicionalmente (Logger.notify sempre faz isso,
 	-- ver Logger.luau) — só a exibição do toast depende da preferência.
-	Logger.notify(("reconciliada(s) %d duplicata(s) de %s '%s' sob %s"):format(
-		#candidates - 1,
-		className,
-		name,
-		parent:GetFullName()
-	))
+	Logger.notify(
+		("reconciliada(s) %d duplicata(s) de %s '%s' sob %s"):format(
+			#candidates - 1,
+			className,
+			name,
+			parent:GetFullName()
+		)
+	)
 
 	return canonical
 end

@@ -1,0 +1,4 @@
+Pasta de destino de src/assets/SyncTeam.rbxm, gerado por
+`bun run scripts/build-plugin-asset.ts` (gitignored via a regra global
+*.rbxm em .gitignore). Este arquivo só existe para a pasta sobreviver em um
+clone limpo do repositório.

@@ -121,12 +121,24 @@ local function createOrAdoptRecord(uuid, instance, canonicalPathStr)
 	if folder == nil then
 		folder = Instance.new("Folder")
 		folder.Name = uuid
+		-- Mitigação de undo (2026-07-26, docs/DECISIONS.md): camada 1
+		-- (fast-path best-effort) — ver comentário em TeamCreateSchema.luau.
+		-- Sem checagem de integridade dedicada aqui (fora do escopo desta
+		-- tarefa, que cobriu só sessões/leases/presença): se undo destruir
+		-- esta pasta de metadados, a resolução uuid->Instance NESTE Studio
+		-- continua funcionando (recordByUuid[uuid].instance já cacheia a
+		-- Instance real em memória, independente da pasta sobreviver), mas a
+		-- identidade fica sem replicar para outro Studio que ainda não a
+		-- viu — risco residual aceito, registrar como fatia futura se
+		-- aparecer como problema real.
+		folder.Archivable = false
 		folder.Parent = scriptsFolder
 	end
 	local instanceRef = folder:FindFirstChild("InstanceRef")
 	if instanceRef == nil then
 		instanceRef = Instance.new("ObjectValue")
 		instanceRef.Name = "InstanceRef"
+		instanceRef.Archivable = false
 		instanceRef.Parent = folder
 	end
 	instanceRef.Value = instance
@@ -134,6 +146,7 @@ local function createOrAdoptRecord(uuid, instance, canonicalPathStr)
 	if canonicalPath == nil then
 		canonicalPath = Instance.new("StringValue")
 		canonicalPath.Name = "CanonicalPath"
+		canonicalPath.Archivable = false
 		canonicalPath.Parent = folder
 	end
 	canonicalPath.Value = canonicalPathStr or ""
@@ -215,7 +228,8 @@ function ScriptRegistry.resolveOrAllocate(instance, canonicalPathStr)
 	local existingUuid, instanceRef, canonicalPath = findRegistryEntryFor(instance)
 	if existingUuid ~= nil then
 		local folder = scriptsFolder:FindFirstChild(existingUuid)
-		recordByUuid[existingUuid] = { folder = folder, instanceRef = instanceRef, canonicalPath = canonicalPath, instance = instance }
+		recordByUuid[existingUuid] =
+			{ folder = folder, instanceRef = instanceRef, canonicalPath = canonicalPath, instance = instance }
 		uuidByInstance[instance] = existingUuid
 		log(("resolveOrAllocate: reaproveitado uuid=%s já existente no registry compartilhado."):format(existingUuid))
 		return existingUuid, false
@@ -259,6 +273,45 @@ function ScriptRegistry.updateCanonicalPath(uuid, newPath)
 	end
 end
 
+-- Reatribui um uuid JÁ EXISTENTE no registry para apontar para uma Instance
+-- NOVA, sem alocar um uuid novo nem tratar como delete+create. Uso
+-- (docs/DECISIONS.md 2026-08-02, 3ª rodada, seção 2): conversão de classe
+-- Folder -> Script/LocalScript/ModuleScript em
+-- SourceWatcher.resolvePath quando uma pasta ganha init.*/init.server.*/
+-- init.client.* (convenção Rojo) — a Instance antiga (Folder) é destruída e
+-- uma nova (LuaSourceContainer) é criada em seu lugar. Se a Folder destruída
+-- JÁ tinha entrada no registry, esta função garante que o MESMO uuid
+-- continue valendo para a Instance nova, em vez de: (a) o registry antigo
+-- ser varrido como "destruído" pelo próximo checkRegistryDrift (emitindo
+-- scriptRemoved) e (b) um uuid novo, sem nenhuma relação, ser alocado para a
+-- Instance nova por resolveOrAllocate — o que quebraria lease/presença
+-- ativos no uuid antigo.
+--
+-- Nota honesta: no caminho comum de hoje, uma Folder pura (agrupando filhos,
+-- sem init.*) NUNCA tem entrada no registry (só LuaSourceContainer é
+-- registrado, ver isInstanceWatchable/watchScript em SourceWatcher.luau) —
+-- então, na prática atual, o chamador quase sempre encontra uuid == nil
+-- aqui e esta função não faz nada (é um no-op seguro, ver `return false`
+-- abaixo). Ainda assim, a checagem é feita SEMPRE antes de destruir a
+-- Instance antiga: é barata, e protege a identidade em qualquer cenário
+-- futuro em que a Instance convertida já esteja registrada (ex.: se esta
+-- mesma lógica de conversão for reaproveitada para outro caso no futuro).
+--
+-- Retorna true se reatribuiu (uuid existia), false se uuid é desconhecido
+-- (chamador decide o que fazer nesse caso — hoje, aloca um uuid novo
+-- normalmente via o caminho de sempre, resolveOrAllocate).
+function ScriptRegistry.reassignInstance(uuid, newInstance)
+	local record = recordByUuid[uuid]
+	if record == nil then
+		return false
+	end
+	uuidByInstance[record.instance] = nil
+	record.instanceRef.Value = newInstance
+	record.instance = newInstance
+	uuidByInstance[newInstance] = uuid
+	return true
+end
+
 -- Destrói a entrada do registry (Folder inteiro) e limpa os mapas em memória.
 -- Não decide sozinho SE deve remover — quem chama (SourceWatcher, ciclo de
 -- poll) já decidiu que a Instance foi destruída.
@@ -285,7 +338,10 @@ end
 function ScriptRegistry.forEach(callback)
 	local snapshot = {}
 	for uuid, record in recordByUuid do
-		table.insert(snapshot, { uuid = uuid, instance = record.instanceRef.Value, storedPath = record.canonicalPath.Value })
+		table.insert(
+			snapshot,
+			{ uuid = uuid, instance = record.instanceRef.Value, storedPath = record.canonicalPath.Value }
+		)
 	end
 	for _, entry in snapshot do
 		callback(entry.uuid, entry.instance, entry.storedPath)

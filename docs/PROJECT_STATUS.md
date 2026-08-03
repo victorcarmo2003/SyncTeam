@@ -1,8 +1,839 @@
 # Status do projeto
 
-Última atualização: 2026-07-20 (toggle real de auto-reconectar no painel do plugin)
+Última atualização: 2026-08-03 (logo do SyncTeam no `StatusBarItem` da
+extensão VS Code via fonte de ícone gerada com `fantasticon` — build,
+lint, 275/275 testes e `.vsix` empacotado real conferidos; renderização
+dentro do VS Code de verdade ainda `[Hipótese]`, ver DECISIONS.md "14ª
+rodada")
 
-## Nota de sessão (2026-07-20, mais recente) — toggle real de "Reconectar automaticamente" no painel (plugin)
+## Nota de sessão (2026-08-03, mais recente) — Logo do SyncTeam no `StatusBarItem` (fonte de ícone via fantasticon)
+
+Detalhe completo em `docs/DECISIONS.md`, "14ª rodada", e
+`.claude/agent-memory/ui-dev.md`. Resumo: `StatusBarItem.text` só aceita
+`$(codicon)`, então a logo (já existente como `resources/icon.svg`/
+`icon.png`) virou uma fonte de ícone (`vscode-extension/scripts/build-icon-font.cjs`
++ `fantasticon`, gerando `resources/syncteam-icons.woff`), declarada em
+`contributes.icons` no `package.json` e usada como `$(syncteam-logo)`
+prefixado nos 3 estados de `statusBarMenu.ts` (parado/aguardando/conectado
+— logo é ADIÇÃO, os indicadores de estado existentes continuam).
+
+**Achado técnico**: bug real do `fantasticon@4.1.0` no Windows (`path.join`
+interno gera separador `\`, o `glob@13` usado por baixo trata `\` como
+escape e nunca acha os SVGs) — contornado com um monkeypatch local e
+temporário de `path.join` dentro do script de build (só funciona na build
+CJS do fantasticon, não na ESM — por isso o script é `.cjs`). Ver
+DECISIONS.md pra reprodução completa; útil pra qualquer tarefa futura que
+use `fantasticon` de novo neste repo em Windows.
+
+**`[Verificado]`**: `npm run build` (dispara o `prebuild` novo sozinho),
+`tsc --noEmit`, `vitest run` 275/275, e um `.vsix` real gerado via `npx
+@vscode/vsce package --no-dependencies` foi inspecionado (unzip) —
+contém `resources/syncteam-icons.woff` e `contributes.icons` intacto,
+sem vazar os intermediários de build (`icon-font-src/`, `.json` de
+codepoints, ambos gitignorados + excluídos via `.vscodeignore`).
+
+**`[Hipótese]`**: o glifo aparecendo de fato na barra de status de um VS
+Code real (Extension Development Host ou `.vsix` instalado) — não
+instalado/testado nesta sessão de propósito (evitar abrir janela/capturar
+tela do usuário sem pedido explícito). Roteiro pra fechar: `code
+--install-extension <vsix>` + abrir pasta com `default.project.json`.
+
+## Nota de sessão (2026-08-03) — `syncteam-cli`: `port`/`start`/`stop`/`extension install`
+
+Detalhe completo em `docs/DECISIONS.md`, "12ª rodada", e
+`.claude/agent-memory/extension-dev.md`. Resumo: `syncteam start`/`stop`
+sobem/derrubam a MESMA composição de produção da extensão VS Code
+(`SyncServer`+`SyncTeamService`+`SyncBridge`+`NodeDiskIO`, reusados por
+import cross-pacote de `vscode-extension/src/`, sem duplicar lógica) como
+um daemon headless (processo destacado), com resolução de porta ocupada
+INTERATIVA (diálogo `[s/N]` de terminal, mesmo mecanismo de "posse de
+porta" já validado da extensão — `PortOwnership.ts::attemptPortReclaim`,
+reusado sem alteração). `syncteam port <N>` persiste em
+`~/.syncteam/config.json` (novo local de config PRÓPRIO do CLI, distinto
+dos settings do VS Code). `syncteam extension install` espelha `plugin
+install`, mas instala o `.vsix` embutido via `code --install-extension
+--force`.
+
+**Achado técnico mais relevante**: descobrir como reinvocar o PRÓPRIO
+binário do CLI como processo destacado, de forma que funcione tanto em
+modo interpretado (`bun run src/index.ts`) quanto compilado (`bun build
+--compile`) — duas heurísticas óbvias falharam de fato (confirmado com
+teste real, não só análise) antes de achar o sinal certo
+(`process.execPath === process.argv[0]`, só bate em modo interpretado).
+Detalhe completo em `.claude/agent-memory/extension-dev.md` — vale ler
+antes de qualquer tarefa futura que mexa em self-respawn de um executável
+Bun compilado.
+
+**`[Verificado]` de ponta a ponta nesta máquina (Windows), incluindo o
+binário COMPILADO de verdade** (não só modo interpretado): 52/52 testes
+(era 17, rodado 2x sem flakiness — inclui 6 testes de ponta a ponta REAIS
+que sobem/derrubam um daemon de verdade e exercitam o diálogo Y/N com um
+processo Node separado ocupando a porta), `bun run lint` limpo. Testado
+manualmente ao vivo com o `.exe` compilado: `start`/`stop` reais (processo
+destacado sobrevivendo ao pai, porta confirmada via `netstat`, PID via
+`Get-Process`), diálogo Y/N nos dois caminhos (aceitar/recusar matar o
+processo ocupante), `syncteam port <N>` persistindo/lendo de volta,
+`syncteam extension install` confirmado via `code --list-extensions
+--show-versions` (`dev-hakor.syncteam@0.1.0` instalado de verdade).
+
+**`[Hipótese razoável, não testada]`**: `start`/`stop` em macOS/Linux
+(mecanismo deveria funcionar igual — mesma composição, mesmo Bun — mas só
+exercitado no Windows nesta rodada).
+
+**Nada publicado nesta rodada** — release/`rokit.toml` intocados (o release
+v0.1.0 já publicado antes, 11ª rodada, só tem `plugin install`).
+`CLAUDE.md` (linha ~57) ficou desatualizada ("Único comando hoje: `syncteam
+plugin install`") — não editada por decisão de escopo (fora do que foi
+delegado), sinalizado para o usuário/orquestrador atualizar se quiser.
+
+## Nota de sessão (2026-08-02) — Spike: `bun build --compile` funciona no Rokit, mas binário é 112MB
+
+Contexto: usuário pediu (após frustração com revisão automática do VS Code
+Marketplace travando `dev-hakor.syncteam`) explorar distribuir o SyncTeam via
+Rokit, como o Rojo faz. Detalhe completo em `docs/DECISIONS.md`, 9ª rodada.
+Resultado: tecnicamente funciona (testado ponta a ponta contra repo real),
+mas o binário Bun sai 112MB (runtime inteiro embutido) contra poucos MB dos
+binários Rust do ecossistema — trade-off real que ainda não foi decidido.
+**Não iniciei a construção do `syncteam-cli` de produto** (embutir o
+`.rbxm`, comando `plugin install`, GitHub Actions cross-platform) — parei
+no spike de validação e deixei a decisão Bun-vs-Rust em aberto pro usuário,
+mesmo com autorização geral pra decidir sozinho nesta sessão, porque é
+exatamente o tipo de trade-off (peso de instalação vs. linguagem nova pro
+time) que vale confirmar antes de comprometer arquitetura nova.
+
+**Publicação no VS Code Marketplace**: bloqueada por review automática
+("Your extension has suspicious content"), mesmo com metadata completa
+(`license`/`repository`/`homepage`/`bugs`/`keywords`, VSIX limpo de 40KB).
+Encaminhado contato com `vsmarketplace@microsoft.com` (texto pronto no
+histórico da conversa, usuário ainda não enviou). Alternativa sugerida e
+não executada ainda: Open VSX Registry (`ovsx publish`), review separado,
+sem esse bloqueio conhecido.
+
+## Nota de sessão (2026-08-02) — Handoff quase-instantâneo de lease: implementação real no plugin (`luau-dev`)
+
+Detalhe completo em `docs/DECISIONS.md`, entrada "8ª rodada" (continuação
+`luau-dev`). Resumo: `TeamCreateLease.luau` — o ciclo do líder (`leaderTick`)
+parou de reusar `TeamCreateElection.PULSE_INTERVAL_SECONDS` (2s, heartbeat de
+eleição — intocado) e passou a rodar em `Config.POLL_INTERVAL_SECONDS` (0.5s);
+o limiar de staleness do intent virou `Config.getPlaceSetting(pluginObject,
+"leaseStaleAfterSeconds")` (novo, por-place, default 2s) em vez do antigo
+`TeamCreateElection.STALE_AFTER_SECONDS` fixo em 8s — que continua fixo em 8s
+só para eleição de líder/sessão (decisão deliberada: são conceitos
+desacoplados agora, ver DECISIONS.md para o raciocínio completo). UI nova em
+`StatusPanel.luau`/`PluginUI.luau`: campo "Liberar lease após (s)" no painel
+de configurações. Lado extensão (paralelo, `extension-dev`, mesma feature):
+`onDidChangeTextDocument` throttled ~150ms complementa o watcher de disco
+para o Pulse renovar durante digitação ativa — sem isso o novo default de 2s
+não faz sentido de verdade. **Nada testado em Studio real** — roteiro de 5
+passos na entrada de DECISIONS.md, pendente do usuário/`qa-tester` (precisa
+dos 2 lados — plugin E extensão — mesclados para fazer sentido).
+
+## Nota de sessão (2026-08-02) — Spike M1.6 executado, dado real coletado
+
+Detalhe completo em `docs/DECISIONS.md`, entrada "7ª rodada" (a 6ª rodada
+abaixo registra só a construção do tooling, ainda sem execução real).
+Resultado prático: sem bloqueio de dado restante pra desenhar a feature de
+produto que substitui o lease exclusivo atual por handoff quase-instantâneo
+(dono muda em ~1 tick, não 8s) + streaming read-only do texto do dono pro
+outro dev. Riscos residuais aceitos (não bloqueadores): write concorrente
+com digitação humana simultânea no editor NATIVO do Studio (fluxo real do
+produto é sempre via VS Code, não o editor nativo); replicação em rede real
+entre 2 máquinas diferentes (só localhost/2 contas na mesma máquina
+testado). Próximo passo: implementação de produto (ainda não iniciada).
+
+## Nota de sessão (2026-08-02) — Spike M1.6: taxa de streaming de Source — tooling pronto, execução PENDENTE (nota anterior, superada pela acima)
+
+Pergunta do usuário: dá para trocar o lease exclusivo por handoff
+quase-instantâneo com streaming em tempo real do Source (2/5/15/30/60Hz)?
+Detalhe completo em `docs/DECISIONS.md`, entrada 2026-08-02 "(6ª rodada)".
+
+- **Construído em `spikes/m1.6-source-streaming-rate/`**: plugin Luau
+  descartável (`SyncTeamRateSpike.lua`, porte do padrão de
+  `spikes/m0-source-replication/SyncTeamM0.lua` — 1 clique por Studio,
+  escritor cicla sozinho pelas 5 taxas depois disso), `control-server.mjs`
+  (logger Node local, relógio único comparável entre os 2 Studios — desenho
+  deliberado para não depender de nenhum timestamp Roblox não confirmado em
+  `.claude/research/`), `analyze-log.mjs` (calcula perda/coalescing e
+  latência min/p50/p95/max por taxa e por via sinal/poll). Tooling Node
+  validado com dado sintético (feeder descartável, removido depois).
+- **NÃO executado contra os 2 Studios reais nesta rodada** — restrição de
+  domínio do `luau-dev` ("nada de teste que exija 2 Studios rodando") mais
+  ausência de MCP Roblox Studio/Command Bar nesta sessão (sem como clicar o
+  botão remotamente). Roteiro completo de 5 passos em
+  `spikes/m1.6-source-streaming-rate/README.md` — próximo passo é o
+  orquestrador decidir quem roda (usuário ou `qa-tester`).
+- **Item 2 do pedido (cursor-jump com editor nativo aberto)**: documentado
+  como 100% manual (sem API para abrir o Script Editor remotamente) —
+  roteiro de 4 passos no README do spike, fica `[Decisão pendente]`.
+- **Nenhuma afirmação de taxa recomendada foi promovida a `[Verificado]`**
+  — só uma recomendação provisória baseada na pesquisa já existente (Rojo
+  revertendo write-por-tecla), explicitamente marcada como não testada
+  neste projeto.
+
+## Nota de sessão (2026-08-02) — Lado VS Code da feature "ReSync"
+
+Contrato completo em `docs/DECISIONS.md`, entrada "5ª rodada". Trabalho em
+paralelo com `luau-dev`/`ui-dev` (lado Studio); esta nota cobre só a parte da
+extensão.
+
+- **`vscode-extension/src/protocol.ts`**: dois `kind` novos, aditivos (sem
+  bump de `PROTOCOL_VERSION`) — `ResyncRequestMessage {kind:"resyncRequest"}`
+  (plugin→extensão, espontânea) e `ResyncResultMessage
+  {kind:"resyncResult", ok, deletedCount?, reason?}` (extensão→plugin).
+- **`SyncBridge.resyncFromScratch(transport): Promise<number>`** (novo,
+  seção "ReSync" antes de "disco -> Studio"): apaga todo arquivo em
+  `diskPathByUuid` (cada delete em try/catch isolado — arquivo
+  ausente/locked não aborta o resto, só loga e segue), zera
+  `scripts`/`diskPathByUuid`/`uuidByDiskPath`/`contentCache`/`sourceCache`, e
+  chama `runInitialSync(transport)` para repuxar tudo fresco. Retorna quantos
+  arquivos apagou de fato. Escopo estritamente limitado a arquivos que O
+  PRÓPRIO bridge já rastreia — nunca toca `default.project.json` nem arquivo
+  fora do escopo rastreado.
+- **`SyncTeamService`**: novo `case "resyncRequest"` em `routeSpontaneous` →
+  `handleResyncRequest` (privado). Fluxo: sem `onConfirmResync` registrado →
+  recusa por segurança (`resyncResult ok:false reason:"no_confirm_handler"`);
+  callback resolve `false` → `ok:false reason:"cancelled_by_user"`, nada
+  apagado; resolve `true` → `enqueueMutation(() =>
+  bridge.resyncFromScratch(transport))` (MESMA fila FIFO que já serializa
+  `sourceChanged`/`scriptAdded`/etc. — nunca corre concorrente com outra
+  mutação) → `resyncResult ok:true deletedCount:N`; qualquer exceção (na
+  própria confirmação OU no reset) → `catch` captura e responde
+  `ok:false reason:<mensagem>` — nunca deixa o pedido sem resposta (senão o
+  botão do painel do Studio fica travado em "syncing" para sempre).
+- **Novo callback `ConfirmResyncCallback`/`setOnConfirmResync`** — mesmo
+  padrão já usado por `PortReclaimHost.confirmKill` (posse de porta,
+  2026-08-02, 3ª rodada): mantém `SyncTeamService`/`SyncBridge` livres de
+  `vscode`/testáveis com fake; `extension.ts` é quem liga isto a
+  `vscode.window.showWarningMessage(mensagem, {modal:true}, "Confirmar",
+  "Cancelar")`. Decisão deliberada: NÃO usei
+  `vscode.window.showWarningMessage` direto dentro de `SyncTeamService.ts`
+  (o texto da tarefa sugeria isso) porque violaria a regra de arquitetura já
+  registrada (só `extension.ts`/`ui/*.ts`/`VscodeDiskIO.ts`/`vscodeLogger.ts`
+  importam `vscode`) e quebraria a testabilidade sem mock de `vscode` que o
+  projeto todo mantém desde o M1.
+- **`enqueueMutation` virou genérico** (`<T>(task: () => Promise<T>):
+  Promise<T>`, era `Promise<void>` fixo) — necessário porque
+  `resyncFromScratch` precisa devolver `deletedCount` através da fila.
+  100% compatível com todo call site pré-existente (`void` continua sendo um
+  `T` válido).
+- **Testes** (263 no total, era 256): 3 novos em `syncBridge.test.ts`
+  (`resyncFromScratch` apagando+repuxando com conteúdo novo e preservando
+  arquivo fora do escopo; Studio sem nenhum script deixa os mapas vazios de
+  fato; delete que falha não aborta o resto, `deletedCount` conta só os que
+  de fato apagou) e 4 novos em `syncTeamService.test.ts` (sem confirmador →
+  recusa; usuário cancela; `onConfirmResync` rejeita → `resyncResult` com a
+  mensagem de erro, nunca deixa a exceção subir; usuário confirma → fluxo
+  ponta-a-ponta com um plugin fake via WebSocket REAL confirmando que o
+  conteúdo antigo é substituído pelo novo, provando que o repull aconteceu de
+  fato). `npm run lint` (tsc --noEmit) limpo, `npm run test` (vitest run)
+  **263/263 passando**, `npm run build` (esbuild) gera os dois bundles sem
+  erro.
+- **Não testado em Studio real** — fica `[Hipótese]` até `luau-dev`/`ui-dev`
+  terminarem o lado Studio (botão, `elseif message.kind == "resyncResult"`,
+  `state.resyncState`) e o usuário validar os dois lados juntos. Nenhum
+  round-trip Team Create aqui — 100% lógica local (arquivos + fila +
+  callback), mesma conclusão de outras fatias recentes puramente client-side.
+
+## Nota de sessão (2026-08-02) — Output do Studio limpo: `Logger.log`/`Logger.notify` pararam de imprimir
+
+Pedido do usuário: "limpar os prints do output, pode retirar todos" — o
+Output do Studio vinha poluído com `[SyncTeam HH:MM:SS] ...` a cada evento de
+`Logger.log`/`Logger.notify` (só `Logger.debug`, criado em 2026-07-16, já não
+imprimia — dessa vez o pedido cobre TODAS as chamadas, não só ruído de boot).
+
+- **`plugin/src/Logger.luau`**: `render()` parou de chamar `print()` para
+  qualquer caminho — antes era condicional (`log`/`notify` imprimiam,
+  `debug` não); agora nenhum dos três imprime no Output. Parâmetro renomeado
+  `shouldPrint` → `trackPanel`: só decide se a mensagem alimenta a linha
+  INFO do painel (`lastMessageText`/`lastMessageAt`), sem relação com
+  Output. **Intocado**: encaminhamento por WS (observabilidade de teste via
+  `Tools/`) e o toast de `Logger.notify` — ambos continuam funcionando
+  exatamente como antes.
+- **`plugin/src/init.server.luau`**: dos 2 `print()` crus fora do Logger
+  (`sendMessage`, motivo de recursão documentado no arquivo), removido só o
+  de "descartado (sem conexão): `<kind>`" — na prática é ALTA frequência
+  (dispara a cada mensagem espontânea enquanto o plugin roda sem a extensão
+  VS Code conectada) e não perde observabilidade real (sem conexão, o WS já
+  não tinha como encaminhar de qualquer forma). Mantido o de "falha ao
+  enviar: `<err>`" — esse sim é raro/genuíno (WS quebrou sem `Closed`/`Error`
+  disparar) e é o único canal restante para essa falha específica.
+- Decisão completa (incluindo por que os dois prints foram tratados de forma
+  assimétrica, divergindo da sugestão inicial de manter ambos, e o achado de
+  comentários stale em `PluginUI.luau`/`StatusPanel.luau` sinalizado para
+  `ui-dev`) em `docs/DECISIONS.md`, entrada 2026-08-02 "(4ª rodada, mais
+  recente)".
+- **Validado só por `selene`/`stylua`/`lune run`** — 0 errors/37 warnings
+  (baseline mantida), StyLua limpo, `lune run` sem erro de sintaxe nos 2
+  arquivos tocados (`Logger.luau` roda inteiro sem erro; `init.server.luau`
+  erra só na 1ª linha que toca `game`, padrão de sempre). **Nada testado em
+  Studio real** — fica `[Hipótese]`, roteiro de 5 passos em
+  `docs/DECISIONS.md`, mesma entrada.
+
+## Nota de sessão (2026-08-02) — Correção de comportamento: sinal `"busy"` em "posse de porta" agora SEMPRE mostra o diálogo de confirmação
+
+Ajuste pedido diretamente pelo usuário na feature "posse de porta"
+(`vscode-extension/src/sync/PortOwnership.ts`, `attemptPortReclaim` — ver
+nota de sessão logo abaixo para a implementação original da feature).
+
+- **Comportamento antigo**: quando `probeSignal` retornava `"busy"` (sessão
+  SyncTeam com plugin conectado agora, segundo o registro do servidor
+  remoto), a função retornava `{action:"fallback"}` IMEDIATAMENTE, sem nunca
+  chamar `findOwner`/`readLock`/`host.confirmKill` — o diálogo nunca
+  aparecia.
+- **Razão da mudança**: mesmo o sinal `"busy"` não é certeza absoluta — uma
+  sessão "viva" no registro do servidor remoto pode ser um processo fantasma
+  que travou (ex.: o Studio do colega crashou) sem que o servidor tenha
+  detectado a queda ainda, antes do timeout de heartbeat. Negar o diálogo por
+  completo tirava do usuário a chance de recuperar a porta numa trava real.
+  `.claude/rules/authority.md` já foi atualizado pelo usuário refletindo isso
+  (bullet "Matar processo de terceiro") antes de qualquer código ser tocado.
+- **Comportamento novo**: `"busy"` agora segue o MESMO fluxo de
+  identificação/confirmação que os outros sinais e SEMPRE mostra o diálogo
+  (quando um PID é identificado), com a mensagem MAIS FORTE de todas — mais
+  forte que a de `"respondsWs"` sem identificação, que já existia. Deixa
+  claro que uma sessão com plugin conectado AGORA foi detectada, que é MUITO
+  PROVÁVEL ser um colega de verdade (não um zumbi), que matar pode causar
+  perda de trabalho não salvo de outra pessoa, mas que às vezes o processo
+  trava sem o servidor perceber a tempo. `host.confirmKill` continua sendo a
+  ÚNICA porta para `killProcess` rodar (nunca automático). Resto do fluxo
+  (identificação de PID, `killProcess`, espera com escalada SIGTERM→SIGKILL)
+  sem mudança.
+- **Testes**: o teste único anterior (`confirmCalls === 0` para "busy") foi
+  substituído por 4 testes novos em `test/portOwnership.test.ts` (recusa,
+  confirmação, sem PID identificável, precedência sobre "zumbi
+  identificado"). 256 no total (era 253).
+- Detalhe completo em `docs/DECISIONS.md`, entrada 2026-08-02 "(3ª rodada,
+  mais recente)", seção 1, bloco "Correção do sinal `busy`".
+- **Verificado**: `npm run lint` (tsc --noEmit) limpo, `npm run test` (vitest)
+  256/256, `npm run build` (esbuild) gera os dois bundles sem erro. **Não
+  precisa de Studio real** — mudança é 100% lógica local (heurística de
+  mensagem/fluxo de confirmação), sem `[Hipótese]` nova de Team Create.
+
+## Nota de sessão (2026-08-02) — Bug real corrigido: ordem de operações na conversão Folder→ModuleScript derrubava o watch de Source dos filhos já existentes
+
+O `luau-dev` levantou uma hipótese própria relendo `SourceWatcher.resolvePath`
+(bloco de conversão Folder→ModuleScript/Script/LocalScript, convenção Rojo de
+`init.luau`): a ordem antiga reparentava cada filho pra dentro de uma
+`newInstance` **ainda sem `Parent`**, só anexando `newInstance` à árvore
+DEPOIS. O `researcher` confirmou com fonte oficial
+(`.claude/research/2026-08-02-reparent-descendantremoving-semantics.md`,
+`Roblox/creator-docs` `Instance.yaml`): isso bate exatamente com a definição
+de `DescendantRemoving` ("fires immediately before... a descendant instance
+will no longer be a descendant") — cada filho de fato deixava de ser
+descendente da raiz observada, mesmo que momentaneamente, disparando
+`unwatchScript` incorretamente para eles. A reconexão via `DescendantAdded`
+no final não tinha garantia documentada de refire por descendente
+pré-existente de uma subárvore movida de uma vez.
+
+- **Fix**: inverter a ordem — `newInstance.Parent = current` roda ANTES do
+  loop de filhos, não depois. Assim, cada `oldChild.Parent = newInstance` é
+  um reparent direto DENTRO da mesma árvore já observada (nunca deixa de ser
+  descendente da raiz) — não dispara `DescendantRemoving`, e elimina por
+  completo a dependência do comportamento não-garantido de `DescendantAdded`.
+- **Trade-off aceito**: mais eventos de replicação Team Create (a ordem
+  antiga era mais econômica, mas incorreta).
+- Detalhe completo (citação da fonte, interação pré-existente e dormant com
+  `existingUuid`/`resolveOrAllocate`, não alterada por este fix) em
+  `docs/DECISIONS.md`, entrada 2026-08-02 "(3ª rodada, mais recente)", seção
+  2, continuação.
+- **Validado só por `selene`/`stylua`/`lune run`** — 0 errors/37 warnings
+  (baseline mantida), StyLua limpo, `lune run` sem erro de sintaxe (erro
+  esperado só na 1ª linha que toca `game`). **Nada testado em Studio real** —
+  fica `[Hipótese]` (alta confiança na causa/mecanismo, derivada de fonte
+  oficial confirmada por pesquisa, mas comportamento fim-a-fim não
+  exercitado). Roteiro manual de 4 passos (exige só 1 Studio, sem Team
+  Create) em `docs/DECISIONS.md`, mesma entrada — o passo decisivo é editar o
+  `Source` de um filho que já vivia dentro da pasta ANTES da conversão,
+  DEPOIS de convertida, e confirmar que a propagação continua funcionando.
+
+## Nota de sessão (2026-08-02) — Correção de reentrância em `SyncController.start/restart/setPort` (achado do `code-reviewer`)
+
+O `code-reviewer` revisou a implementação de "posse de porta" (nota logo
+abaixo) e achou um gap de reentrância pré-existente cuja janela de exposição
+cresceu muito por causa do novo diálogo modal `confirmKill` (pode ficar
+bloqueado por tempo arbitrário): `SyncController.start()`/`restart()`/
+`setPort()` só bloqueavam reentrada checando `this.running`, que só vira
+`true` DEPOIS que `host.startService(...)` resolve — durante a janela do
+diálogo, um segundo `start`/`restart`/`setPort` disparado criava um SEGUNDO
+`SyncServer`/`SyncTeamService`, órfão o primeiro (exatamente o oposto do
+objetivo da feature).
+
+- **Correção**: `SyncController` ganhou `startOperationInProgress` (booleano,
+  `true` do início de start/restart/setPort até `doStart` terminar), mesmo
+  padrão de `refreshInProgress` de `runRefreshSync`. Segundo
+  start/restart/setPort disparado durante a janela é REJEITADO com aviso
+  (`host.info`), verificado ANTES de qualquer efeito colateral — não
+  derruba o serviço em criação nem persiste config por engano.
+- **Teste**: `syncController.test.ts` ganhou 5 testes novos (describe
+  "reentrância..."), 253/253 no total (era 248). `npm run lint`/`test`/`build`
+  limpos.
+- Detalhe completo (o bug exato, a correção, os testes) em
+  `docs/DECISIONS.md`, entrada 2026-08-02 "(3ª rodada, mais recente)", seção 1,
+  bloco "Correção de reentrância".
+- **Não testado em VS Code real** — só `FakeHost`, mesma limitação de sempre
+  para `SyncController`.
+
+## Nota de sessão (2026-08-02) — Item 1 do plano de 4 frentes concluído: "posse de porta" (oferecer encerrar o processo que ocupa a porta configurada)
+
+Continuação do plano de 4 frentes (nota abaixo, mesma data) — `extension-dev`
+fechou o item 1 (itens 2/4 já fechados por `luau-dev`, item 3 já fechado por
+`ui-dev` — os 4 itens do plano estão concluídos nesta entrada).
+
+Além do fallback automático de porta ocupada que já existia (2ª rodada,
+port+1...), a extensão agora pode **oferecer ao usuário encerrar o processo
+que ocupa a porta CONFIGURADA** antes de cair no fallback:
+
+- Módulo novo `vscode-extension/src/sync/PortOwnership.ts`: lockfile
+  (PID+porta gravado a cada bind bem-sucedido, num diretório persistente —
+  `ExtensionContext.globalStorageUri`) para identificar "zumbi órfão do
+  próprio SyncTeam" numa tentativa de bind futura; detecção do dono de uma
+  porta ocupada via `netstat`/`tasklist` (Windows) ou `lsof`/`ps` (Unix);
+  sondagem de handshake (`probePortSignal`) que conecta como cliente `ws`
+  real SEM nunca mandar `hello` — detecta se já existe uma sessão SyncTeam
+  ATIVA na porta (`connectionRejected`/`port_in_use`) para NUNCA oferecer
+  matar nesse caso (protege o cenário real de 2 contas Studio na mesma
+  máquina, `CANDIDATE_PORTS = {1400,1401}`).
+- `SyncServer.ts` ganhou o hook `onPortOccupied` (chamado só na porta
+  configurada, só na 1ª tentativa, nunca em loop) + `portLockDir` (grava/
+  remove o lockfile a cada bind/stop). `SyncController.ts` ganhou
+  `StartServiceResult.portReclaimed` para anunciar distintamente "processo X
+  encerrado com sucesso, porta assumida" (diferente da mensagem de
+  fallback). `extension.ts` liga tudo com um diálogo modal real
+  (`showWarningMessage`) — SEMPRE com confirmação explícita do usuário,
+  nunca automático, mesmo para o "zumbi identificado" default.
+- Detalhe completo (heurística de segurança, achados de teste — inclusive um
+  bug real de listener de erro assíncrono descoberto escrevendo os testes)
+  em `docs/DECISIONS.md`, entrada 2026-08-02 "(3ª rodada, mais recente)",
+  seção 1 (continuação).
+
+**Verificado**: `npm run lint` (tsc --noEmit) limpo; `npm run test` (vitest)
+248/248 passando (era 214 — 34 novos), suíte rodada duas vezes para confirmar
+que os testes com sockets/processos reais não são flaky; `npm run build`
+(esbuild) gera os dois bundles sem erro. **100% testável localmente sem
+Studio real** (detecção/kill de processo + bind de porta é lógica puramente
+local) — não há `[Hipótese]` pendente de round-trip com Team Create aqui; o
+único residual é o formato exato de `netstat`/`tasklist`/`lsof`/`ps` em
+variações de SO não testadas nesta sessão (degrada graciosamente para
+"processo não identificado", nunca quebra).
+
+**Plano de 4 frentes: as 4 partes estão concluídas** (posse de porta, `init.luau`→ModuleScript, settings por-place, aviso de lock mais leve) — ver as
+respectivas notas de sessão abaixo para o que cada uma cobriu, e
+`docs/DECISIONS.md` "3ª rodada" para o detalhe de cada seção.
+
+## Nota de sessão (2026-08-02) — Itens 2 e 4 do plano de 4 frentes concluídos: preservação de UUID na conversão Folder→ModuleScript + API de settings por-place
+
+Continuação do plano de 4 frentes (nota abaixo, mesma data) — `luau-dev`
+fechou os itens 2 e 4 (itens 1/3 são de `extension-dev`/`ui-dev`; item 3 já
+concluído, ver nota logo abaixo desta).
+
+**Item 2 (`init.luau` → ModuleScript preservando UUID)**: novo
+`ScriptRegistry.reassignInstance(uuid, newInstance)` reatribui um uuid já
+existente no registry para a Instance nova, em vez de alocar um uuid do
+zero. Conectado em `SourceWatcher.resolvePath` (ramo de conversão
+Folder→Script já existente desde 2026-07-26): captura o uuid da `Folder`
+antes de destruí-la e, se não-nil, reaproveita. **Nota honesta**: no caminho
+comum de hoje uma `Folder` pura nunca tem uuid registrado (só
+`LuaSourceContainer` é registrado), então esta checagem é defensiva/futuro-
+prova — o comportamento observável hoje não muda (uuid novo continua sendo
+alocado normalmente). Implementada porque o usuário pediu explicitamente
+"preservar o uuid existente".
+
+**Contrato de protocolo pedido pela tarefa**: documentado em detalhe em
+`docs/DECISIONS.md` (2026-08-02, 3ª rodada, seção 2, continuação) — decisão
+de **reaproveitar `scriptAdded`** (não criar `scriptClassChanged`, não
+reusar `scriptMoved`), porque um sinal novo só ajudaria o Studio que
+INICIOU a conversão (que já sabe o que fez), nunca o colaborador afetado
+pelo bug de duplicação (que só vê a conversão via replicação/`scriptAdded`
+genérico, igual a qualquer script novo). Inclui recomendação concreta para
+a tarefa futura de limpeza de disco (`extension-dev`): tratar `scriptAdded`
+para um path já com filhos mapeados como promoção pasta→módulo, removendo
+qualquer arquivo-folha órfão da representação anterior.
+
+**Achado novo durante a análise, não corrigido (fora de escopo + depende de
+comportamento de engine não confirmado)**: reparentar os filhos de uma
+`Folder` durante a conversão pode disparar `DescendantRemoving` neles (a
+nova Instance ainda não está na árvore no momento do reparent), o que
+desconecta o watch de Source deles (`unwatchScript`) — se `DescendantAdded`
+não os re-registrar individualmente depois, eles ficariam permanentemente
+fora do polling de Source pelo resto da sessão do plugin. `[Hipótese]`,
+requer `researcher` confirmar a semântica exata de
+`DescendantAdded`/`DescendantRemoving` para reparent em massa de subárvore
+antes de qualquer fix — ver detalhe completo e roteiro de teste em
+`docs/DECISIONS.md`.
+
+**Item 4 (settings por-place)**: `Config.luau` ganhou
+`Config.PLACE_SETTINGS_KEY`/`PLACE_SETTINGS_DEFAULTS`
+(`sourcePollIntervalSeconds`, `presencePollIntervalSeconds` — "preferência
+de posse de porta" fica de fora, é responsabilidade da extensão por decisão
+já registrada) + 3 funções: `Config.getPlaceSettings(pluginObject)`,
+`Config.getPlaceSetting(pluginObject, key)`,
+`Config.setPlaceSetting(pluginObject, key, value) -> ok, err`. Contorna
+`GetSetting`/`SetSetting` ser global à instalação (não por place) guardando
+um mapa `{[tostring(placeId)] = {...}}` num único slot, com
+read-modify-write completo a cada set. **Não construída a UI** (StatusPanel,
+`ui-dev`) nem o consumo real nos loops de runtime (SourceWatcher/
+TeamCreatePresence continuam com `Config.POLL_INTERVAL_SECONDS` fixo) —
+assinaturas completas documentadas em `docs/DECISIONS.md` para `ui-dev`
+consumir.
+
+**Validado**: `selene plugin/src` → 0 errors/37 warnings (mesma baseline de
+antes, nenhum warning novo); `stylua --check` limpo; `rojo build` (via
+`Tools/build-and-deploy-plugin.ps1`, `OK - plugin implantado`) + `lune run`
+sem erro de sintaxe nos 3 arquivos tocados (`Config.luau`,
+`ScriptRegistry.luau`, `SourceWatcher.luau`). **Nada testado em Studio
+real** — os dois itens ficam `[Hipótese]`, roteiros em `docs/DECISIONS.md`.
+
+**Item 1 (posse de porta)**: não tocado nesta tarefa — `extension-dev`.
+
+## Nota de sessão (2026-08-02) — Item 3 do plano de 4 frentes concluído: aviso de lock no VS Code sem overlay de fundo
+
+Retomada do plano de 4 frentes (nota abaixo, mesma data). `ui-dev` fechou o
+item 3 ("Lock no VS Code menos alarmante"): `LeaseBorderDecoration.ts` não
+cobre mais o documento inteiro com `backgroundColor` laranja translúcido
+(`isWholeLine`) — o tipo (renomeado `overlayDecoration` → `rulerDecoration`)
+agora só marca `overviewRulerColor` (régua/minimap), sem pintar o texto. O
+`hoverMessage` continua anexado à mesma range de documento inteiro (funciona
+independente de haver fundo visível), então passar o mouse em qualquer linha
+ainda mostra o aviso completo. O rótulo inline "🔒 Bloqueado por X" no fim da
+1ª linha foi mantido sem alteração.
+
+**Novo**: item de status bar dedicado (`statusBarItem` em
+`LeaseBorderDecoration`, prioridade 99 — logo à direita do item de conexão,
+prioridade 100 em `StatusBarItem.ts`) mostra `$(lock) <nome>` só quando o
+arquivo ATIVO está sob lease alheia (oculto via `.hide()` no caso contrário).
+Reaproveita `new vscode.ThemeColor("statusBarItem.warningBackground")` — a
+MESMA cor de aviso já usada no estado "aguardando plugin" da status bar de
+conexão — em vez de inventar uma cor nova, mantendo os dois avisos
+visualmente consistentes. Lógica pura nova em `leaseBorderState.ts`
+(`buildLeaseStatusBarVisual`, testada em `leaseBorderState.test.ts`, +3
+testes) — nenhuma regra de negócio nova, só empacota o mesmo
+`LeaseBorderState` que já decidia a decoração do editor.
+
+Detalhe completo (raciocínio de design, o que foi avaliado e descartado) em
+`docs/DECISIONS.md`, entrada 2026-08-02 "(3ª rodada, mais recente)", seção 3
+(continuação). **Verificado**: `npm run lint` (tsc --noEmit) limpo, `npm run
+test` 214/214 (era 211 — 3 novos), `npm run build` gera os dois bundles sem
+erro. Puramente visual/local à extensão — sem dependência de Team Create ou
+Studio real, então não há `[Hipótese]` pendente de round-trip aqui; só a
+mesma ressalva de sempre para tudo em `ui/*Decorations.ts` (não visto num VS
+Code real rodando de verdade, só tipado/testado). Limitação conhecida
+inalterada: bloqueio de edição de verdade (impedir digitar/salvar) continua
+fora de escopo, documentado no topo do próprio arquivo.
+
+**Itens 1/2/4 do plano de 4 frentes**: não tocados nesta tarefa (fora do
+escopo desta delegação — `extension-dev`/`luau-dev` cuidam deles em paralelo,
+ver nota abaixo).
+
+## Nota de sessão (2026-08-02) — Plano de 4 frentes, sessão pausada por limite de tokens
+
+Usuário trouxe relato de fragilidade em uso real e pediu 4 ajustes (detalhe
+completo das decisões em `docs/DECISIONS.md`, mesma data, "3ª rodada"):
+
+1. **Posse de porta** — diálogo na extensão perguntando se quer encerrar o
+   processo que ocupa a porta (zumbi do próprio SyncTeam por padrão; qualquer
+   processo, só com confirmação explícita a cada vez). Reverte parcialmente o
+   limite "nunca mata processo de terceiro" da nota abaixo (2ª rodada) —
+   `authority.md` já atualizado.
+2. **`init.luau` → ModuleScript** — hoje a pasta fica `Folder` para sempre;
+   falta destruir+recriar como `ModuleScript` preservando UUID
+   (`ScriptRegistry.luau`), e limpar duplicatas órfãs no disco de outros
+   colaboradores nessa conversão.
+3. **Lock no VS Code menos alarmante** — tirar o fundo laranja de
+   `LeaseBorderDecoration.ts` (documento inteiro), manter só overview ruler +
+   status bar.
+4. **Menu de configurações só no painel do plugin (Studio)** — expandir
+   `StatusPanel.luau` (autostart já existe desde 2026-07-20) com posse de
+   porta/intervalos; atenção: `plugin:GetSetting` é global ao Studio, não por
+   place — precisa virar mapa indexado por `game.PlaceId`.
+
+Também mencionado como possibilidade futura (NÃO decidido, só backlog):
+explorador de arquivos + painel de propriedades no VS Code, espelhando o
+Explorer/Properties do Studio. Não iniciar sem alinhar escopo antes (é
+grande).
+
+**Nada implementado ainda nesta rodada** — sessão pausada porque o usuário
+avisou que os tokens acabam e só voltam em ~3h30. Retomada agendada via
+skill `schedule`. Próximo passo ao retomar: ler esta nota + `docs/DECISIONS.md`
+(3ª rodada) inteira, depois delegar em paralelo — `extension-dev` (posse de
+porta, limpeza de duplicatas no `init.luau`), `luau-dev` (conversão
+Folder→ModuleScript preservando UUID, menu de configurações por place),
+`ui-dev` (aviso de lock gutter/status bar, UI do menu de configurações no
+`StatusPanel.luau`) — e fechar com `code-reviewer` revisando o conjunto antes
+de considerar pronto. Backlog de pesquisa pendente pro `researcher`: Roblox
+`SetAttribute` com valor Instance (comentário do usuário) — só decidir trocar
+o esquema de identidade atual se ele confirmar a API.
+
+## Nota de sessão (2026-08-02) — Fallback automático de porta ocupada (extensão)
+
+Implementação real (não só regra de comportamento) do exemplo motivador de
+`.claude/rules/authority.md` (criada na mesma data): porta configurada
+ocupada não é mais falha imediata. `SyncServer.start()`
+(`vscode-extension/src/sync/SyncServer.ts`) agora tenta `port+1`, `port+2`,
+... (até 5 alternativas por padrão, configurável, nunca ultrapassa 65535) só
+quando o erro é `EADDRINUSE`; qualquer outro erro de bind continua rejeitando
+na hora, sem fallback. **Nunca mata processo de terceiro** — limite explícito
+da regra de autoridade.
+
+Porta real fica visível dos dois jeitos pedidos: notificação imediata do VS
+Code (via `SyncController`, mesmo canal que já anuncia "servidor iniciado") E
+estado consultável — `ConnectionState.port` passou a significar "porta REAL
+em uso" (a status bar existente, que já lê esse campo, passou a mostrar a
+porta certa automaticamente, sem nenhuma mudança do lado visual) e
+`ConnectionState.portFallbackFrom` guarda a porta originalmente ocupada, para
+o `ui-dev` usar num polish futuro de tooltip se quiser (não obrigatório,
+sinalizado no relatório). Config do usuário (`syncteam.port`) nunca é
+sobrescrita — cada novo start tenta a porta original de novo.
+
+Detalhe completo (esquema exato, onde cada pedaço ficou, testes) em
+`docs/DECISIONS.md`, entrada 2026-08-02 "(2ª rodada, mais recente)". **100%
+verificado por teste automatizado** (`npm run lint` limpo, `npm run test`
+210/210 — 11 novos, `npm run build` gera os dois bundles sem erro) — feature
+puramente de bind de porta local, sem nenhuma dependência de Team Create ou
+Studio real, então não há `[Hipótese]` pendente de 2 Studios aqui.
+
+## Nota de sessão (2026-07-29) — `watchedRoots`: plugin (`luau-dev`) consome a lista dinâmica da extensão
+
+Continuação da nota abaixo (lado da extensão, mesma data) — agora o lado do
+plugin. `plugin/src/Config.luau` ganhou `Config.setDynamicWatchedRoots(names)`
+(resolve cada nome via `game:GetService` em `pcall`, nome inválido é pulado e
+devolvido para o chamador logar — nunca derruba o plugin) e
+`Config.getWatchedRoots()` passou a devolver a **UNIÃO** (deduplicada) da
+lista fixa com essa lista dinâmica (`nil` até a 1ª `watchedRoots` chegar —
+até lá, comportamento idêntico a antes). `plugin/src/SourceWatcher.luau`
+ganhou `scanAndWatch` extraído para módulo (idempotente por root via novo
+`scannedRoots`) e a função pública nova `SourceWatcher.applyWatchedRoots(names)`,
+que aplica a lista nova só ADICIONANDO os containers que a lista fixa ainda
+não cobria (nunca remove um já observado). `plugin/src/init.server.luau`
+ganhou o case `"watchedRoots"` no dispatch de `handleMessage`, mesmo padrão
+aditivo de `ping`/`deleteScript`/`connectionRejected` (não bumpa
+`PROTOCOL_VERSION`).
+
+**Decisão de timing**: scan inicial de `start()` continua rodando na hora,
+sem esperar `watchedRoots` (nenhum timeout novo) — quando a mensagem chega, o
+plugin escaneia os containers novos de forma síncrona (sem yields no
+caminho), então o `listScripts` que vem logo depois já reflete a lista
+atualizada, cumprindo o contrato sem arriscar travar a conexão inicial
+esperando uma mensagem que uma extensão mais velha nunca vai mandar.
+Detalhe completo/justificativa em `docs/DECISIONS.md` (mesma entrada
+2026-07-29, seção "Onde foi implementado (lado do plugin)").
+
+**Validação**: `Tools/build-and-deploy-plugin.ps1` limpo (`OK - plugin
+implantado`); `lune run` nos 3 arquivos tocados sem erro de sintaxe. **Nada
+testado em Studio real** — o cenário que motivou a tarefa (mount point novo
+tipo `ReplicatedFirst/First` sincronizando sem editar `Config.luau` à mão)
+segue `[Hipótese]`, roteiro de 4 passos em `docs/DECISIONS.md`, pendente do
+usuário validar com Studio real.
+
+## Nota de sessão (2026-07-29) — `watchedRoots`: extensão manda os serviços de topo do projeto ao plugin (lado da extensão; lado do plugin feito na nota acima)
+
+Bug real reportado pelo usuário em uso real: mount point novo no
+`default.project.json` (`ReplicatedFirst/First -> src/first`) não sincronizou
+nada, porque o plugin Studio tem uma lista FIXA hardcoded de "watched roots"
+(`plugin/src/Config.luau::Config.getWatchedRoots()`) que não incluía
+`ReplicatedFirst`. Um fix pontual (adicionar `ReplicatedFirst` à lista fixa)
+já foi aplicado e deployado para desbloquear o usuário — mas qualquer serviço
+fora dessa lista fixa (`Lighting`, `Teams`, `Chat`, `SoundService`, etc.)
+quebraria do mesmo jeito no futuro.
+
+**Decisão estrutural** (contrato completo, exaustivo, em `docs/DECISIONS.md`
+2026-07-29 — é a interface entre esta tarefa e a próxima do `luau-dev`): a
+extensão (única que lê o `default.project.json`) extrai os serviços de topo
+referenciados pelos mount points do projeto atual e manda essa lista ao
+plugin logo após o `hello`, via mensagem nova `watchedRoots {kind, roots:
+string[]}` — espontânea, aditiva (não muda `PROTOCOL_VERSION`). A lista fixa
+do plugin passa a ser só fallback (implementação do lado do plugin é tarefa
+SEPARADA, ainda não feita).
+
+**Só o lado da extensão foi implementado nesta sessão**:
+- `vscode-extension/src/mapping/projectMapping.ts`: função pura nova
+  `computeWatchedRoots(mountPoints): string[]` (primeiro segmento de cada
+  `dataModelPath`, deduplicado).
+- `vscode-extension/src/protocol.ts`: interface `WatchedRootsMessage`
+  documentada com o contrato completo (kind, campo, ordem no handshake, o que
+  o plugin deve fazer).
+- `vscode-extension/src/sync/SyncTeamService.ts`: `mountPoints` virou campo
+  guardado (`private readonly mountPoints`); no handler `onClientConnected`,
+  manda `watchedRoots` via `server.sendSpontaneous(...)` logo após o
+  `hello` ser aceito e ANTES de enfileirar `bridge.runInitialSync(...)`.
+
+**Testes**: 6 novos em `test/projectMapping.test.ts` (`computeWatchedRoots`,
+incluindo regressão explícita do caso `ReplicatedFirst`) + 2 de integração em
+`test/syncTeamService.test.ts` (socket `ws` real confirmando que
+`watchedRoots` chega ANTES do `listScripts` da sincronização inicial, com os
+`roots` corretos; e que `mountPoints: []` ainda manda a mensagem com `roots:
+[]`). 199 testes no total (era 191). `npx tsc --noEmit` limpo, `npm run test`
+199/199, `npm run build` + `npx @vscode/vsce package --no-dependencies`
+geraram `vscode-extension/syncteam-0.1.0.vsix` novo (não instalado —
+combinado com o usuário).
+
+**`[Verificado]` (automatizado, lado da extensão)**: envio no ponto certo do
+handshake e cálculo de `roots`, confirmados com socket `ws` real.
+**`[Decisão pendente]` (lado do plugin)**: tarefa seguinte, delegada
+separadamente ao `luau-dev` — deve ler só `docs/DECISIONS.md` (entrada
+2026-07-29) e `protocol.ts` atualizado, sem precisar re-derivar nada desta
+sessão nem re-ler `SyncTeamService.ts` inteiro.
+
+## Nota de sessão (2026-07-29) — Cursor remoto: rótulo inline → hover, barra piscando (extensão, UX)
+
+Pedido do usuário: o rótulo colorido com o nome do colaborador em
+`RemoteCursorDecorations.ts` era um pseudo-elemento `after` **inline** —
+empurrava o texto real do documento pra abrir espaço pra si na posição do
+cursor remoto, deixando ilegível quando o cursor estava no meio de uma
+palavra (ex. `module.Func[nome]tion()`).
+
+**Mudança**: `vscode-extension/src/ui/RemoteCursorDecorations.ts` reescrito.
+A barra vertical (2px, cor do colaborador) continua na posição exata do
+cursor, mas agora **pisca** (`setInterval` de 530ms alternando lista
+vazia/cheia de `DecorationOptions` no mesmo `DecorationType` — a API do VS
+Code não tem `@keyframes`/animação CSS). O rótulo com o nome **nunca mais
+desloca texto**: virou um badge que só aparece no **hover nativo** do VS
+Code, via um `DecorationType` novo e separado (`hoverArea`, sem estilo
+visual próprio, NÃO pisca — precisa estar sempre presente pro hover
+funcionar mesmo na fase "apagada" da barra) cobrindo uma range 1 caractere
+mais larga que o cursor (facilita o mouse acertar um alvo que antes tinha
+largura zero) sem mover a barra visual, que continua ancorada exatamente em
+`cursorPos`.
+
+**Pesquisa feita antes de depender da técnica de hover colorido**
+(`.claude/research/2026-07-29-markdownstring-supporthtml-span-style-badge.md`):
+confirmado no código-fonte do VS Code (`domSanitize.ts`/`markdownRenderer.ts`,
+branch `main` e tag estável `1.131.0`) que `MarkdownString` com
+`supportHtml: true` permite `style` inline **somente em `<span>`** e
+**somente** `color`/`background-color`/`border-radius` **nessa ordem exata**
+(hex ou `var(--vscode-*)`, sem `padding`/`display` — usei `&nbsp;` como
+respiro visual em vez de `padding`, que derrubaria o atributo `style`
+inteiro por não estar na allowlist). Não depende de `isTrusted` (isso só
+afeta links `command:`). `supportHtml` existe desde VS Code 1.62
+(out/2021), sem necessidade de fallback.
+
+**Validação**: `npx tsc --noEmit` limpo, `npm run test` 191/191 (nenhum
+teste tocava este arquivo antes nem precisou mudar — decoração visual
+depende da API real do VS Code, sem teste unitário direto, mesmo padrão já
+aceito para `LeaseBorderDecoration.ts`/`FilePresenceDecorations.ts`).
+`npm run build` + `npx @vscode/vsce package --no-dependencies` geraram
+`vscode-extension/syncteam-0.1.0.vsix` novo.
+
+**`[Hipótese]`, não testado ponta-a-ponta**: é puramente visual dentro do
+editor VS Code — não dá pra validar 100% sem abrir 2 janelas de VS Code
+reais com 2 colaboradores. Roteiro sugerido para quando isso rodar contra
+Studio/VS Code real: (1) confirmar que a barra pisca visivelmente numa
+cadência parecida com o caret nativo; (2) confirmar que o texto ao redor do
+cursor remoto NUNCA se desloca, mesmo com o cursor no meio de uma palavra;
+(3) passar o mouse sobre a barra (inclusive na fase "apagada" do pisca) e
+confirmar que o badge colorido aparece com fundo na cor do colaborador e
+texto branco, cantos arredondados; (4) mover o cursor remoto e confirmar que
+a barra reaparece sólida na hora (reset da fase do pisca), não numa fase
+aleatória do ciclo; (5) testar em nome de colaborador com caracteres
+especiais (`&`, `<`, `>`) e confirmar que o badge não quebra visualmente
+(escape de HTML).
+
+## Nota de sessão (2026-07-27) — Fila FIFO serializa mensagens espontâneas mutantes (extensão)
+
+Bug real reportado pelo usuário em uso real (projeto de jogo, não spike):
+arrastar todos os filhos de uma `Folder` "Server" para dentro de um `Script`
+também chamado "Server" no Explorer do Studio gerou uma rajada de ~30
+`scriptMoved` quase simultâneos. Resultado: o `init.server.luau` esperado
+nunca foi criado — em vez disso a pasta antiga ficou intacta E uma pasta nova
+aninhada apareceu com uma CÓPIA de tudo (duplicação de arquivos em disco).
+
+**Causa raiz confirmada** (detalhe completo em `docs/DECISIONS.md`
+2026-07-27): `SyncTeamService.routeSpontaneous` despachava
+`sourceChanged`/`scriptAdded`/`scriptMoved`/`scriptRemoved` fire-and-forget a
+partir do handler SÍNCRONO de mensagem do `SyncServer` — uma rajada disparava
+múltiplas chamadas CONCORRENTES a `SyncBridge.handleScriptMoved`/etc., todas
+mutando os MESMOS mapas (`scripts`/`diskPathByUuid`/`uuidByDiskPath`/
+`contentCache`) com I/O de disco assíncrono intercalado, corrompendo o layout
+final.
+
+**Fix**: fila FIFO assíncrona (`SyncTeamService.enqueueMutation`/`queueTail`)
+serializa `sourceChanged`/`scriptAdded`/`scriptMoved`/`scriptRemoved`
+(`routeSpontaneous`), `notifyLocalFileChange` (watcher local — mesmos mapas
+compartilhados), `runInitialSync` e `refreshSync()` — cada handler completa
+por inteiro (todos os `await` internos) antes do próximo começar; uma falha
+não trava a fila. Deliberadamente FORA da fila:
+`leaseChanged`/`presenceChanged`/`presenceLeft`/`log` (nunca tocam
+`SyncBridge`/disco — enfileirá-los só adicionaria latência a mensagens de
+alta frequência sem ganho de correção).
+
+**Testes** (`vscode-extension/test/syncTeamService.test.ts`, novo describe):
+mecanismo puro da fila (FIFO + falha não trava); regressão do bug real —
+rajada de 3 `scriptMoved` reparentando scripts para dentro de um Script
+existente, sem aguardar entre as mensagens, contra `NodeDiskIO` real num
+tmpdir, confirmando promoção correta para `init.server.luau` sem duplicação;
+`notifyLocalFileChange` comprovadamente na mesma fila (ordem de log). 191
+testes no total (era 188). `npx tsc --noEmit` limpo, `npx vitest run
+--pool=threads` 191/191, `npm run build` gera os dois bundles sem erro.
+
+**`[Verificado]` (automatizado)**: o mecanismo de fila em si, testado com
+mensagens concorrentes simuladas de forma determinística.
+**`[Hipótese]` (Studio real)**: round-trip genuíno (reproduzir a rajada real
+de ~30 `scriptMoved` arrastando filhos de uma Folder para dentro de um
+Script no Studio de verdade) ainda não confirmado — pendente de roteiro
+manual/2 Studios reais.
+
+## Nota de sessão (2026-07-26) — Mitigação de undo (Ctrl+Z) destruindo instances de coordenação (plugin)
+
+Usuário reportou bug real: apertar Ctrl+Z no Studio reverte/destrói as
+instances de coordenação do SyncTeam (sessões/heartbeats/leases/presença sob
+`TestService.SyncTeam`), quebrando o plugin. Pesquisa prévia
+(`.claude/research/2026-07-26-changehistoryservice-undo-exclusion.md`)
+confirmou: não existe API oficial pra excluir uma Instance do
+`ChangeHistoryService`; achado colateral importante — mudanças em `Source`
+são confirmadas por staff da Roblox como NUNCA capturadas pelo
+`ChangeHistoryService` ("Working as Designed"), então o bug é exclusivamente
+sobre a árvore de metadados, nunca sobre código sincronizado.
+
+**Mitigação de 2 camadas** (detalhe completo, incluindo lista exata de
+arquivos e roteiro manual de 6 passos, em `docs/DECISIONS.md` 2026-07-26):
+
+1. **Fast-path best-effort**: `instance.Archivable = false` gravado antes de
+   `.Parent` em toda Instance de coordenação criada sob
+   `TestService.SyncTeam` (`TeamCreateSchema.luau`, `TeamCreateElection.luau`,
+   `TeamCreateLease.luau`, `TeamCreatePresence.luau`, `ScriptRegistry.luau`).
+2. **Self-healing reativo (caminho garantido)**: módulo novo
+   `plugin/src/TeamCreateUndoGuard.luau`, escuta
+   `ChangeHistoryService.OnUndo`/`OnRedo` desde o boot do plugin (fora de
+   start()/stop()) e, a cada disparo, chama `checkIntegrity()` (novo) de
+   `TeamCreateElection`/`TeamCreateLease`/`TeamCreatePresence` — cada um
+   reaproveita a própria lógica "criar se não existir" já existente para
+   recriar sessão/containers de lease/presença ausentes. `TeamCreateLease`/
+   `TeamCreatePresence.checkIntegrity()` também corrigem um gap já
+   documentado desde 2026-07-07 (containers cacheados 1x, nunca refeitos).
+
+`ScriptRegistry.luau`/`TeamCreateSchema.luau` ganharam só a camada 1
+(fora do escopo explícito da tarefa) — risco residual aceito e documentado no
+código/DECISIONS.md.
+
+`rojo build` + `lune run` limpos nos 7 arquivos tocados (5 editados + 1 novo +
+`init.server.luau`); buildado e implantado via
+`Tools/build-and-deploy-plugin.ps1` (`OK - plugin implantado`).
+**`[Hipótese]`**: nada testado em Studio real nesta tarefa — mitigação de
+undo exige apertar Ctrl+Z DE VERDADE dentro do Studio (ação física, fora do
+alcance de `Tools/`). Roteiro manual completo de 6 passos em
+`docs/DECISIONS.md` 2026-07-26, pendente de confirmação do usuário.
+
+## Nota de sessão (2026-07-26) — Folder existente ganhando `init.luau` agora vira ModuleScript/Script corretamente (plugin)
+
+Usuário reportou: pasta já sincronizada (com scripts filhos, existia no
+Studio como `Folder` simples) recebendo um `init.luau` novo no VS Code
+falhava com "alvo não é um script" — `SourceWatcher.resolvePath`
+(`plugin/src/SourceWatcher.luau`) sempre reusava o child existente no
+segmento final sem comparar classe, então a `Folder` nunca virava
+`LuaSourceContainer`. Quebrava a convenção Rojo "pasta com init.* = a própria
+pasta vira o script" para pastas que já existiam antes do `init.*` chegar
+(caso comum: pasta criada primeiro só pra agrupar filhos, ganha `init.luau`
+depois). Detalhe completo da causa raiz e do fix (conversão Folder→Script*
+preservando Name/Parent/filhos, guard `index > 1` contra converter Services)
+em `docs/DECISIONS.md` 2026-07-26.
+
+`rojo build` + `lune run` limpos em `SourceWatcher.luau`; buildado e
+implantado via `Tools/build-and-deploy-plugin.ps1`. **`[Hipótese]`**: nada
+testado em Studio real nesta tarefa (cenário exige criar arquivo novo via VS
+Code apontando pra pasta já materializada — fora do alcance de `Tools/` sem
+harness rodando) — roteiro de 4 cenários em `docs/DECISIONS.md` 2026-07-26,
+pendente de confirmação do usuário.
+
+## Nota de sessão (2026-07-20) — toggle real de "Reconectar automaticamente" no painel (plugin)
 
 Pedido do usuário (`ui-dev`): expor `Config.AUTOSTART_SETTING_KEY` (existente
 desde 2026-07-16, só ligável via Command Bar) como toggle de verdade na tela

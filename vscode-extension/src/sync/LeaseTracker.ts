@@ -62,4 +62,24 @@ export class LeaseTracker {
   getLease(uuid: string): LeaseState | undefined {
     return this.leases.get(uuid);
   }
+
+  /**
+   * Diferente de `isOwnedByMe` (otimista: também `true` quando a lease ainda
+   * não foi arbitrada OU está livre — pensado para "posso deixar o usuário
+   * editar sem aviso?"), este método só retorna `true` quando a lease foi
+   * arbitrada de fato E o dono é explicitamente eu. Usado pelo gatilho de
+   * "handoff quase-instantâneo" (`onDidChangeTextDocument` em extension.ts,
+   * 2026-08-02, ver docs/DECISIONS.md "8ª rodada"): esse canal extra só deve
+   * mandar Source do BUFFER quando a posse já é minha de verdade — nunca para
+   * um arquivo alheio, nem para a primeira edição de um arquivo cujo uuid
+   * ainda não existe/lease ainda não foi resolvida (esses continuam só pelo
+   * fluxo de save já existente).
+   */
+  isExplicitlyOwnedByMe(uuid: string): boolean {
+    if (this.myClientId === null) {
+      return false; // sem clientId próprio, nunca há como confirmar posse explícita.
+    }
+    const lease = this.leases.get(uuid);
+    return lease !== undefined && lease.ownerClientId === this.myClientId;
+  }
 }

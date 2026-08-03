@@ -61,7 +61,44 @@ local portSource = vide.source(Config.DEFAULT_PORT)
 local viewSource = vide.source("main")
 local notificationsEnabledSource = vide.source(true)
 local autoReconnectEnabledSource = vide.source(false)
+-- "Nome de exibição customizado" (M4.5+, implementado de verdade em
+-- 2026-08-02 — antes um placeholder "em breve"). Default "" aqui é só o
+-- placeholder pré-init (mesmo padrão de notificationsEnabledSource/
+-- autoReconnectEnabledSource acima); PluginUI.init lê o valor real via
+-- Config.resolveCustomDisplayName.
+local customDisplayNameSource = vide.source("")
+-- "Liberar lease após (s)" (2026-08-02, docs/DECISIONS.md "8ª rodada",
+-- handoff quase-instantâneo de lease). Default aqui é só o placeholder
+-- pré-init (mesmo padrão dos demais Sources desta seção) — lido de
+-- Config.PLACE_SETTINGS_DEFAULTS.leaseStaleAfterSeconds em vez de um número
+-- mágico solto, para nunca divergir do default real se ele mudar em
+-- Config.luau. PluginUI.init sobrescreve com o valor por-place de verdade via
+-- Config.getPlaceSetting.
+local leaseStaleAfterSecondsSource = vide.source(Config.PLACE_SETTINGS_DEFAULTS.leaseStaleAfterSeconds)
 local sessionsMapSource = vide.source({})
+
+-- ReSync (2026-08-02, docs/DECISIONS.md "5ª rodada"): estado visual do botão
+-- RESYNC do painel. "idle" (padrão) -> "syncing" (empurrado por
+-- init.server.luau assim que o clique dispara a mensagem espontânea
+-- resyncRequest) -> "done" (init.server.luau recebe resyncResult ok=true,
+-- volta sozinho a "idle" depois de ~1.2s) ou de volta direto a "idle" se
+-- resyncResult vier com ok=false (e um Toast de erro separado, ver
+-- init.server.luau). Mesmo padrão de setter externo que
+-- connectionStatusSource/portSource já usam (PluginUI.setResyncState,
+-- abaixo) — este módulo nunca decide sozinho quando mudar de estado, só
+-- reflete o que init.server.luau empurra.
+local resyncStateSource = vide.source("idle")
+
+-- Item 1 da tarefa 2026-07-21 (linha INFO no gap entre título e Porta, ver
+-- StatusPanel.luau): `infoTextSource` reflete a última mensagem IMPRESSA por
+-- Logger.log/Logger.notify (Logger.getLastMessage(), sem prefixo de
+-- timestamp) e `infoElapsedSecondsSource` os segundos decorridos desde
+-- então — refreshInfoRow() (abaixo) recalcula os dois a cada 1s. Placeholder
+-- inicial até a 1ª mensagem impressa desta sessão do plugin (deve ser quase
+-- imediato: PluginUI.init loga "painel: inicializado." perto do fim de si
+-- mesma, antes do 1º refreshInfoRow()).
+local infoTextSource = vide.source("aguardando eventos...")
+local infoElapsedSecondsSource = vide.source(0)
 
 -- --------------------------------------------------------- tabela de sessões
 
@@ -137,6 +174,31 @@ local function refreshSessionsMap()
 	end
 end
 
+-- ------------------------------------------------------------------- info row
+
+-- Item 1 da tarefa 2026-07-21: poll de Logger.getLastMessage() (SEM callback
+-- injetado — leitura passiva, mesma disciplina de polling de
+-- .claude/rules/luau.md) chamado a cada 1s por um task.spawn próprio em
+-- PluginUI.init (cadência independente de Config.POLL_INTERVAL_SECONDS/
+-- refreshSessionsMap, que não precisa ser tão fina). `text == nil` (nenhuma
+-- mensagem impressa ainda nesta sessão do plugin) deixa o placeholder
+-- inicial de infoTextSource intacto. O contador nunca é "resetado"
+-- explicitamente aqui: `os.clock() - updatedAt` já dá ~0 na primeira leitura
+-- depois de uma mensagem nova, então só recalcular a cada 1s a partir do
+-- MESMO `updatedAt` já produz o crescimento contínuo pedido — ele só some
+-- para 0 de novo quando Logger.getLastMessage() devolver um `updatedAt` mais
+-- recente (ou seja, uma mensagem nova de verdade chegou).
+local function refreshInfoRow()
+	local text, updatedAt = Logger.getLastMessage()
+	if text == nil then
+		return
+	end
+	if text ~= infoTextSource() then
+		infoTextSource(text)
+	end
+	infoElapsedSecondsSource(math.max(0, math.floor(os.clock() - updatedAt)))
+end
+
 -- ------------------------------------------------------------------ notify
 
 -- Injetado em Logger.initNotify por init.server.luau (dentro de start()) —
@@ -151,7 +213,8 @@ end
 -- aparece sozinho sobre o Studio, sem depender do painel estar aberto — abrir
 -- o painel à força seria intrusivo (o usuário pode tê-lo fechado de
 -- propósito). Ressalva: a pesquisa indica que o overlay via CoreGui talvez só
--- cubra o viewport 3D; o log no Output continua sendo o registro garantido.
+-- cubra o viewport 3D; o encaminhamento por WS (Tools/) continua sendo o
+-- registro garantido (Logger não imprime mais no Output desde 2026-08-02).
 function PluginUI.notify(text)
 	if not notificationsEnabledSource() then
 		return
@@ -186,15 +249,27 @@ function PluginUI.setPort(port)
 	end
 end
 
+-- Empurrado por init.server.luau nas transições do fluxo ReSync (clique no
+-- botão -> "syncing"; resyncResult ok=true -> "done" -> de volta a "idle"
+-- sozinho depois de ~1.2s; resyncResult ok=false -> de volta a "idle" direto).
+-- Mesmo padrão de dedupe/validação de PluginUI.setConnectionStatus acima.
+local VALID_RESYNC_STATES = { idle = true, syncing = true, done = true }
+function PluginUI.setResyncState(state)
+	if VALID_RESYNC_STATES[state] and state ~= resyncStateSource() then
+		resyncStateSource(state)
+	end
+end
+
 -- ------------------------------------------------------------------ init/stop
 
 -- Chamado 1x por init.server.luau, fora do ciclo start()/stop() (mesmo
 -- lugar/momento em que a toolbar antiga era criada) — cria toolbar+widget,
 -- monta a árvore Vide, e inicia o refresh em segundo plano da tabela de
 -- sessões. `callbacks` = { onConnect, onDisconnect, onPortChange(newPort),
--- onAutoReconnectToggle(newValue) } (mesma nomenclatura/contrato de
--- start()/stop()/troca de porta já existentes em init.server.luau — este
--- módulo só invoca, nunca reimplementa a lógica de conexão).
+-- onAutoReconnectToggle(newValue), onResyncRequest() } (mesma
+-- nomenclatura/contrato de start()/stop()/troca de porta/ReSync já
+-- existentes em init.server.luau — este módulo só invoca, nunca reimplementa
+-- a lógica de conexão/sincronização).
 -- `onAutoReconnectToggle` é repassado DIRETO pro StatusPanel sem lógica
 -- própria aqui (diferente de onNotificationsToggle, implementado abaixo só
 -- com plugin:SetSetting): a ação de "ligar auto-reconectar tenta conectar já
@@ -213,12 +288,14 @@ function PluginUI.init(pluginObject, callbacks)
 	local ok, err = pcall(function()
 		notificationsEnabledSource(Config.resolveNotificationsEnabled(pluginObject))
 		autoReconnectEnabledSource(Config.resolveAutoStartEnabled(pluginObject))
+		customDisplayNameSource(Config.resolveCustomDisplayName(pluginObject))
+		leaseStaleAfterSecondsSource(Config.getPlaceSetting(pluginObject, "leaseStaleAfterSeconds"))
 
 		local toolbar = pluginObject:CreateToolbar("SyncTeam")
 		local toggleButton = toolbar:CreateButton(
 			"syncteam-toggle-panel",
 			"Mostra/esconde o painel de status do SyncTeam",
-			"",
+			"rbxassetid://84898837758979",
 			"SyncTeam"
 		)
 		toggleButton.ClickableWhenViewportHidden = true
@@ -267,6 +344,53 @@ function PluginUI.init(pluginObject, callbacks)
 			-- ligado) vivem em init.server.luau, o único lugar que conhece
 			-- start()/isInRunOrPlayMode().
 			onAutoReconnectToggle = callbacks.onAutoReconnectToggle,
+			-- "Nome de exibição customizado" (2026-08-02, saiu da lista "em
+			-- breve"): SELF-CONTAINED aqui, não passthrough — diferente de
+			-- onAutoReconnectToggle (que depende de start()/isInRunOrPlayMode(),
+			-- só em init.server.luau), a ação completa (persistir a setting +
+			-- atualizar o Username já publicado na sessão atual) só depende de
+			-- Config/TeamCreateElection, os dois já requeridos no topo deste
+			-- módulo — nenhuma lógica exclusiva de init.server.luau envolvida.
+			onCustomDisplayNameSubmit = function(newValue)
+				local okSet, errSet = pcall(function()
+					pluginObject:SetSetting(Config.CUSTOM_DISPLAY_NAME_SETTING_KEY, newValue)
+				end)
+				if not okSet then
+					log("falha ao salvar nome de exibição customizado:", tostring(errSet))
+					return
+				end
+				-- Atualiza o Username já publicado na sessão atual (se houver) sem
+				-- exigir reconectar — TeamCreateElection.setLocalUsername já degrada
+				-- em no-op se a eleição não estiver rodando (start() ainda não
+				-- chamado / desconectado no momento); o próximo start() lê a setting
+				-- de novo do zero.
+				TeamCreateElection.setLocalUsername(newValue)
+			end,
+			-- "Liberar lease após (s)" (2026-08-02, docs/DECISIONS.md "8ª rodada"):
+			-- SELF-CONTAINED aqui, mesmo raciocínio de onCustomDisplayNameSubmit
+			-- acima (Config já requerido no topo deste módulo, nenhuma lógica
+			-- exclusiva de init.server.luau envolvida) — MAS, diferente de
+			-- onCustomDisplayNameSubmit, não precisa de nenhuma chamada extra de
+			-- "republicar agora": TeamCreateLease.readLiveIntents já relê
+			-- Config.getPlaceSetting(..., "leaseStaleAfterSeconds") a cada ciclo
+			-- do líder (até Config.POLL_INTERVAL_SECONDS = 0.5s depois), então só
+			-- persistir a setting já é suficiente. StatusPanel.luau já validou/
+			-- rejeitou não-positivo antes de chamar este callback — Config.
+			-- setPlaceSetting valida de novo por conta própria (defesa em
+			-- profundidade, não confia cegamente no chamador).
+			onLeaseStaleAfterSecondsSubmit = function(newValue)
+				local okSet, errSet = Config.setPlaceSetting(pluginObject, "leaseStaleAfterSeconds", newValue)
+				if not okSet then
+					log("falha ao salvar 'liberar lease após (s)':", tostring(errSet))
+				end
+			end,
+			-- Passthrough puro (ReSync, 2026-08-02, docs/DECISIONS.md "5ª
+			-- rodada" — mesmo padrão de onConnect/onDisconnect acima): o envio
+			-- da mensagem espontânea `resyncRequest` e o estado visual
+			-- "syncing" vivem em init.server.luau, o único lugar que conhece
+			-- sendMessage/o client WS. Este módulo só invoca o callback e
+			-- reflete o estado de volta via resyncState/PluginUI.setResyncState.
+			onResyncRequest = callbacks.onResyncRequest,
 		}
 
 		local state = {
@@ -275,7 +399,12 @@ function PluginUI.init(pluginObject, callbacks)
 			view = viewSource,
 			notificationsEnabled = notificationsEnabledSource,
 			autoReconnectEnabled = autoReconnectEnabledSource,
+			customDisplayName = customDisplayNameSource,
+			leaseStaleAfterSeconds = leaseStaleAfterSecondsSource,
 			sessionsMap = sessionsMapSource,
+			infoText = infoTextSource,
+			infoElapsedSeconds = infoElapsedSecondsSource,
+			resyncState = resyncStateSource,
 		}
 
 		-- `StatusPanel.build` (e tudo que ele cria por dentro — `vide.create`
@@ -299,7 +428,7 @@ function PluginUI.init(pluginObject, callbacks)
 	-- de acesso a CoreGui degrada para "sem toast visível" sem impedir o
 	-- refresh da tabela de sessões abaixo (o painel já montou com sucesso).
 	local okToast, errToast = pcall(function()
-		toastHandle = Toast.mount()
+		toastHandle = Toast.mount(pluginObject)
 	end)
 	if not okToast then
 		log("painel: falha ao criar overlay de notificação (CoreGui):", tostring(errToast))
@@ -320,6 +449,22 @@ function PluginUI.init(pluginObject, callbacks)
 	end)
 
 	log("painel: inicializado.")
+
+	-- Item 1 da tarefa 2026-07-21: cadência PRÓPRIA de 1s (o contador "Ns" da
+	-- linha INFO precisa de granularidade de segundo, independente de
+	-- Config.POLL_INTERVAL_SECONDS usado acima para a tabela de sessões) —
+	-- populamento imediato (sem esperar o 1º task.wait) para o painel já
+	-- abrir refletindo a linha "painel: inicializado." de log acima em vez de
+	-- um placeholder por 1s.
+	refreshInfoRow()
+	task.spawn(function()
+		while running and currentToken == myToken do
+			task.wait(1)
+			if running and currentToken == myToken then
+				refreshInfoRow()
+			end
+		end
+	end)
 end
 
 -- Chamado em plugin.Unloading (init.server.luau) — separado do stop() da
