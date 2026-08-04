@@ -3,6 +3,570 @@
 Padrões visuais e convenções de texto adotados no SyncTeam.
 Atualize ao final de cada tarefa; mantenha curto e acionável.
 
+## Logo do SyncTeam no `StatusBarItem` via fonte de ícone (fantasticon), 2026-08-03
+
+Pedido: mostrar a logo (já existente, `vscode-extension/resources/icon.svg`/
+`icon.png`, 2 cores `#2c333f`/`#0268fc`) no `StatusBarItem` (barra inferior
+do VS Code). `StatusBarItem.text` só aceita texto + `$(codicon)` — sem
+caminho de SVG cru (pesquisa prévia,
+`.claude/research/2026-08-03-statusbaritem-custom-icon-svg.md`). Único
+caminho real: `contributes.icons` no `package.json` apontando pra uma FONTE
+de ícone (glifo, WOFF), gerada com `fantasticon` (mesma ferramenta do
+`microsoft/vscode-codicons`). Detalhe completo em `docs/DECISIONS.md`
+"14ª rodada" (2026-08-03).
+
+**Padrão a reusar sempre que precisar de outro ícone customizado em
+`$(nome)` daqui pra frente**:
+- Script dedicado `vscode-extension/scripts/build-icon-font.cjs`, rodado
+  via `"prebuild"` no `package.json` (dispara sozinho em `npm run build`,
+  sem passo manual) — copia o(s) SVG(s) fonte pra uma pasta temporária de
+  input (`resources/icon-font-src/`, REGENERADA a cada build, nunca editada
+  à mão) e chama `fantasticon` (`generateFonts`, API programática, não a
+  CLI).
+- **BUG real do `fantasticon@4.1.0` no Windows** (confirmado isolado, não
+  suposição): a função interna `loadPaths` monta o glob com
+  `path.join(dir, "**/*.svg")` — no Windows isso produz separador `\`, e o
+  `glob@13` (dependência direta do fantasticon) trata `\` como caractere de
+  ESCAPE no padrão, não como separador — o glob nunca acha nada e falha com
+  "No SVGs found" mesmo com o arquivo existindo. Reproduzido isolado:
+  `glob('dir\\**\\*.svg')` → `[]`, `glob('dir/**/*.svg')` → acha certo.
+  **Workaround**: monkeypatch de `path.join` só durante a chamada a
+  `generateFonts` (`path.join = (...a) => original(...a).split(path.sep).join('/')`),
+  restaurado em `finally`. **Só funciona chamando a build CJS do fantasticon
+  (`require("fantasticon")`, resolve pra `dist/index.cjs`)** — testado
+  isolado que a build ESM (`import`, resolve pra `dist/index.js`) bundla
+  sua própria referência a `path` internamente e NÃO respeita esse
+  monkeypatch externo (mesmo teste, troquei só require→import, voltou a
+  falhar "No SVGs found"). Por isso `build-icon-font.cjs` é
+  **deliberadamente `.cjs`**, nunca `.mjs`, mesmo o resto do projeto usando
+  `esbuild.config.mjs` — não "consertar" pra ESM sem retestar isso primeiro.
+- Fonte gerada (`.woff`) + JSON de codepoints + a pasta de input
+  (`icon-font-src/`) são **artefato de build, não commitado** — mesmo
+  tratamento de `dist/` (gitignorado na raiz do repo, MAS ainda assim vai
+  parar no `.vsix` porque `vsce` empacota o que existe em disco no momento
+  do `vsce package`, não filtra por `.gitignore` — confirmado empírico
+  comparando um baseline `vsce package` ANTES de mexer em qualquer coisa:
+  `dist/extension.js`, já gitignorado desde antes desta tarefa, sempre
+  apareceu no `.vsix`). O `.json`/pasta de input intermediários (não
+  precisam ir no pacote final) são excluídos via `.vscodeignore` — só o
+  `.woff` de fato precisa estar no `.vsix` (é o que `contributes.icons`
+  referencia).
+- **Codepoint: sempre ler o valor REAL gerado, nunca copiar o exemplo de um
+  research doc/exemplo genérico** — o script loga o codepoint decimal→hex
+  (`\FXXX`) a cada build; conferir contra o `fontCharacter` gravado em
+  `contributes.icons`. Nesta tarefa: gerou `61697` decimal = `\F101` (não o
+  `\E001` do exemplo da pesquisa).
+- **Fonte de ícone é SEMPRE monocromática** — mesmo se o SVG de origem tiver
+  múltiplas cores/`<path>` com `fill` diferentes (nosso logo tem 2), WOFF/TTF
+  só carregam a FORMA (contorno), a cor final vem inteira do CSS/tema de
+  quem usa `$(nome)` (status bar = cor do texto da status bar). Perda de
+  marca (2 tons → 1 cor) é esperada e aceita, não é bug a corrigir. Ao
+  verificar isso via headless Chrome, cuidado com falso positivo: uma
+  primeira tentativa mostrou as 2 cores originais renderizando — era
+  artefato de CACHE/TIMING (screenshot tirado antes do `@font-face` acabar
+  de carregar via `file://`, browser caiu num fallback de sistema
+  coincidentemente colorido) — só ficou confiável usando `data:` URI inline
+  (síncrono, sem race) + forçar `color: red` no CSS pra provar que o glifo
+  é mesmo monocromático (saiu vermelho sólido, forma preservada).
+- **Adição de marca, nunca substituição do indicador de estado**: quando o
+  pedido é "mostra a logo" num widget que já comunica estado (aqui, os 3
+  ícones `$(circle-outline)`/`$(broadcast)`/`$(circle-filled)` do
+  `StatusBarItem`), o padrão é PREFIXAR o ícone de marca antes do indicador
+  existente (`` `${BRAND_ICON} $(circle-outline) ...` ``), nunca trocar um
+  pelo outro — os 3 estados continuam 100% distinguíveis sem a logo.
+- **Verificação sem VS Code real**: build+lint+teste+`vsce package` reais
+  (unzip do `.vsix` pra conferir presença do `.woff` e integridade de
+  `contributes.icons`) dão confiança alta sem precisar abrir o VS Code de
+  verdade. Deliberadamente **não** instalei a extensão no VS Code real do
+  usuário nem tirei screenshot da tela dele para "ver o glifo aparecer" —
+  abrir uma janela nova/capturar a tela inteira sem pedido explícito é
+  invasivo demais pra esse nível de verificação (a tarefa já sinalizava
+  "print não dá" como esperado). Documentado como `[Hipótese]` (alta
+  confiança) em vez de `[Verificado]`.
+
+## "Nome de exibição customizado" saiu de "em breve" — implementado de verdade, 2026-08-02 (8ª rodada)
+
+Pedido do usuário: tirar 1 dos 3 itens "em breve" do painel de Configurações
+(`DisabledSettingRow`) e implementar de verdade; os outros 2
+("Containers observados", "Nível de log") **continuam** desabilitados —
+não tocados. Arquivos: `plugin/src/Config.luau`,
+`plugin/src/TeamCreateElection.luau`, `plugin/src/init.server.luau`,
+`plugin/src/ui/StatusPanel.luau`, `plugin/src/ui/PluginUI.luau`.
+
+**Persistência**: `Config.CUSTOM_DISPLAY_NAME_SETTING_KEY =
+"SyncTeam_CustomDisplayName"` + `Config.resolveCustomDisplayName(pluginObject)`
+— MESMO esqueleto de `resolveNotificationsEnabled`/`resolveAutoStartEnabled`
+(GetSetting em pcall; nunca setado ou tipo errado caem no default), só o tipo
+esperado muda para `"string"` (as outras duas são `"boolean"`). Default `""`
+= "usar o nome do Roblox normalmente". Setting GLOBAL à instalação do Studio
+(mesmo grupo de NOTIFICATIONS/AUTOSTART) — **não** é o mecanismo por-place
+(`PLACE_SETTINGS_KEY`), que é uma fatia recente e não relacionada (cuidado
+documentado na própria tarefa para não confundir os dois).
+
+**Onde o TextBox grava / runtime-update foi implementado de verdade (não só
+"efeito na próxima sessão")**: `TeamCreateElection.luau` ganhou
+`TeamCreateElection.setLocalUsername(customName)` — escreve direto em
+`sessionValues.Username.Value` (o MESMO `Username` que
+`TeamCreateLease.describeClient` usa nas mensagens de lease negada e que a
+tabela de sessões do painel lê) se `customName` não-vazio; se vazio (dev
+LIMPOU o campo, "voltar a usar o nome do Roblox"), dispara de novo a
+resolução assíncrona via `Players:GetNameFromUserIdAsync` em vez de publicar
+string vazia. No-op silencioso se `sessionValues == nil` (eleição ainda não
+rodando) — o próximo `start()` aplica a setting do zero. `PluginUI.luau`
+chama esse setter **direto** (self-contained, dentro do callback
+`onCustomDisplayNameSubmit`, junto do `SetSetting`) — **não** é passthrough
+para `init.server.luau` como `onAutoReconnectToggle`: `TeamCreateElection` já
+era `require`'d em `PluginUI.luau` para os getters de leitura da tabela de
+sessões (M4.5), então nenhuma lógica exclusiva de `init.server.luau`
+(`start()`/`isInRunOrPlayMode()`) estava envolvida — diferente do padrão
+documentado na entrada M4.5+ mais abaixo ("dois padrões de callback
+distintos"), este é um 3º caso: ação real que não precisa nem de
+`start()`/guard de Run-Play nem fica 100% dentro de `StatusPanel.luau` (não é
+só estado local de UI, precisa persistir + propagar).
+
+**Resolução assíncrona do nome do Roblox refatorada, não duplicada**: o
+bloco `task.spawn(Players:GetNameFromUserIdAsync...)` que já existia dentro
+de `TeamCreateElection.start()` foi extraído para
+`resolveAndPublishRobloxUsername(myToken)` (função local module-level) —
+reusada tanto por `start()` (branch "sem nome customizado") quanto por
+`setLocalUsername` (branch "campo limpo, volta a resolver"). `start()` agora
+recebe um 2º parâmetro `pluginObject` (não recebia antes — `init.server.luau`
+precisou passar a repassar: `TeamCreateElection.start(userIdParam,
+pluginObject)`), usado só para `Config.resolveCustomDisplayName` no boot;
+**decisão explícita**: quando a setting já tem um nome customizado no boot,
+a resolução assíncrona do nome real do Roblox é **pulada por completo** (não
+"resolvida mas descartada") — menos 1 yield/chamada de rede que o resultado
+nem seria usado.
+
+**UI (`StatusPanel.luau`)**: `CustomDisplayNameField(state, callbacks)` —
+`TextBox` (novo tipo de controle de settings no arquivo; até aqui só existia
+`TextButton` de toggle binário) com o MESMO layout de coluna dos toggles
+(`SettingsRow`, controle em 0.62/0.38 da linha) mas fundo/borda copiados do
+`portBox` de `PortRow` (`Theme.Color.Background` + `BorderStroke()`, não o
+`Theme.Color.Border` sólido dos toggles) — decisão: um campo de texto editável
+já se distingue de um botão pelo cursor/caret, mas reforçar com a MESMA
+linguagem visual dos outros CAMPOS (não botões) do painel deixa "isto é
+texto, não uma ação" claro à primeira vista. `FocusLost` confirma em
+Enter/perda de foco (mesmo padrão de `PortRow`) e só dispara o callback se o
+valor mudou de verdade (evita gravar/republicar à toa a cada FocusLost sem
+edição real) — campo vazio é um valor válido e intencional (não é tratado
+como "cancelar", é "volte ao nome do Roblox"). `DISABLED_SETTINGS` (array)
+perdeu o primeiro item — os 2 restantes (`Containers observados`/`Nível de
+log`) foram reindexados para `[1]`/`[2]`.
+
+**Contrato de `state`/`callbacks` no cabeçalho do arquivo** atualizado:
+`state.customDisplayName: Source<string>` entrou no grupo de campos que
+`StatusPanel` também ESCREVE diretamente (junto de `view`/
+`notificationsEnabled`/`autoReconnectEnabled` — mesmo raciocínio: troca de
+texto é estado local de UI até o `FocusLost` confirmar, só a PERSISTÊNCIA
+exige o callback); `callbacks.onCustomDisplayNameSubmit(newName: string)`
+entrou no grupo de callbacks que persistem/agem.
+
+**Validação**: `selene plugin/src/` 0 errors, 41 warnings (só
+`mixed_table`/`roblox_manual_fromscale_or_fromoffset`, mesmas 2 categorias já
+aceitas — nenhuma categoria nova). `stylua --check` limpo nos 5 arquivos
+tocados. `lune run` nos 5: todos parseiam o arquivo INTEIRO antes de falhar
+no 1º acesso a global do Roblox (`game`/`script.Parent` — `Config.luau` nem
+chega a falhar, carrega 100% porque não toca `game` no top-level), mesmo
+padrão de sempre usado neste projeto pra confirmar sintaxe sem Studio.
+
+**Não testado em Studio real** (2 Studios necessários — mesma ressalva de
+sempre para qualquer coisa que toque `TestService.SyncTeam`/replicação):
+roteiro sugerido — (1) setar o nome customizado em 1 Studio ANTES de
+conectar, conectar, confirmar que a tabela de sessões do OUTRO Studio mostra
+o nome customizado, não o nome do Roblox; (2) com sessão já conectada nos
+dois lados, editar o campo no painel de 1 Studio e confirmar que o outro
+Studio vê o nome mudar SEM precisar reconectar (e que uma mensagem de lease
+negada, se disparada nesse meio-tempo, já usa o nome novo); (3) limpar o
+campo (voltar a `""`) com sessão conectada e confirmar que volta a mostrar o
+nome do Roblox (não fica em branco/vazio na tabela do outro lado).
+
+## Reskin "Modux Companion" portado pro Luau real, 2026-08-02 (7ª rodada)
+
+Tarefa de portar o reskin (6ª rodada, mockup) pra `plugin/src/ui/` **falhou
+no meio** por limite de gasto mensal da conta (erro de API, não bug de
+código). Estado em que ficou: `Theme.luau` e `StatusPanel.luau` já tinham
+sido reescritos por completo (paleta nova, sem corner, texto
+centralizado+negrito via `Theme.applyBold`, indicador de status quadrado,
+conteúdo centralizado verticalmente — 0 errors no selene, 0 parse errors no
+lune) — mas `Toast.luau` ainda usava tokens antigos que a nova `Theme.luau`
+já tinha removido (`ConnectIdle`/`ConnectConnecting`/`ConnectActive`/
+`FieldBackground`/`ToastText`/`Font.Title`/`Font.Body`), quebrando em
+runtime (`BackgroundColor3`/`TextColor3` recebendo `nil`). **O orquestrador
+(sessão principal) terminou esse pedaço específico diretamente** (não
+delegou de novo, pra não arriscar outra falha de API): remapeou a
+severidade do toast pra 4 casos (fonte de verdade:
+`design-preview/styles.css`, `.st-toast__titlebar[data-severity=...]`) —
+`sucesso`→`GreenStrong`, `aviso`→`YellowStrong`, `erro`→`RedStrong` (as 3
+com texto branco `ButtonText`), `info` (default/fallback, inclusive
+chamadores antigos que só passam `text`) → fundo `SubText` + texto PRETO
+`ToastInfoText` (única exceção à regra de texto branco do reskin). Título e
+corpo do toast também centralizados + negrito, fonte trocada pra
+`Theme.Font.Rounded`. Validado: `selene plugin/src` 0 errors/0 parse errors,
+`stylua --check` limpo, `lune run` chega até a 1ª linha que toca
+`game:GetService` (padrão de sempre — confirma que o arquivo INTEIRO
+parseou antes de rodar).
+
+**Lição pra próxima vez que uma tarefa de reskin/token-removal for
+dividida**: se `Theme.luau` for reescrito removendo tokens antigos, TODOS os
+arquivos que os referenciam precisam ser atualizados na MESMA tarefa (ou a
+tarefa precisa terminar com uma varredura final tipo
+`grep -rn "Theme\.\(Color\|Font\|Layout\)\.\w\+"` cruzada contra os campos
+que sobraram em `Theme.luau`) — não presumir que "só StatusPanel.luau e
+Toast.luau usam Theme" é suficiente sem checar CADA referência depois da
+reescrita, especialmente se a tarefa puder ser interrompida no meio.
+
+## Reskin "Modux Companion" nas 3 telas Studio do mockup, 2026-08-02 (6ª rodada)
+
+Pedido do usuário: reaplicar o visual de outro plugin dele (Modux Companion,
+projeto separado — ModuxWatcher) nas 3 telas Roblox Studio de
+`design-preview/` (`screen-studio-main`, `screen-studio-settings`,
+`screen-studio-toast`). **Escopo estritamente mockup** — `plugin/src/` real
+NÃO foi tocado; portar pro Luau é uma tarefa futura separada, depois de
+aprovação visual. Telas VS Code do mockup (`.vsc-*`) também não tocadas de
+propósito (identidade visual própria, ligada ao tema real do VS Code).
+
+**Arquivos tocados**: `design-preview/styles.css` (grosso da mudança — novo
+bloco `:root` com paleta `--mc-*` logo no início da seção 3, e reescrita de
+todo o CSS de `.st-panel` pra baixo até o fim do toast), `design-preview/index.html`
+(status square na titlebar principal, wrapper `.st-content` novo pra
+centralização vertical, divisor `.st-divider` reusado em 2 lugares, select de
+cor da INFO novo, `data-severity` no toast + opção "sucesso" nova no select),
+`design-preview/app.js` (sync do quadrado de status com `connStatus`, função
+`applyMainInfoColor`/`setMainInfoColorAndSyncLab`, toast trocou de
+`style.background` inline por `dataset.severity` — cor 100% no CSS agora).
+
+**Paleta**: variáveis `--mc-*` (prefixo "Modux Companion", pra não colidir
+com `--tool-*` do chrome da própria ferramenta de preview) definidas 1x no
+topo da seção 3 do CSS. Nomes espelham 1:1 os nomes do briefing do usuário
+(`background/border/text/subtext/muted/green/greenStrong/...`). Regra
+inegociável do briefing, sempre 2 tons por cor semântica: a versão clara
+(`--mc-green` etc.) é só TEXTO/indicador sobre fundo escuro; a `-strong` é só
+FUNDO de botão com texto branco em cima — nunca inverter. `--mc-blue` e
+`--mc-purple` não têm par (o briefing já avisa) — não usados em nenhum botão
+nesta tarefa por isso mesmo.
+
+**Fonte "arredondada" sem webfont**: `--mc-font-rounded: "Nunito",
+"Quicksand", "Century Gothic", system-ui, sans-serif` — decisão deliberada
+de NÃO adicionar `<link>` de Google Fonts (o arquivo já se descreve como
+"sem build step, sem pré-processador"; carregar fonte externa quebraria
+isso e dependeria de rede pra um preview local). Century Gothic (já usada
+no chrome do `.studio-window`) é o fallback real na prática — geométrica/
+arredondada o bastante pra aproximar sem precisar de rede. Campo técnico
+(porta) usa `--mc-font-mono` (Cascadia Code) — único lugar que foge da
+fonte arredondada, por pedido explícito do briefing.
+
+**Decisões não-óbvias / reconciliação com decisões anteriores**:
+
+- **CONNECT (3 estados) usa cores diferentes do quadrado de status,
+  DELIBERADAMENTE**: botão = "ação disponível" (disconnected→verde-forte
+  como call-to-action "conectar"; connecting→amarelo-forte; connected→
+  vermelho-forte porque clicar agora DESCONECTA, ação de parar). Quadrado
+  de status na titlebar = "saúde da conexão" (disconnected→cinza/neutro;
+  connecting→amarelo; connected→verde; vermelho reservado pra um futuro
+  estado de erro genuíno, não modelado nos 3 `connStatus` atuais — a
+  classe CSS `[data-state="error"]` já existe, só não é alcançável pelos
+  controles do lab ainda). São duas leituras do mesmo estado, cores
+  propositalmente não-espelhadas — documentar isso evita "corrigir" um dos
+  dois achando que é inconsistência no futuro.
+- **RESYNC idle reconciliado com decisão antiga de M4.5+ 5ª rodada** ("peso
+  visual secundário, nunca cor de destaque"): o briefing novo exige TODOS
+  os botões com texto branco + fundo "Strong". Reconciliação: idle usa
+  `--mc-border` (único tom acromático do palette, sem parceiro "Strong"
+  porque não é cor semântica) — continua lendo como secundário por ser
+  cinza/dessaturado ao lado do CONNECT colorido, mesmo com texto branco
+  igual nos dois.
+- **Toast ganhou uma 4ª categoria** ("sucesso", verde) que não existia antes
+  (eram só info/aviso/erro) — "info" foi REPAGINADO de "estado calmo azul"
+  pra "fallback genérico/neutro" (fundo `--mc-subtext` claro, texto PRETO —
+  única exceção à regra de texto branco no projeto inteiro, briefing
+  explícito). Se um chamador real do produto (`Toast.show(text, severity)`,
+  hoje só `"info"|"aviso"|"erro"`) quiser usar a cor verde de sucesso, vai
+  precisar de um 4º valor de severidade (`"sucesso"`) quando isso for
+  portado pro Luau — sinalizar ao `luau-dev` nessa hora.
+- **Conteúdo do painel principal, centralização vertical**: técnica =
+  wrapper novo `.st-content` (flex:1, `justify-content:center`) envolvendo
+  tudo que fica abaixo da titlebar; a titlebar continua fixa no topo fora
+  do wrapper. A tabela de sessões (`.st-table`) mudou de `flex:1` (esticava
+  pra preencher, texto sempre colado no topo) pra `flex:none` +
+  `max-height:150px` + `overflow-y:auto` — só assim o bloco inteiro
+  (INFO/Porta/Connect/ReSync/tabela) centraliza como grupo em vez da tabela
+  absorver todo o espaço livre e anular o efeito. Confirmado visualmente
+  (screenshot) que o espaço acima do divisor e abaixo da última linha da
+  tabela ficou aproximadamente igual. Tela de Configurações não precisou de
+  wrapper novo — `.st-settings-body` já era o único bloco entre titlebar e
+  fim do painel, só ganhou `flex:1; justify-content:center` direto.
+- **Linha divisória `.st-divider`** (1px, `rgba(242,242,242,0.12)`) é UMA
+  classe reusada em 2 lugares (topo do `.st-content` da tela principal, topo
+  do `.st-settings-body`) — não criei uma segunda classe redundante.
+- **Texto de linha da tabela (`st-row__user`/`st-row__info`) ficou de fora
+  do "tudo centralizado + negrito"**: mantido peso 400 e alinhado à
+  esquerda, só o CABEÇALHO da tabela (`st-tableheader`) ficou centralizado
+  + negrito. Julgamento deliberado: dado dinâmico truncado (nome de
+  colaborador, caminho de arquivo) fica pior de escanear centralizado, e
+  negrito em toda uma lista competiria com os botões/títulos que devem ser
+  o foco visual principal. Se o usuário reportar que quer TUDO centralizado
+  sem exceção depois de ver o mockup, essa é a única linha que ficou de
+  fora conscientemente.
+- **`.studio-window*` (chrome que simula a janela real do Roblox Studio: 
+  titlebar/menubar/toolbar/viewport) NÃO foi reskinado** — só o painel
+  SyncTeam (`.st-*`) segue a paleta nova. Julgamento: esse chrome representa
+  o Studio de verdade (que tem sua própria aparência, fora do controle do
+  plugin), não faz sentido "pintar" ele com a paleta do Modux Companion.
+  Se o usuário achar que quer o chrome também estilizado, é uma decisão
+  nova a discutir, não algo que o checklist do briefing pedia (o briefing
+  fala em "3 telas Studio" mas no contexto de "o painel", não da janela
+  fake do Studio ao redor).
+- **Leader dot da tabela virou quadrado** (era `border-radius:50%`,
+  círculo) — decisão de consistência total com "sem cantos arredondados"
+  do briefing, já que o indicador de status da titlebar também é quadrado.
+  Pequeno, mas documentar pra não "corrigir de volta" pra círculo achando
+  que foi engano.
+
+**Verificação visual real feita nesta tarefa** (pedido explícito do
+usuário: "rode/veja o index.html você mesmo antes de reportar"): sem
+Puppeteer instalado no projeto, usei **CDP (Chrome DevTools Protocol) cru
+via WebSocket nativo do Node 21+** (`new WebSocket(wsUrl)`, sem nenhum `npm
+install`) — `chrome.exe --headless=new --remote-debugging-port=N`, `GET
+/json/list` pra pegar a URL do DevTools, `Page.navigate` +
+`Runtime.evaluate` (pra clicar nav-items/botões e ler `dataset.state`) +
+`Page.captureScreenshot`. Confirmei visualmente as 3 telas E os 3 estados
+dinâmicos do CONNECT/RESYNC (disconnected/connecting/connected,
+idle/syncing/done) sem nenhum erro de JS (`exceptionDetails` vazio em todo
+`Runtime.evaluate`). **Técnica reaproveitável por qualquer agente futuro que
+precise de screenshot headless deste repo sem depender de instalar
+Puppeteer/Playwright** — script ficou só no scratchpad da sessão, não
+commitado (é ferramenta de verificação pontual, não parte do produto).
+
+## M4.5+ — Painel Studio: InfoRow vira label+caixa, botão RESYNC (contrato), Toast em 2 faixas com severidade, 2026-08-02 (5ª rodada)
+
+Portou 1:1 os 3 ajustes já aprovados/validados no mockup `design-preview/`
+(que agora é a fonte de verdade pixel-a-pixel — CSS de
+`design-preview/styles.css` tem os valores literais, ver seções `.st-inforow`/
+`.st-resync-btn`/`.st-toast*`) para o Luau real. Arquivos:
+`plugin/src/ui/StatusPanel.luau`, `plugin/src/ui/Toast.luau`,
+`plugin/src/ui/Theme.luau`.
+
+**InfoRow (era 1 TextLabel com `"INFO: [ %s ] %ds"` solto)**: virou label
+fixo "INFO:" (44px, mesma largura do label "Porta") + uma CAIXA
+somente-exibição (Frame+TextLabel, `Theme.Color.FieldBackground`/`FieldText`
+— **nunca um TextBox**, o usuário só lê) + um "selo" (chip) pequeno de
+segundos à DIREITA da caixa (`Theme.Color.FieldBackground` de novo, 40×18px,
+corner radius `UDim.new(0,4)`), em vez de concatenar `"[ %s ] %ds"` dentro do
+texto — decisão: chip evita competir com `TextTruncate` de mensagens de log
+longas. `INFO_ROW_HEIGHT` agora É `PORT_ROW_HEIGHT` (30, era 18) — mesma
+estrutura, mesma altura.
+
+**Botão RESYNC** (`ResyncRow`, entre `ConnectRow` e `TableHeader`): 3 estados
+lidos de `state.resyncState()` (`"idle"|"syncing"|"done"`, Source criada pelo
+`luau-dev` em `PluginUI.luau` — `ui-dev` só CONSOME). Cores **zero
+inventadas**: idle = `Theme.Color.IconButton`/`IconButtonHover` (cinza, com
+hover — único estado clicável); syncing = `Theme.Color.ConnectConnecting`
+(laranja, MESMO do CONNECT "connecting"); done = `Theme.Color.LeaderDot`
+(único verde do Theme). **Decisão não especificada pela tarefa mas confirmada
+pelo mockup aprovado**: syncing/done NÃO têm variação de hover (o CSS do
+mockup faz o seletor `[data-state="syncing"]` vencer sobre `:hover` por ordem
+de declaração) — só o estado idle reage a MouseEnter/Leave, porque só ele é
+de fato clicável (`Activated` só chama `callbacks.onResyncRequest()` quando
+`state.resyncState() == "idle"`). Texto: idle usa `Theme.Color.FieldText`
+(tom discreto, peso visual SECUNDÁRIO de propósito — não deve competir com
+CONNECT); syncing/done usam `Theme.Color.ButtonText` (branco), como todo
+botão colorido do painel. Altura `RESYNC_ROW_HEIGHT = 28` (mais baixo que
+`CONNECT_ROW_HEIGHT=34`, reforça o peso secundário; 28 coincide com
+`Theme.Layout.IconButtonSize` por acaso, sem relação semântica).
+
+**Contrato `state.resyncState`/`callbacks.onResyncRequest`** documentado no
+cabeçalho do arquivo (comentário `state = {...}`/`callbacks = {...}`) — texto
+exato acordado com `luau-dev` para a tarefa em paralelo. **Confirmado depois
+que o `luau-dev` já tinha terminado a parte dele** (achado ao ler
+`PluginUI.luau`/`init.server.luau`, ambos já modificados quando eu comecei):
+os nomes batem 100% (`state.resyncState = resyncStateSource`,
+`callbacks.onResyncRequest = callbacks.onResyncRequest` passthrough) —
+nenhum ajuste necessário depois de eu terminar. Lição: quando duas tarefas em
+paralelo compartilham um contrato só por texto de spec (sem código ainda
+escrito por nenhum dos lados), vale a pena, ao terminar, grepar o lado do
+outro agente pra CONFIRMAR que os nomes batem de verdade, não só assumir.
+
+**Toast — duas faixas + severidade** (`Toast.show(text, severity)`,
+`severity: "info"|"aviso"|"erro"` opcional, default `"info"`): faixa de cima
+("SYNC TEAM" + botão X, ambos DENTRO do fluxo normal — nada mais floating por
+cima do texto) muda de cor conforme severidade, reaproveitando as MESMAS 3
+cores do CONNECT (`ConnectIdle`/`ConnectConnecting`/`ConnectActive` — info/
+aviso/erro); faixa de baixo (corpo da mensagem) usa
+`Theme.Color.FieldBackground` (cinza neutro, mesmo do portBox). Cantos RETOS
+(removido `UICorner` do frame raiz) e `Frame "Accent"` de 4px removido por
+completo (cor de severidade já vive inteira na faixa de cima). Botão de
+fechar trocou de cor própria (`ToastCloseIdle`/`Hover`, removidas do Theme)
+para `Theme.Color.ButtonText` fixo + hover via `TextTransparency` (0 → 0.25,
+já que agora tem que contrastar sobre 3 fundos coloridos diferentes, não mais
+1 fundo neutro único). `TITLE_BAND_HEIGHT` reaproveita
+`Theme.Layout.TitleBarHeight` (36, mesmo do título do painel principal, pra
+ler como a mesma linguagem visual); `BODY_HEIGHT = 48` é decisão nova (dá
+~28px de texto, similar à área de texto do design antigo). Removidos de
+`Theme.luau` (ficaram órfãos): `ToastBackground`, `ToastAccent`,
+`ToastCloseIdle`, `ToastCloseHover` — `ToastText` continua (cor do corpo da
+mensagem, não mudou).
+
+**Achado crítico durante o "grep por `Toast.show(` no resto do plugin"** (a
+tarefa pedia explicitamente essa verificação): `init.server.luau` — já escrito
+pelo `luau-dev` em paralelo, uncommitted quando eu peguei a tarefa — chama
+`Toast.show(friendlyMessage, "erro")` como função ESTÁTICA do módulo
+(`local Toast = require(script.ui.Toast)`), **não** através de
+`toastHandle.show()`/`PluginUI.notify` (de propósito: o toast de erro do
+ReSync precisa aparecer sempre, ignorando a preferência "Mostrar
+notificações", que só governa o caminho `PluginUI.notify`). Antes desta
+tarefa, `Toast.luau` só expunha `Toast.mount(pluginObject) -> {show,
+destroy}` — nenhuma função estática. Resolvido adicionando um singleton
+módulo-level (`local activeToast = nil`, setado dentro de `Toast.mount`) +
+`function Toast.show(text, severity)` que repassa pro `activeToast.show`
+(no-op com log se chamado antes de qualquer `mount()`) — MESMO padrão já
+usado por `Logger` no projeto (`Logger.init` guarda estado interno, chamadas
+estáticas subsequentes usam esse estado). Lição geral: ao redesenhar a API
+pública de um módulo de UI, sempre grepar TODOS os chamadores reais no
+repo antes de declarar a tarefa concluída — inclusive os escritos por uma
+tarefa paralela ainda não mesclada; o grep pedido explicitamente pela tarefa
+foi o que pegou esse caso, não uma inspeção manual.
+
+**CRLF armadilha (ambiente Windows)**: `Edit`/o ambiente local introduziram
+terminadores CRLF nos 3 arquivos tocados (confirmado via `file <arquivo>`),
+enquanto o resto do repo usa LF puro (sem `.gitattributes` — depende de
+`core.autocrlf` do usuário) — isso fazia `stylua --check` reportar um diff de
+100% das linhas (todo o arquivo aparecendo como removido+adicionado, sintoma
+clássico de mismatch de line-ending, não de estilo real). Corrigido com
+`sed -i 's/\r$//'` nos 3 arquivos antes de validar. Lição para a próxima vez:
+se `stylua --check` mostrar um diff onde CADA linha do arquivo aparece como
+alterada (não só as linhas realmente tocadas), suspeitar de CRLF/LF antes de
+qualquer outra coisa — rodar `file <arquivo>` pra confirmar antes de tentar
+"consertar" o conteúdo.
+
+**Validação**: `selene plugin/src/` 0 errors (47 warnings, todas categorias
+`mixed_table`/`roblox_manual_fromscale_or_fromoffset` já aceitas no projeto —
+baseline antes das minhas 3 edições era 35; crescimento de 12 é proporcional
+aos novos blocos `vide.create` adicionados, mesma categoria, não uma
+regressão). `stylua --check` limpo nos 3 arquivos e no `plugin/src/` inteiro.
+`lune run` nos 3 arquivos: parseiam limpo, param só no 1º global Roblox
+(`script.Parent`/`game`/`Color3.fromRGB`), mesmo padrão de sempre. **Nada
+testado em Studio real** (fora de escopo desta tarefa, que era só visual —
+quem liga o clique do RESYNC de verdade e testa a mensagem `resyncRequest`/
+`resyncResult` é o `luau-dev`, em paralelo).
+
+## M3.4 revisão — Overlay de fundo era percebido como "erro no módulo inteiro": trocado por status bar, 2026-08-02
+
+Usuário testou o overlay de M3.4 (entrada mais abaixo neste arquivo,
+2026-07-16) em uso real e reportou que o `backgroundColor` laranja
+translúcido cobrindo o documento inteiro (`isWholeLine`) parecia "erro no
+módulo inteiro", não um aviso de lock de colaboração — mesmo com alpha baixo.
+**Lição para a próxima vez que a tentação for "cobrir o editor inteiro para
+não passar despercebido"**: em VS Code, qualquer `backgroundColor` de
+decoração que cubra TODO o documento lê como "algo está errado com este
+arquivo" (linter/diagnóstico), não como "atenção: metadado externo sobre
+este arquivo" — o canal certo para esse segundo tipo de aviso é a **status
+bar** (persistente, sempre visível, não compete com a leitura do código), não
+o corpo do editor.
+
+**Fix aplicado, padrão para avisos futuros do tipo "algo external limita este
+arquivo/esta sessão"**:
+- Remover `backgroundColor`/`isWholeLine` da decoração; manter só
+  `overviewRulerColor`/`overviewRulerLane.Full` na MESMA range (a régua não
+  compete com a leitura do texto, é um "radar" na borda). `hoverMessage`
+  continua funcionando mesmo sem `backgroundColor` — anexado à mesma range,
+  passar o mouse em qualquer linha do documento ainda mostra o aviso
+  completo. Renomeei a variável (`overlayDecoration` → `rulerDecoration`)
+  para o nome não mentir sobre o que o tipo faz.
+- Rótulo inline pontual (`renderOptions.after`, uma linha só) pode continuar
+  — é a diferença entre "uma marca de rodapé" e "o arquivo inteiro pintado".
+- **Item de status bar dedicado por-arquivo-ativo é o padrão a reusar**:
+  quando o aviso é sobre "o arquivo que estou olhando AGORA" (não todo editor
+  visível), um `vscode.StatusBarItem` próprio, oculto via `.hide()` quando
+  não aplicável (nunca "aparece vazio"), recalculado dentro do mesmo hook que
+  já re-renderiza a decoração (aqui, `renderAll()` — nenhum novo listener
+  precisou ser criado, o módulo já rodava nos pontos certos: leaseChanged,
+  stop do serviço, troca de editor/lista de visíveis). **Reusar a cor de
+  aviso já estabelecida** (`new
+  vscode.ThemeColor("statusBarItem.warningBackground")`, mesma da
+  `SyncTeamStatusBar`/`statusBarMenu.ts` para "no ar, aguardando plugin") em
+  vez de inventar uma cor nova — dois avisos na mesma barra devem ler como a
+  MESMA linguagem visual de "atenção", nunca cores diferentes concorrendo.
+- **Prioridade de status bar**: itens mais genéricos/fundamentais
+  (conexão geral) ganham prioridade MAIOR (mais à esquerda no grupo — aqui
+  100); itens mais específicos/contextuais (lease do arquivo ativo) ganham
+  prioridade um pouco menor (aqui 99, logo à direita do primeiro). Convenção
+  a seguir: quanto mais "sempre relevante", mais à esquerda.
+- **Lógica pura primeiro**: antes de tocar o arquivo `vscode`-dependente,
+  adicionar a função de decisão em módulo puro já existente (aqui,
+  `leaseBorderState.ts` ganhou `buildLeaseStatusBarVisual(state) ->
+  {visible, text, tooltip}`, testável sem `vscode`) — nenhuma regra de
+  negócio nova, só reempacota o MESMO estado que já decidia a decoração
+  anterior. Mesma disciplina de sempre: strings centralizadas em `STRINGS`,
+  texto pt-BR.
+- Arquivos: `vscode-extension/src/ui/leaseBorderState.ts` (puro, +
+  `buildLeaseStatusBarVisual`), `vscode-extension/src/ui/LeaseBorderDecoration.ts`
+  (status bar item + rename), `vscode-extension/test/leaseBorderState.test.ts`
+  (+3 testes). Ver `docs/DECISIONS.md` 2026-08-02 "3ª rodada" seção 3
+  (continuação) para o detalhe completo.
+
+## M4+ — Cursor remoto: rótulo inline → hover, barra piscando, 2026-07-29
+
+Pedido do usuário depois de ver o M4 em uso: o rótulo com nome do
+colaborador (`renderOptions.after` de `DecorationOptions`) era **inline** —
+empurrava o texto real do documento local, ficando ilegível quando o cursor
+remoto caía no meio de uma palavra. `RemoteCursorDecorations.ts` reescrito
+com a técnica que fica valendo daqui pra frente sempre que precisar de um
+"pisca" ou de um "rótulo que não pode deslocar texto" em decoração de
+editor:
+
+- **Pisca sem CSS animation**: `TextEditorDecorationType`/
+  `DecorationRenderOptions` não tem `@keyframes`. Técnica: `setInterval`
+  (530ms por fase, aproximando o caret nativo do SO/VS Code, sem precisão
+  milimétrica) alternando entre a lista cheia de `DecorationOptions` e uma
+  lista VAZIA no MESMO `DecorationType` reciclado (nunca recriar o tipo por
+  frame). Reset de fase (`blinkVisible = true`) em toda mudança de presença/
+  editor ativo/editores visíveis — um cursor que acabou de aparecer/mover
+  sempre entra SÓLIDO, nunca numa fase aleatória do ciclo já em andamento
+  (evita a sensação de "cadê o cursor, ele nem apareceu"). Timer limpo em
+  `dispose()` (`clearInterval`), mesmo cuidado de vazamento de todo
+  `setInterval`/`setTimeout` no projeto (ver `HeartbeatMonitor.ts` pro
+  mesmo padrão de campo `timer: ReturnType<typeof setInterval> | null`).
+- **Rótulo que NUNCA desloca texto = hover, não inline, e NUNCA no mesmo
+  `DecorationType` que pisca**: quando um rótulo/badge precisa aparecer só
+  sob demanda (mouse em cima) em vez de sempre visível/inline, criar um
+  `DecorationType` **separado e invisível** (`createTextEditorDecorationType({})`
+  — sem nenhuma propriedade de estilo) cobrindo uma range um pouco mais
+  larga que o alvo real (aqui: 1 caractere a mais que a posição exata do
+  cursor, pra não depender de acertar um alvo de largura zero com o mouse —
+  ver `computeHoverRange`, prefere expandir pra DIREITA, cai pra ESQUERDA
+  perto do fim de linha, mantém largura zero em linha vazia) e que carrega
+  só o `hoverMessage`. Esse tipo de decoração **nunca pisca/nunca some** —
+  se ele compartilhasse o ciclo de vida do elemento visual que pisca, o
+  hover pararia de funcionar durante a fase "apagada", experiência ruim.
+  Regra geral: sempre que uma decoração tiver uma parte "sempre visível
+  levemente" (barra/ícone) e uma parte "só sob demanda" (nome/detalhe), são
+  DOIS `DecorationType`s com ciclos de vida independentes, nunca um
+  renderOptions condicional dentro do mesmo tipo.
+- **Badge colorido em hover via HTML no `MarkdownString`**: `hoverMessage`
+  aceita `vscode.MarkdownString`; com `supportHtml: true`, o sanitizador do
+  VS Code permite `style` inline **somente em `<span>`**, **somente** nesta
+  ordem exata: `color:<hex|var(--vscode-*)>;background-color:<hex|var(--vscode-*)>;border-radius:<N>px;`
+  — confirmado lendo o código-fonte real (`domSanitize.ts`/
+  `markdownRenderer.ts`, branch main E tag estável 1.131.0), ver
+  `.claude/research/2026-07-29-markdownstring-supporthtml-span-style-badge.md`.
+  **`padding` e `display` NÃO estão na allowlist** e, como a validação é do
+  atributo `style` INTEIRO (não por propriedade), incluir `padding` derruba
+  o `style` inteiro — pra dar "respiro" visual ao texto dentro do badge,
+  usar `&nbsp;` no conteúdo (`&nbsp;${nome}&nbsp;`), nunca `padding`. Não
+  depende de `isTrusted` (isso só habilita link `command:`). Sempre escapar
+  texto livre (nome do colaborador) antes de embutir no `<span>`
+  (`escapeHtml`: `&`/`<`/`>`) — é conteúdo remoto, não confiável 100%.
+  `supportHtml` existe desde VS Code 1.62 (2021), sem necessidade de
+  fallback de versão neste projeto.
+- **Cor precisa ser hex** (`#rrggbb`) para entrar no regex do sanitizador —
+  a paleta `COLLABORATOR_COLORS` de `PresenceTracker.ts` já é hex, nenhuma
+  conversão extra necessária.
+- **Não testado ponta-a-ponta** (mesma ressalva de sempre para tudo em
+  `ui/*Decorations.ts`): puramente visual, precisa de VS Code real com
+  cursor remoto de verdade pra confirmar pisca/hover/posição. Roteiro
+  completo em `docs/PROJECT_STATUS.md` 2026-07-29.
+
 ## M4.5+ — Toggle real de "Reconectar automaticamente" no painel do plugin, 2026-07-20
 
 Padrão para expor uma setting já existente (sem UI) como toggle real: NUNCA

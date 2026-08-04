@@ -1,228 +1,437 @@
-# Memória do researcher
+- `api.github.com/search/code?q=...` exige autenticação (retorna 401 sem
+  token) mesmo pra repositório público — não usar como atalho de busca de
+  código; usar a Contents API (listar diretório) + WebFetch no raw em vez
+  disso.
 
-Fontes e atalhos úteis descobertos nas pesquisas. Atualize ao final de cada
-tarefa; mantenha curto e acionável.
+## Tooling Luau (lint/format/teste headless) — lune, selene, stylua, testez
 
-## Atalhos de fonte
+- Doc oficial do Lune (`lune-org.github.io/docs/`) tem página dedicada
+  "API Status" da lib `roblox` (`lune-org.github.io/docs/roblox/4-api-status/`)
+  que lista TAXATIVAMENTE o que é suportado (`DataModel.GetService`/
+  `FindService`, ~23 métodos genéricos de `Instance`, ~23 datatypes tipo
+  Vector3/CFrame/Color3) com aviso explícito "if an API on a class is not
+  listed here it may not be within the scope for Lune" — atalho direto pra
+  responder "Lune suporta serviço X?" sem precisar vasculhar changelog.
+  Achado central: Lune **NÃO** mocka `game`/`workspace`/`script` nem
+  serviços vivos (`TestService`, `HttpService:CreateWebStreamClient`,
+  `ScriptEditorService`, `ChangeHistoryService`) — a lib `roblox` é só
+  serialização/manipulação de arquivo de place/model, "more limited API"
+  que o engine real (frase literal da doc). Ferramentas de terceiro que
+  tentam emular mais por cima do Lune (ex. `lune-test`, DevForum
+  t/4658410, mai/2026) usam `getfenv()` (2-3x mais lento, incompleto) — bom
+  pra citar como "existe, mas não maduro", não como solução pronta.
+- **TestEZ (`Roblox/testez`) foi arquivado pelo dono em 14/set/2024**
+  (read-only) — não é mais o padrão ativo em 2026. Sucessor "oficial" da
+  própria Roblox é `jsdotlua/jest-lua` → `Roblox/jest-roblox` (esse último é
+  só "read-only mirror", dev real é interno), mas a doc/issue do
+  `jsdotlua/jest-lua` confirma que **ainda não roda headless via Lune/Luvit
+  em 2026** ("Jest Lua can currently only run inside of Roblox... help
+  wanted to get it running in other Lua environments, such as Lune or
+  Luvit") — ou seja, não adotar Jest Roblox esperando rodar fora do Studio.
+  O caminho legado de TestEZ pra CI era `LPGhatguy/lemur` (reimplementação
+  parcial da API Roblox em Lua puro, pré-Lune) — não confirmei atividade
+  recente, tratar como possivelmente abandonado, não recomendar pra código
+  novo sem checar de novo. Conclusão útil pra recomendação de arquitetura:
+  em 2026 não existe framework de teste estilo-spec maduro e amplamente
+  adotado que rode headless pra código Luau que dependa de Roblox; o que dá
+  pra testar headless com Lune é só lógica pura (sem tocar serviço do
+  Studio), com um runner simples baseado em `assert`, não um framework BDD.
+- Selene (`Kampfkarren/selene`) e StyLua (`JohnnyMorganz/StyLua`) são
+  projetos de autores DIFERENTES (não confundir como "mesmo projeto") mas
+  ativamente mantidos os dois em 2026 (releases de mai/2026) e sempre
+  aparecem juntos em templates comunitários de Rojo+Wally+Rokit — bom
+  padrão pra confirmar rápido: `selene.toml` usa `std = "roblox"` (+
+  opcional `roblox-std-source = "pinned"` pra gerar `roblox.yml` local sem
+  depender de rede a cada 6h; `selene update-roblox-std` força refresh) pra
+  reconhecer `game`/`script`/`workspace`/`Instance` sem falso-positivo.
+  Rokit (`rojo-rbx/rokit`, sucessor de Aftman/Foreman) é o instalador
+  padrão pra essas ferramentas hoje: `rokit add <owner>/<repo>` (ex.
+  `rokit add lune-org/lune`, `rokit add Kampfkarren/selene`,
+  `rokit add JohnnyMorganz/StyLua`) + `rokit.toml` versionado no repo.
+  Detalhe completo (incl. lista de fontes e ressalva sobre alegação não
+  confirmada de rename `stylua.toml`→`.stylua.toml`) em
+  `.claude/research/2026-08-02-lune-selene-stylua-testez-luau-tooling.md`.
 
-- `create.roblox.com/docs/...` costuma ser renderizado por JS — WebFetch direto
-  na página falha (só pega nav/metadata). **Solução**: buscar o `.yaml`/`.md`
-  correspondente em `raw.githubusercontent.com/Roblox/creator-docs/main/content/en-us/...`
-  (mesmo caminho da URL, trocando `create.roblox.com/docs` por
-  `raw.githubusercontent.com/Roblox/creator-docs/main/content/en-us`, e a
-  extensão por `.yaml` para páginas de classe/`reference/engine/classes/*` ou
-  `.md` para artigos em `scripting/...`). Funciona bem e traz o texto completo.
-- `ScriptEditorService.yaml` nesse repo tem a doc completa de
-  `UpdateSourceAsync`, `GetEditorSource`, `TextDocumentDidChange`.
-- `Instance.yaml` tem a doc oficial de `Destroy()`/`Parent`/`Destroying` —
-  útil como base para qualquer pergunta de "como detectar que uma Instance
-  foi destruída".
-- `scripting/events/deferred.md` explica Immediate vs Deferred
-  (`Workspace.SignalBehavior`): Deferred só atrasa até o próximo resumption
-  point (input/PreRender/PreAnimation/PreSimulation/PostSimulation/Heartbeat),
-  nunca faz um evento deixar de disparar — útil para descartar Deferred como
-  causa de timeouts longos (segundos) em sinais que não disparam.
-- `reference/engine/classes/WebStreamClient.yaml` e
-  `reference/engine/enums/WebStreamClientState.yaml` (mesmo atalho raw acima)
-  têm a doc completa e verbatim dos eventos `Opened`/`MessageReceived`/
-  `Error`/`Closed` de `HttpService:CreateWebStreamClient` — útil pra
-  qualquer pergunta futura sobre esse objeto (retorno de `CreateWebStreamClient`
-  é a classe `WebStreamClient`). Achado central (ver
-  `.claude/research/2026-07-15-webstreamclient-close-code.md`): `Closed()`
-  não tem NENHUM parâmetro (`parameters: []` no YAML) — sem close code, sem
-  reason string; `Error(responseStatusCode: int, errorMessage: string)`
-  existe mas `responseStatusCode` é documentado como **HTTP status code**
-  (ex. 404, 500), não close code de protocolo WS (RFC 6455, ex. 1013) — API
-  não expõe close code/reason de fechamento de WebSocket hoje, ponto
-  reforçado por feature request aberto e sem resposta no DevForum
-  (`t/send-and-receive-close-codes-for-websockets/4240741`, jan/2026, 0
-  replies confirmado via `.json` do Discourse). `HttpService.yaml` (mesmo
-  atalho) confirma limite oficial de "six total clients" para
-  `CreateWebStreamClient` — bate com o que já está em `.claude/rules/luau.md`.
-- `reference/engine/classes/RunService.yaml` (mesmo atalho raw) tem a doc
-  verbatim de `IsStudio`/`IsRunning`/`IsEdit`/`IsClient`/`IsServer`. Achado
-  central (ver `.claude/research/2026-07-16-runservice-isstudio-isrunning-plugin-detect-test.md`):
-  `IsStudio()` é `true` tanto em Edição quanto durante Play/Run (F5/F8) DENTRO
-  do processo do Studio — não serve para distinguir os dois (confirmado por
-  doc oficial + múltiplos relatos de fórum). Quem distingue é
-  `IsRunning()`/`IsEdit()` (inversos entre si, exceto ambos `false` quando a
-  simulação está pausada — doc oficial). Padrão certo para plugin: `IsStudio()
-  and not IsRunning()` = edição normal. Única exceção documentada de
-  `IsStudio()` == `false` dentro de um fluxo iniciado do Studio: o SERVIDOR de
-  Team Test (não o cliente) — confirmado por staff (`tnavarts`) como
-  intencional, servidor de Team Test é "servidor live normal", não sessão de
-  Studio.
-- DevForum: buscar por `"UpdateSourceAsync" site:devforum.roblox.com` via
-  WebSearch encontra vários bugs conhecidos (Drafts mode + script recém-criado,
-  Live Scripting + CRLF, strings grandes estourando Team Create). Padrão:
-  `UpdateSourceAsync` é historicamente instável quando combinado com
-  Team Create/Drafts/Live Scripting e scripts nunca abertos no editor.
-- **Threads do DevForum (Discourse) têm endpoint JSON**: adicionar `.json` à
-  URL do tópico (ex.: `devforum.roblox.com/t/<slug>/<id>.json`) e dar
-  WebFetch nele retorna todos os posts/replies estruturados (autor, data,
-  texto), o que ajuda a confirmar rápido se um post tem resposta de staff ou
-  ficou sem resposta nenhuma (sinal de "lacuna real", não só "não achei a
-  thread certa") — usado em
-  `.claude/research/2026-07-15-webstreamclient-close-code.md` pra confirmar
-  que um feature request de jan/2026 sobre close codes segue com 0 replies.
-- `RojoCoop/rojo-7.7.0-rc.1/plugin/src/` é útil como "código de referência
-  validado" para comparar com o que a doc oficial promete. Ex.: grep por
-  `UpdateSourceAsync|ScriptEditorService|GetPropertyChangedSignal` mostrou que
-  o Rojo **nunca usa `UpdateSourceAsync`** — escreve `Source` via
-  `Reconciler/setProperty.lua` (atribuição direta de propriedade) e observa
-  mudanças via `instance.Changed` genérico em `InstanceMap.lua` (não
-  `GetPropertyChangedSignal` por-propriedade, exceto para `ValueBase`).
-  **Cuidado**: os testes desse repo usam MOCK de Roblox — não confiar em
-  comportamento de mock (ex.: `TeamCreateCoordinator.spec.lua:374-381` mocka
-  `ObjectValue.Value` virando `nil` em Destroy, o que o engine real **não**
-  faz — ver seção abaixo). Testes com mock validam lógica interna do plugin,
-  nunca a premissa sobre comportamento da API real.
-- **Para navegar em repositório PÚBLICO no GitHub (ex.: Rojo real,
-  `rojo-rbx/rojo`, ou Wally `UpliftGames/wally`), a página HTML normal
-  (`github.com/.../tree/...` ou `blob/...`) é resumida/truncada pelo WebFetch
-  — não dá pra confiar em listagem completa.** Atalho confiável:
-  `api.github.com/repos/<owner>/<repo>/contents/<path>` (JSON com lista de
-  arquivos/pastas e campo `download_url` de cada arquivo, que aponta pro
-  `raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>` correspondente).
-  Fluxo: listar diretório via Contents API → pegar `download_url` do arquivo
-  desejado → WebFetch nesse raw URL para o conteúdo completo (funciona bem
-  até para ler literalmente uma função Rust específica, pedindo no prompt do
-  WebFetch pra citar o trecho verbatim). Usado para achar como o Rojo real
-  implementa seus popups de notificação (ver
-  `.claude/research/2026-07-15-plugin-floating-overlay-notification.md`) e
-  para confirmar o comportamento de `wally install` lendo
-  `src/installation.rs`/`src/commands/install.rs` direto do repo
-  (`.claude/research/2026-07-16-wally-packages-manual-module.md`).
+## `SetAttribute` com valor Instance — `InstanceHandle` (beta jul/2026)
 
-## Roblox Studio: contas, Team Create e testes solo
+- Confirmado (fórum, não ainda em doc de referência): desde post oficial de
+  staff no DevForum em 23/jul/2026, `Instance:SetAttribute(nome, instancia)`
+  aceita um valor `Instance` diretamente — sem toggle de beta, "no setup
+  required". Mas `GetAttribute()` NÃO devolve a Instance: devolve um novo
+  tipo de engine `InstanceHandle`, que exige `:Get()` (não-bloqueante, nil
+  se ausente) ou `:Wait([timeout])` (bloqueante) pra obter a Instance real.
+  `GetAttributeChangedSignal` dispara ao trocar/apagar o atributo, mas NÃO
+  dispara quando o alvo entra/sai de streaming nem quando é destruído —
+  mesmo padrão de sinal frágil já registrado em `.claude/rules/luau.md`
+  pra `Source.Changed`/`ObjectValue.Changed`.
+- **Achado crítico pra qualquer decisão de arquitetura**: staff da própria
+  Roblox confirma NA MESMA thread que o comportamento em `:Destroy()` do
+  alvo referenciado **ainda não está implementado/finalizado** — hoje pode
+  gerar yield infinito em `:Wait()` sem timeout (bug relatado e confirmado
+  por staff como esperado no estado atual); invalidação automática (erro ou
+  cancelamento com warning) é só uma ideia futura. Ou seja: ao contrário de
+  `ObjectValue.Value` (documentado no projeto como referência morta mantida,
+  nunca nil), o destino de `InstanceHandle` após Destroy() não está fechado
+  — não assumir nenhum dos dois comportamentos sem re-testar.
+- **Não encontrei em lugar nenhum** (post original, 5 páginas de replies,
+  thread separada "What is an InstanceHandle?", buscas dedicadas) qualquer
+  menção a comportamento em **Team Create** (replicação entre dois clientes
+  Studio na mesma sessão colaborativa — o caso de uso central do SyncTeam).
+  O que existe confirmado (relato de usuário, não staff) é replicação via
+  `RemoteEvent` servidor↔cliente em jogo publicado, que é mecanismo
+  DIFERENTE de replicação de atributo entre Studios via Team Create. Se
+  isso virar relevante pra decisão de arquitetura, é preciso spike em dois
+  Studios reais, não assumir a partir do caso RemoteEvent.
+- Doc oficial de referência (`create.roblox.com/docs/reference/engine/
+  classes/Instance#SetAttribute`, guia `Roblox/creator-docs`
+  `content/en-us/scripting/attributes.md`) e dump de terceiros
+  (`robloxapi.github.io`, changelog e página de classe `InstanceHandle.html`
+  → 404) ainda não refletem a feature (checado 02/ago/2026) — só o DevForum
+  confirma até agora.
+- Detalhe completo, com atribuição de cada afirmação a staff vs. usuário
+  comum e trechos citados, em
+  `.claude/research/2026-08-02-setattribute-instance-value.md`.
 
-- `en.help.roblox.com/...` bloqueia WebFetch direto (HTTP 403), diferente de
-  `create.roblox.com/docs`. Não existe atalho tipo raw.githubusercontent para
-  esse domínio (não é um repo público). Único jeito que funcionou: WebSearch
-  com trecho entre aspas do título do artigo + termo específico — os
-  resultados de busca do Claude costumam trazer resumo/citações literais do
-  conteúdo mesmo sem conseguir abrir a página.
-- **Studio suporta múltiplas contas simultâneas nativamente**: clicar no nome
-  de usuário (canto superior direito) > "Add Account" abre uma NOVA
-  instância/processo de Studio já logada com outra conta, mantendo a janela
-  antiga aberta com a conta original — tudo sob o MESMO perfil de usuário do
-  Windows (não precisa Fast User Switching nem VM). Fonte oficial: anúncio
-  "Introducing Seamless Account Switching on Roblox"
-  (devforum.roblox.com/t/2703821) + thread "Switch Users in Studio"
-  (devforum.roblox.com/t/1159640, staff confirmou implementação). O cookie de
-  login fica em `HKEY_CURRENT_USER\SOFTWARE\Roblox\RobloxStudioBrowser\roblox.com`
-  (por perfil de Windows, não por processo) — mas isso não impede múltiplas
-  contas simultâneas porque cada instância parece autenticar/guardar a sessão
-  em memória no momento em que abre. Ver
-  `.claude/research/2026-07-03-dois-studios-mesma-maquina.md` para o
-  passo a passo completo.
-- **A MESMA conta não pode entrar 2x na mesma sessão de Team Create** — uma
-  das duas é bloqueada/expulsa. Confirmado por relatos no DevForum; existe
-  feature request em aberto (não implementado) pedindo suporte a isso
-  (devforum.roblox.com/t/allow-multiple-team-create-sessions-from-the-same-account/3408211).
-- **Mudança recente e importante (rollout maio-jun/2026, ainda válida em
-  jul/2026)**: Team Create agora exige Age Check (estimativa facial ou ID) do
-  DONO e de CADA colaborador antes de colaborar juntos, e as contas precisam
-  estar em "grupos de idade" compatíveis (ou virar "Trusted Friends"/ter
-  permissão parental se não). Isso vale até para uma conta nova criada só
-  pra teste — sem Age Check nela, ela é barrada ao tentar entrar no Team
-  Create, o que pode parecer bug de plugin/rede sem ser. Fonte oficial:
-  devforum.roblox.com/t/age-requirements-for-team-create-in-studio/4539725 e
-  en.help.roblox.com/hc/en-us/articles/45500519296532 (datas: age check
-  obrigatório a partir de 11/jun/2026, restrição de grupo de idade cruzada a
-  partir de 25/jun/2026).
-- "Team Test" (Test tab > Clients/Servers) é para testar GAMEPLAY com
-  `Player`s simulados, não serve para testar colaboração de EDIÇÃO via Team
-  Create entre duas identidades reais — são features diferentes, não
-  confundir ao responder perguntas sobre "testar Team Create sozinho".
-  Detalhe adicional confirmado 2026-07-16: o SERVIDOR de Team Test roda como
-  processo separado (não é "sessão de Studio" para efeitos de
-  `RunService:IsStudio()`, que retorna `false` nele) — só o cliente de Team
-  Test mantém `IsStudio() == true`.
+## `DescendantRemoving`/`DescendantAdded` — semântica exata em reparent
 
-## Achados que podem ser reaproveitados
+- Fonte oficial mais confiável pra semântica EXATA (texto literal) de
+  eventos de `Instance` não é a página HTML renderizada
+  (`create.roblox.com/docs/reference/engine/classes/Instance#Nome`, que via
+  WebFetch só devolve assinatura + exemplo trivial, sem a descrição em prosa)
+  — é o **YAML fonte** do repositório `Roblox/creator-docs`:
+  `raw.githubusercontent.com/Roblox/creator-docs/main/content/en-us/reference/engine/classes/Instance.yaml`
+  (pedir pro WebFetch achar o bloco do evento específico; arquivo é grande,
+  ~2400 linhas, pode truncar — pedir trechos visados por nome do evento).
+- **Definição textual exata confirmada**: `DescendantRemoving` = "fires
+  immediately before the parent Instance changes such that a descendant
+  instance will no longer be a descendant" — ou seja, é relativo ao
+  ancestral em que o evento foi conectado: só dispara quando a Instance está
+  prestes a DEIXAR de ser descendente DAQUELE ancestral específico. Reparent
+  direto entre duas posições que continuam ambas dentro da mesma árvore
+  observada não deveria disparar (a relação de descendência nunca se rompe);
+  reparent para uma Instance órfã (recém-criada, ainda sem `.Parent`) ou pra
+  fora da árvore, sim, dispara — mesmo que temporário/rápido.
+- `DescendantAdded` documentado oficialmente só como "fires after a
+  descendant is added" — a alegação (comum em resumos de busca/Fandom) de
+  que dispara INDIVIDUALMENTE pra cada descendente pré-existente quando uma
+  subárvore inteira é reparentada de uma vez **não está confirmada na doc
+  oficial** (página oficial só tem exemplo trivial de 1 instância sem
+  filhos). Único suporte encontrado é DevForum (2020,
+  `t/descendantadded-with-models/94936`), sem confirmação staff, e com
+  ressalva explícita de um dos respondentes ("Anaminus": comportamento comum
+  mas "nothing guaranteeing that it happens in all possible cases").
+- `Enum.SignalBehavior` (`Default`/`Immediate`/`Deferred`/`AncestryDeferred`)
+  controla se handlers desses eventos rodam inline (`Immediate`) ou
+  enfileirados pro próximo "resumption point" (`Deferred` — recomendado pela
+  Roblox, e já é o padrão em places NOVOS/template; em places EXISTENTES o
+  valor `Default` ainda equivale a `Immediate`, então **checar
+  `workspace.SignalBehavior` no place real** antes de assumir qual modo
+  está ativo). Doc oficial: `create.roblox.com/docs/scripting/events/deferred`
+  (ou `.md` fonte em `Roblox/creator-docs`). Nenhuma fonte (oficial ou
+  fórum) confirma a ordem exata quando MÚLTIPLOS eventos (remove + add) pra
+  MESMA Instance ficam enfileirados no mesmo lote deferido — ponto em
+  aberto, só teste real em Studio resolve.
+- Detalhe completo (aplicado ao caso real de
+  `SourceWatcher.resolvePath`/conversão Folder→Script, com citações) em
+  `.claude/research/2026-08-02-reparent-descendantremoving-semantics.md`.
 
-- `GetPropertyChangedSignal("Source")`/`Changed` após
-  `ScriptEditorService:UpdateSourceAsync` **não tem garantia documentada** de
-  disparar, especialmente para script nunca aberto no editor + replicado via
-  Team Create. Ver `.claude/research/2026-07-03-source-changed-signal-reliability.md`.
-  Recomendação registrada lá: usar contador/hash em `TestService.SyncTeam`
-  (`IntValue`/`StringValue`, sinal comprovadamente confiável) como notificação
-  de "algo mudou, vá ler", em vez de confiar no `Changed` da instância do
-  script em si.
-- **`ObjectValue.Value` NÃO vira `nil` automaticamente quando a Instance
-  referenciada é destruída via `:Destroy()`** — confirmado como "intended
-  behavior" por staff em múltiplos threads do DevForum (não documentado
-  explicitamente na doc oficial, mas consistente com a recomendação oficial
-  de `Instance.Destroy()` de zerar variáveis manualmente). `ObjectValue.Changed`
-  **também não dispara** quando o valor referenciado é destruído (só dispara
-  ao reatribuir `Value` para outra coisa). Detecção robusta de "destruído":
-  `instance.Parent == nil` (necessário, não suficiente — Parent nil também
-  ocorre em Instance só temporariamente desparentada) **+** `pcall` tentando
-  reatribuir `instance.Parent = instance.Parent` (falha = destruída de
-  verdade, porque `Destroy()` trava `Parent` — essa trava é documentada
-  oficialmente). `Instance.Destroying` existe e é documentado mas tem
-  múltiplos relatos de disparo inconsistente no DevForum (cascata de
-  destruição, timing) — nunca usar como único caminho, só fast-path, igual ao
-  padrão já adotado para `Source.Changed`. Comportamento sob replicação
-  remota via Team Create (dois Studios) **não encontrado** em doc nem
-  DevForum — é lacuna, tratar como hipótese e testar com dois Studios reais.
-  Detalhe completo, threads e tabela de pegadinhas em
-  `.claude/research/2026-07-04-objectvalue-destroy-detection.md`.
-- **UI de plugin NÃO é limitada a `DockWidgetPluginGui`.** `CoreGui`
-  (`game:GetService("CoreGui")`) é oficialmente utilizável por plugins
-  ("It can also be used by Plugins in Roblox Studio", doc oficial da classe
-  `CoreGui`) — dá pra parentar um `ScreenGui` direto nele pra um overlay
-  livre de verdade (sem chrome de widget docked/float), sem precisar de
-  permissão de manifest extra (capability `Plugin` já vem de graça em código
-  de plugin). **Confirmado no código-fonte público do Rojo real**
-  (`rojo-rbx/rojo`, `plugin/src/init.server.lua`:
-  `Roact.mount(app, game:GetService("CoreGui"), "Rojo UI")`) que é assim que
-  ele implementa o popup de notificação: painel principal continua
-  `DockWidgetPluginGui` (via `StudioPluginGui`), mas o toast é um `ScreenGui`
-  **irmão** dele na árvore, parentado em `CoreGui` — não é widget disfarçado.
-  Ressalva sem confirmação oficial explícita: overlay via CoreGui em Studio
-  provavelmente só cobre a área do viewport 3D, não os painéis nativos
-  (Explorer/Properties/Output) — inferência, não fonte única confirmando,
-  validar com teste real. `DockWidgetPluginGuiInfo`/`InitialDockState.Float`
-  sempre tem cabeçalho/bordas nativos mesmo flutuando (bug reconhecido por
-  staff Roblox: FloatingXSize/FloatingYSize incluem chrome do widget no
-  cálculo) — não serve pra popup borderless. Detalhe completo em
-  `.claude/research/2026-07-15-plugin-floating-overlay-notification.md`.
-- **`HttpService:CreateWebStreamClient` (`WebStreamClient`) não expõe close
-  code nem reason string de WebSocket em NENHUM evento documentado.**
-  `Closed()` não tem parâmetro nenhum; `Error(responseStatusCode: int,
-  errorMessage: string)` existe, mas `responseStatusCode` é status HTTP
-  (404/500), não close code de protocolo WS (1000-1015, ou 1013 do caso do
-  SyncTeam). Feature request pedindo isso está aberto no DevForum desde
-  jan/2026 sem resposta. Portanto: heurística por comportamento (tempo +
-  ausência de mensagem antes de cair), não parsing de close code, é o único
-  caminho hoje para o plugin inferir "rejeitado de propósito" vs "erro
-  genérico". Detalhe completo em
-  `.claude/research/2026-07-15-webstreamclient-close-code.md`.
-- **`wally install` apaga a pasta de destino INTEIRA (`Packages/`,
-  `ServerPackages/`, `DevPackages/`) via `fs::remove_dir_all` a cada
-  execução, incondicionalmente** — sem diff seletivo, sem preservar arquivos
-  manuais/não gerenciados. Confirmado lendo o código-fonte real
-  (`src/installation.rs`, função `clean()`, chamada em
-  `src/commands/install.rs` antes de `install()`). O campo `exclude` do
-  `wally.toml` é para outra coisa (controla o que entra no pacote quando
-  VOCÊ publica, não protege `Packages/` local). Não existe flag de CLI nem
-  opção de manifesto para excluir um subcaminho desse apagamento; Wally
-  também não documenta dependência tipo "path"/local (só registry e git).
-  Conclusão: qualquer módulo manual precisa ficar FORA de
-  `Packages/`/`ServerPackages/`/`DevPackages/` (pasta irmã própria, mapeada
-  separadamente no `default.project.json` do Rojo) — colocá-lo dentro é
-  destruído na próxima `wally install`. Detalhe completo em
-  `.claude/research/2026-07-16-wally-packages-manual-module.md`.
-- **`RunService:IsStudio()` NÃO distingue Edição de Play/Run (F5/F8) dentro
-  do Studio — é `true` nos dois.** A API correta é `RunService:IsRunning()`
-  (ou `IsEdit()`, seu inverso documentado): edição normal =
-  `IsStudio() and not IsRunning()`. As duas (`IsRunning`/`IsEdit`) só
-  divergem — ficando ambas `false` — quando a simulação está pausada
-  (doc oficial, sem confirmação de teste real de plugin encontrada — se
-  relevante, validar manualmente). Única exceção documentada de
-  `IsStudio() == false` num fluxo iniciado do Studio: servidor de Team Test
-  (staff confirma que não é "sessão de Studio"); o cliente de Team Test
-  continua `true`. Detalhe completo em
-  `.claude/research/2026-07-16-runservice-isstudio-isrunning-plugin-detect-test.md`.
+## `Enum.Font`/`Font`/`FontFace`/`Enum.FontWeight` — reskin de UI (Theme/StatusPanel/Toast)
+
+- **Atalho de fonte primária pra qualquer dúvida de enum/datatype Font**:
+  YAML bruto em `raw.githubusercontent.com/Roblox/creator-docs/main/
+  content/en-us/reference/engine/{enums,datatypes}/<Nome>.yaml` — mesmo
+  padrão já usado pra `Instance.yaml` acima. Confirmado funcionando pra
+  `enums/Font.yaml`, `enums/FontWeight.yaml`, `datatypes/Font.yaml`,
+  `classes/TextLabel.yaml` (WebFetch com prompt pedindo texto verbatim das
+  descriptions, não resumo, dá resultado confiável e citável).
+- **`Enum.Font.Nunito` EXISTE** no enum atual (valor 35) — confirmado em
+  YAML oficial + página HTML renderizada + WebSearch, os três batendo.
+  Lista completa do enum `Font` (54 itens, ordem oficial) está salva em
+  `.claude/research/2026-08-02-font-enum-fontface-fontweight-nunito.md` —
+  útil pra qualquer pergunta futura tipo "Enum.Font.X existe?" sem precisar
+  refazer o fetch.
+- **`Font` (datatype)/`FontFace` (propriedade)/`Font.new`/`Font.fromName`/
+  `Font.fromEnum`/`Font.fromId` são todos reais e documentados hoje**,
+  assinaturas exatas confirmadas via YAML oficial: `Font.new(family:
+  Content, weight?: Enum.FontWeight = Regular, style?: Enum.FontStyle =
+  Normal)` (family é asset id `rbxasset://`/`rbxassetid://`, NÃO nome cru);
+  `Font.fromName(name: string, weight?, style?)` aceita nome tipo
+  `"FredokaOne"` (sem espaço, mesmo texto do item do enum — confirmado por
+  relato de fórum de erro comum ao usar `"Fredoka One"` com espaço);
+  `Font.fromEnum(font: Enum.Font)` (erro se `Enum.Font.Unknown`).
+- **`Enum.FontWeight` — 9 valores confirmados** (YAML oficial):
+  `Thin`(100)/`ExtraLight`(200)/`Light`(300)/`Regular`(400, default)/
+  `Medium`(500)/`SemiBold`(600)/`Bold`(700)/`ExtraBold`(800)/`Heavy`(900).
+- **Gotcha real confirmado por 2 threads DevForum independentes**: mutar
+  `instance.FontFace.Weight = X` diretamente **não tem efeito** (comum
+  engano — é value type, leitura devolve cópia). Técnica correta: ler
+  `.FontFace` numa var local, construir/mutar um `Font` novo (via
+  `Font.new`/reatribuição de campo na cópia local), e **reatribuir o objeto
+  inteiro de volta** à propriedade `.FontFace`.
+- Doc oficial confirma (texto verbatim) que `.Font` (enum legado) e
+  `.FontFace` (datatype novo) são propriedades "kept in sync" uma com a
+  outra — mas só documenta explicitamente a direção `FontFace→Font`
+  ("quando você seta FontFace, Font vira o Enum.Font correspondente ou
+  Unknown"). A direção oposta (setar `.Font` reseta peso customizado do
+  FontFace de volta pro peso implícito daquele item do enum) é **inferência
+  lógica a partir do texto de sincronização, não citação/teste staff
+  dedicado** — mas suficiente pra recomendação prática seguir sendo segura:
+  em qualquer helper tipo `applyBold(instance)`, sempre setar `.Font`
+  primeiro (se for setar) e `.FontFace` por último, nunca o contrário.
+- Detalhe completo (com todas as citações verbatim) em
+  `.claude/research/2026-08-02-font-enum-fontface-fontweight-nunito.md`.
+
+## Streaming de Source por tecla via Team Create — viabilidade
+
+- **Sem API de patch incremental de escrita**: `ScriptEditorService`
+  (YAML oficial, 12 membros) não tem nenhum método de "insert at
+  position"/"replace range" para escrever Source — `UpdateSourceAsync`
+  sempre reescreve a string inteira via callback `(oldContent) ->
+  newContent`. O único range-aware é `TextDocumentDidChange`
+  (`{range={start,end}, text}`), mas é evento de LEITURA de mudanças no
+  editor local, não API de escrita.
+- **Achado mais forte contra "write a cada tecla"**: issue oficial do
+  próprio Rojo, `rojo-rbx/rojo#1273` ("Made two way Source sync stable") —
+  sincronizar Source a cada tecla causou "repeated writes/server echoes" e
+  cursor pulando pro final; a correção foi ELIMINAR write automático por
+  tecla e trocar por gatilho manual (atalho). Fonte de confiança média
+  (contribuidor individual, issue aberta, não staff Roblox) mas é a analogia
+  de caso de uso mais próxima do SyncTeam já achada em qualquer pesquisa do
+  projeto — vale a pena checar de novo se essa issue fechar/mergear.
+- **Write externo + sessão colaborativa ativa no mesmo Script já é
+  sabidamente frágil mesmo em baixa frequência**: thread oficial "Live
+  Scripting Beta" (`t/2640607`) tem engenheiro Roblox reconhecendo bug vago
+  ("this is a bug with something, but not sure what... corrupted data being
+  sent") quando write externo via `UpdateSourceAsync` coincide com sessão
+  Live Scripting ativa no mesmo Script — sem fix confirmado até o acesso.
+- **Live Scripting em si é construído sobre `UpdateSourceAsync`** (doc
+  oficial confirma verbatim) e tem fallback documentado para read-only
+  quando a banda é insuficiente — evidência indireta de que write frequente
+  de Source via Team Create é sustentável em princípio, mas não prova que a
+  mesma eficiência vale pro caminho de API pública exposto a plugins
+  (Live Scripting pode ter otimização interna não exposta).
+- **Rate limit de replicação de propriedade em Team Create especificamente:
+  não encontrado em nenhuma fonte** (nem doc oficial nem DevForum trata
+  Team Create como caminho de replicação separado do client-server de jogo
+  publicado). A única info de coalescing achada ("só o último valor de uma
+  propriedade alterada 3x no mesmo frame replica") é de thread de tutorial
+  de usuário sobre replicação de JOGO PUBLICADO, sem citar fonte oficial e
+  sem mencionar Team Create — não promover a fato sem spike real.
+- Detalhe completo com todas as citações verbatim em
+  `.claude/research/2026-08-02-realtime-source-streaming-team-create.md`.
+
+## VS Code Marketplace — erro "suspicious content" no `vsce publish`
+
+- Fora do escopo Roblox, mas registrado aqui porque a pergunta pode
+  reaparecer (publicação da extensão SyncTeam). Fonte oficial mais forte
+  encontrada: blog `developer.microsoft.com/blog/security-and-trust-in-
+  visual-studio-marketplace/` — confirma que TODO pacote publicado passa
+  por scanner de malware (motor tipo Defender) + análise dinâmica em
+  **sandbox de comportamento em runtime**, e que extensões flagradas vão
+  pra revisão manual de engenheiro de segurança pra evitar falso-positivo.
+  Não é rate-limit nem coisa que passa só esperando — fica bloqueado até
+  correção ou revisão manual.
+- **Nenhuma fonte (oficial ou comunidade) confirma qual sinal específico
+  dispara o flag** — nem "publisher novo", nem "abrir socket/servidor de
+  rede local", nem "metadados incompletos" têm confirmação oficial como
+  causa. São só correlações observadas em relatos de usuário (issues
+  `microsoft/vsmarketplace` #344/#682/#826/#919, todas sem resposta técnica
+  pública da causa raiz) — inclusive há um caso documentado (Microsoft Q&A,
+  extensão 100% local sem rede, metadados completos) onde nada disso se
+  aplicava e só resolveu via contato manual.
+- Mitigação prática mais citada (sem garantia): preencher
+  `repository`/`homepage`/`bugs`/`license`/`keywords` no `package.json`,
+  `.vscodeignore` limpando `node_modules`/`.git`/scripts de build/fontes
+  `.ts` do VSIX final (usar bundler tipo esbuild pra gerar `dist/` único),
+  conferir `publisher` no manifest bate exatamente (case-sensitive) com o
+  nome no portal.
+- Canal oficial de contestação/revisão manual: e-mail
+  `vsmarketplace@microsoft.com` e abrir issue no repositório
+  `github.com/microsoft/vsmarketplace` ("Customer feedback and issue
+  tracker repository for Visual Studio Marketplace"). Existe também um
+  formulário de suporte linkado do portal/Partner Center, mas o atalho
+  `aka.ms/...` exato variou entre fontes consultadas — não confirmei qual é
+  o correto, checar direto no portal quando for usar.
+- Detalhe completo com todas as citações em
+  `.claude/research/2026-08-02-vsce-publish-suspicious-content-error.md`.
+
+## Rokit — formato de artefato exigido / distribuição do plugin do Rojo
+
+- **Rokit não exige manifest do lado do autor da ferramenta** (nada tipo
+  `rokit-manifest.json`) — só heurística de NOME do asset + fallback de
+  parsing binário real. Código-fonte relevante em
+  `github.com/rojo-rbx/rokit`:
+  - `lib/descriptor/os.rs`: detecção de SO por substring/palavra no nome do
+    arquivo (ex. `"stylua-linux-x86_64-musl"`, `"rojo-...-win64"`).
+  - `lib/descriptor/executable_parsing.rs`: FALLBACK que faz parsing real
+    dos headers do binário já baixado — ELF (`e_machine`), Mach-O
+    (`cputype`, trata "Fat"/universal), PE (`machine` do COFF). Ou seja:
+    **o artefato final PRECISA ser um executável nativo válido nesses 3
+    formatos** — script puro (`.js`/`.py`/shell) não passa; um binário
+    gerado por `bun build --compile`/`pkg`/`nexe` teoricamente passaria (tem
+    headers nativos reais), mas não achei nenhum caso confirmado de
+    ferramenta Node.js distribuída assim via Rokit (busca dedicada, sem
+    resultado).
+  - `lib/sources/artifact/provider.rs`: único provider é GitHub Releases
+    (`ArtifactProvider::GitHub`, não há GitLab/outro).
+  - `lib/sources/artifact/format.rs`: formatos de compressão aceitos
+    (nome do arquivo): `.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.xz`/`.txz`,
+    `.gz`.
+  - Consumidor usa `rokit.toml` (`alias = "provider/author/name@version"`);
+    instalação local em `{author}-{name}-{version}/`, binário
+    `{name}[.exe]` dentro.
+- **O Rojo NÃO baixa seu próprio plugin de Studio (`.rbxm`) em runtime nem
+  via Rokit** — é feature do PRÓPRIO binário `rojo` (Rokit só entrega o
+  binário `rojo`; depois disso `rojo plugin install` age sozinho, sem
+  rede). Mecanismo confirmado em `build.rs` (raiz de
+  `github.com/rojo-rbx/rojo`, lido diretamente): compila o código Luau-fonte
+  da pasta `plugin/` + `plugin.project.json` num `VfsSnapshot` serializado
+  pra `plugin.bincode` em tempo de BUILD; esse arquivo é embutido no binário
+  via `include_bytes!` (constante `PLUGIN_BINCODE`, confirmado via DeepWiki
+  sobre `src/cli/plugin.rs` — não consegui abrir esse arquivo bruto direto,
+  path pode ter mudado). Em runtime, só deserializa os bytes já embutidos e
+  escreve `RojoManagedPlugin.rbxm` na pasta de plugins do Studio (localizada
+  via `RobloxStudio::locate()`, do crate `Kampfkarren/roblox-install` — ver
+  seção dedicada abaixo com o path exato por SO). `build.rs` também valida
+  que `plugin/Version.txt` bate com a versão do Cargo, evitando plugin
+  dessincronizado do CLI. Alternativa manual sem CLI (confiança média, só
+  via snippet de busca, não fetch direto): Roblox Creator Store (Asset ID
+  `13916111004`) ou `.rbxm` anexado ao GitHub Release.
+- **Implicação prática pro SyncTeam** (hoje: extensão VS Code TS + plugin
+  Luau, SEM CLI compilado): não cabe direto no padrão Rokit sem antes
+  existir um binário nativo standalone do projeto. Se algum dia surgir um
+  componente CLI/servidor fora do VS Code, teria que compilar como binário
+  nativo real (Rust/Go, ou Node empacotado via `bun build --compile`/`pkg`
+  — sem precedente confirmado) publicado em GitHub Release com nome de
+  asset contendo palavra-chave de SO/arch reconhecível.
+- **CORREÇÃO (03/ago/2026) — a afirmação acima de "Rokit só aceita
+  `owner/repo` completo, sem registro central" estava INCOMPLETA.** Existe
+  sim um mecanismo de shorthand (`rokit add rojo` sem owner funciona,
+  confirmado ao vivo pelo usuário), mas é **lista hardcoded no código-fonte
+  do binário**, não registro dinâmico tipo npm nem busca por GitHub API.
+  Vive em `src/util/constants.rs` (não em `lib/`): constante
+  `KNOWN_TOOL_AUTHORS_AND_IDS` (array de 8 pares autor→[ferramentas]),
+  processada num `BTreeMap` (`KNOWN_TOOLS`, lookup case-insensitive) via
+  `get_known_tool(tool)`. Consumida em `src/util/id_or_spec.rs`
+  (`ToolIdOrSpec::from_str`): se o argumento não contém `@`, tenta
+  `get_known_tool(s)` ANTES de tentar parsear como `ToolId` cru (que exige
+  `owner/nome`) — só cai pro parse cru se não achar no mapa. Lista completa
+  hoje (8 autores, 12 ferramentas): `evaera`→`moonwave`;
+  `Iron-Stag-Games`→`lync`; `JohnnyMorganz`→`luau-lsp`,`StyLua`,
+  `wally-package-types`; `Kampfkarren`→`selene`; `luau-lang`→`luau`;
+  `lune-org`→`lune`; `rojo-rbx`→`remodel`,`rojo`,`tarmac`;
+  `UpliftGames`→`wally`. **Não documentado** em README/CHANGELOG (busca
+  dedicada nos dois, sem achado) — só descobrível lendo o código-fonte.
+  **Sem `CONTRIBUTING.md` no repo** e sem processo formal encontrado pra
+  terceiro entrar nessa lista — hoje só ferramentas do núcleo do
+  ecossistema Rojo/Luau estão lá, nenhum precedente de projeto externo;
+  entrar exigiria PR direto em `src/util/constants.rs` a critério dos
+  mantenedores. **Implicação pro `syncteam-cli`**: sem esse shorthand,
+  usuários sempre precisam do owner completo (`rokit add
+  <owner>/SyncTeam`), que já funciona hoje sem mudança nenhuma — não é
+  bloqueio, só significa que não vira `rokit add SyncTeam` sem pedir (e
+  provavelmente não conseguir) entrada nessa lista curada. Detalhe completo
+  com o código-fonte citado verbatim em
+  `.claude/research/2026-08-03-rokit-known-tools-shorthand-mechanism.md`.
+- Detalhe completo com todas as citações de código-fonte em
+  `.claude/research/2026-08-02-rokit-artifact-format-rojo-plugin-distribution.md`.
+
+## Bun `bun build --compile` — embutir arquivo binário arbitrário (equivalente a `include_bytes!` do Rust)
+
+- **Confirmado, doc oficial, feature madura desde v1.1.5 (mai/2024)** — bem
+  antes da 1.3.13 usada no projeto. Sintaxe:
+  `import rbxmPath from "./SyncTeam.rbxm" with { type: "file" }`. O import
+  devolve uma **string de path** (não os bytes): em dev aponta pro arquivo
+  real; depois de `bun build --compile` vira path virtual interno
+  `/$bunfs/root/<nome>-<hash>.<ext>`. Leitura em runtime é **API idêntica**
+  dentro e fora do binário compilado: `await Bun.file(rbxmPath).bytes()`
+  (→ `Uint8Array`, ideal pra binário) ou `.arrayBuffer()`/`.text()`; `node:fs`
+  (`readFileSync`) também funciona sobre o mesmo path virtual.
+- Sem limite de tamanho/tipo documentado — doc oficial usa exatamente esse
+  mecanismo pra `.wasm`, `.ttf`, `.node` (N-API addon) e libs nativas
+  (`.dylib`/`.so`/`.dll` via `bun:ffi`) como exemplos de "binary files",
+  então `.rbxm` (poucos KB) não é caso de risco plausível.
+- `Bun.embeddedFiles: ReadonlyArray<Blob>` lista tudo que foi embutido
+  (ordenado por nome, vazio fora de standalone) — útil só pra debug/
+  verificação pós-build, não necessário no fluxo principal.
+  `Bun.isStandaloneExecutable: boolean` detecta se está rodando dentro do
+  binário compilado sem custo de alocar Blobs.
+- Único bug relevante achado (Windows, `bun build --compile` travando com
+  binário embutido + `--minify`/`--sourcemap`) foi na v1.1.4, corrigido logo
+  em seguida (PR referenciada no próprio issue) — não afeta a 1.3.13 atual,
+  mas vale lembrar se aparecer algo estranho ativando essas flags junto de
+  embed no Windows.
+- Não é necessário recorrer à alternativa "base64 em string constante"
+  (mais simples/sem dependência de bundler, mas gera +33% de tamanho de
+  fonte e um passo extra de geração) — a feature nativa está madura e sem
+  relato de instabilidade pra arquivo binário genérico na versão atual;
+  guardar a alternativa como fallback só se aparecer bug real ao testar.
+- Doc oficial: `bun.sh/docs/bundler/executables` (seção "Embed assets &
+  files") e `bun.com/reference/bun/embeddedFiles`. Detalhe completo com
+  citações em
+  `.claude/research/2026-08-03-bun-compile-embed-binary-file-rbxm.md`.
+
+## Pasta de Plugins locais do Roblox Studio por SO — Windows `[Verificado]`, macOS sem doc oficial
+
+- **Windows** (já em uso em `Tools/build-and-deploy-plugin.sh` e
+  `cli/src/plugin/studioPluginsDir.ts`): `%LOCALAPPDATA%\Roblox\Plugins`.
+- **macOS**: `~/Documents/Roblox/Plugins`. **Nenhuma doc oficial
+  (`create.roblox.com/docs`) nem post de staff no DevForum confirma esse
+  caminho** — todas as threads relevantes do fórum revisadas (várias sobre
+  "plugin não aparece no Mac") discutem o problema sem ninguém citar o path
+  exato. A confirmação mais forte disponível é o código-fonte real do crate
+  `Kampfkarren/roblox-install` (mesmo autor de Selene; é o mecanismo que o
+  **próprio Rojo usa** para achar a pasta de plugins e instalar
+  `RojoManagedPlugin.rbxm` — ver `build.rs`/`RobloxStudio::locate()` citado
+  acima). Bloco relevante (`src/lib.rs`, `#[cfg(target_os = "macos")]`,
+  `locate_from_directory`):
+  ```rust
+  let documents = dirs::document_dir().ok_or(Error::DocumentsDirectoryNotFound)?;
+  let plugins = documents.join("Roblox").join("Plugins");
+  ```
+  (`dirs::document_dir()` resolve pra `$HOME/Documents` no macOS).
+- **Cuidado com um contraexemplo de baixa qualidade circulando**: página
+  de terceiros sem vínculo aparente com a Roblox
+  (`roblox-studio-plugins-folder.pages.dev`) afirma
+  `~/Library/Application Support/Roblox/Plugins` — sem fonte citada, e
+  `~/Library/Application Support/Roblox` de fato existe no macOS (confirmado
+  por artigo oficial de suporte sobre desinstalar o Roblox Player), mas como
+  pasta de dados/cache do Roblox em geral, não há evidência de que a
+  subpasta `Plugins` de lá seja usada pelo Studio para plugins locais.
+  Tratar essa alegação como não confirmada/provavelmente errada se
+  reaparecer em pesquisa futura.
+- Existe um setting `Studio.PluginsDir` (mencionado em
+  `Kampfkarren/roblox-install` issue #33 e ecoado por relato de usuário no
+  DevForum que resolveu bug de plugin sumido "mudando o Plugins Directory")
+  que pode fazer o valor real divergir do default por máquina — não achei
+  onde esse setting fica exposto na UI do Studio.
+- Detalhe completo com todas as citações em
+  `.claude/research/2026-08-03-macos-studio-plugins-folder-path.md`.
+
+## VS Code — ícone customizado em `StatusBarItem` (SVG direto NÃO existe)
+
+- **`StatusBarItem.text` só aceita texto + `$(codicon-id)` (`ThemeIcon`)**,
+  nunca imagem/SVG direto. Prova forte da ausência: issue oficial
+  `microsoft/vscode#72244` pedindo exatamente sintaxe `$(custom:path/to/
+  icon.svg)` foi **fechada em 09/out/2019 como "completed"** sem implementar
+  esse path — o que endereçou o pedido foi a contribution point `icons`
+  (glyph-em-fonte), não SVG cru.
+- **`contributes.icons`** (schema confirmado no guia oficial "Product Icon
+  Theme"): `{ "id": { "description": "...", "default": { "fontPath":
+  "./x.woff", "fontCharacter": "\\E001" } } }`. Citação verbatim da doc:
+  "VS Code requires the icons to be defined as glyph in an icon font." —
+  **fonte (WOFF recomendado), nunca SVG solto**, mesmo a doc "recomendando
+  SVG" em outro contexto (comandos/views, não essa contribution point).
+  Depois de declarado, usa-se `$(id)` em qualquer lugar que aceite
+  `ThemeIcon`, inclusive `StatusBarItem.text`.
+- **Ferramenta padrão pra gerar a fonte a partir de SVGs**: `fantasticon`
+  (`github.com/tancredi/fantasticon`, hoje sob `twbs/fantasticon`) — é a
+  MESMA ferramenta usada pelo próprio `microsoft/vscode-codicons` pra gerar
+  a fonte de ícones do VS Code, bom precedente de confiança.
+- **Ícone da extensão na view de Extensions/Marketplace (campo `icon` no
+  manifest)**: doc oficial pede PNG mín. 128x128 (256x256 Retina).
+  Confirmado (issue oficial aberta `microsoft/vsmarketplace#1272`) que
+  `vsce` **recusa publicar** com SVG nesse campo por segurança — sempre
+  converter SVG→PNG antes (passo único, bem mais simples que gerar fonte).
+- Detalhe completo com todas as citações em
+  `.claude/research/2026-08-03-statusbaritem-custom-icon-svg.md`.

@@ -11,10 +11,19 @@ diretamente na sessão principal:
 | Código Luau / plugin Studio / schema Team Create | `luau-dev` |
 | TypeScript / extensão VS Code / harness Node | `extension-dev` |
 | O que o usuário vê (decorações, painéis, widgets, textos) | `ui-dev` |
+| Revisão de diff/PR nas duas stacks (só reporta, nunca corrige) | `code-reviewer` |
+| Rodar/expandir testes, tooling de teste e debug | `qa-tester` |
 
 Exceções que podem ser feitas direto: correções triviais (typo, uma linha),
 edição de documentação, e leitura/investigação de código. Em caso de dúvida,
 delegue.
+
+## Autoridade em obstáculo recuperável
+
+Ver [.claude/rules/authority.md](authority.md): agentes decidem e seguem em
+obstáculos recuperáveis (porta ocupada, cache sujo, retry transitório), com
+log claro da decisão — sem travar pedindo confirmação a cada obstáculo. Ação
+destrutiva/irreversível continua exigindo o usuário sempre.
 
 ## Disciplina de verdade
 

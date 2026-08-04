@@ -670,6 +670,33 @@ export class SyncBridge {
    */
   async handleLocalFileChange(relDiskPath: string, transport: Transport): Promise<void> {
     const key = contentCacheKey(relDiskPath);
+    const knownUuid = this.uuidByDiskPath.get(key);
+
+    // 2026-08-03 (bug de performance real, ver docs/DECISIONS.md): as duas
+    // checagens abaixo são PURAS (Map lookup + string parsing, sem I/O) e
+    // rodavam DEPOIS do `readFile` — ou seja, todo evento de watcher pagava
+    // uma leitura de disco REAL mesmo quando o resultado ia ser descartado
+    // (path fora de qualquer ponto de montagem/convenção Rojo, ou — para uuid
+    // já conhecido — dentro de pasta de pacotes Wally, que já é excluída do
+    // live-edit-sync contínuo por decisão de 2026-07-16). Resolver isso ANTES
+    // do `readFile` evita o I/O inteiro nesses casos, sem mudar nenhum
+    // resultado observável (mesmos logs, mesmo comportamento final) — só
+    // quando NENHuma das duas early-exits se aplica é que vale a pena tocar
+    // disco.
+    if (knownUuid !== undefined) {
+      const instancePath = this.scripts.get(knownUuid)?.path ?? relDiskPath;
+      if (isInsideExcludedPackageFolder(instancePath)) {
+        this.logger.info(
+          `disco → Studio: '${relDiskPath}' (uuid '${knownUuid}') dentro de pasta de pacotes Wally — ignorado sem tocar disco (live-edit-sync não se aplica)`,
+        );
+        return;
+      }
+    } else if (resolveDataModelPathForDiskChange(relDiskPath, this.mountPoints) === null) {
+      this.logger.info(
+        `'${relDiskPath}' fora de qualquer ponto de montagem ou não segue a convenção de nomenclatura Rojo — ignorado (sem leitura de disco)`,
+      );
+      return;
+    }
 
     let content: string | null;
     try {
@@ -688,18 +715,22 @@ export class SyncBridge {
       return; // eco de escrita que a própria ponte já fez
     }
 
-    const knownUuid = this.uuidByDiskPath.get(key);
     if (knownUuid !== undefined) {
       await this.pushKnownUuidUpdate(relDiskPath, key, knownUuid, content, transport, "disco → Studio");
       return;
     }
 
     // Sem uuid conhecido para este diskPath: candidato a arquivo local novo.
+    // `resolveDataModelPathForDiskChange` já foi confirmado não-null acima
+    // (senão já teríamos retornado) — recalculado aqui porque é uma função
+    // PURA e barata (sem I/O), e evita carregar o resultado através de uma
+    // variável mutável entre os dois ramos deste método.
     const resolved = resolveDataModelPathForDiskChange(relDiskPath, this.mountPoints);
     if (resolved === null) {
-      this.logger.info(
-        `'${relDiskPath}' fora de qualquer ponto de montagem ou não segue a convenção de nomenclatura Rojo — ignorado`,
-      );
+      // Defensivo — não deveria acontecer (já validado acima antes do
+      // readFile), mas não custa não confiar cegamente numa função pura só
+      // porque já foi chamada uma vez.
+      this.logger.error(`'${relDiskPath}': resolveDataModelPathForDiskChange divergiu entre as duas chamadas — estado inesperado`);
       return;
     }
     const { dataModelPath, className } = resolved;

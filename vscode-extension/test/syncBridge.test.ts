@@ -23,8 +23,15 @@ import type { MountPoint } from "../src/mapping/projectMapping.js";
 class CountingDiskIO implements DiskIO {
   writeCount = 0;
   renameCount = 0;
+  // 2026-08-03: instrumentação nova para o fix de performance (watcher sem
+  // escopo fazia leitura de disco real pra todo path, mesmo os descartados
+  // depois) — usado para provar que os early-exits novos de
+  // handleLocalFileChange evitam o readFile por completo, não só descartam
+  // o resultado depois de já ter pago o I/O.
+  readCount = 0;
   constructor(private readonly inner: DiskIO) {}
   readFile(relPath: string) {
+    this.readCount += 1;
     return this.inner.readFile(relPath);
   }
   async writeFile(relPath: string, content: string) {
@@ -268,6 +275,27 @@ describe("pastas de pacotes Wally — exclusão do live-edit-sync (2026-07-16)",
     // Nenhum writeSource foi enviado ao Studio.
     expect(transport.sent.some((m) => m.kind === "writeSource")).toBe(false);
     expect(transport.sources.get("uuid-sp")).toBe("return 'v1'");
+  });
+
+  test("2026-08-03 (bug de performance): handleLocalFileChange ignora ATUALIZAÇÃO dentro de Packages SEM tocar disco (não só sem propagar)", async () => {
+    const transport = new FakeTransport();
+    transport.sources.set("uuid-pkg2", "return 'v1'");
+    await bridge.handleScriptAdded(
+      { uuid: "uuid-pkg2", path: "ServerScriptService/Server/Packages/Baz", className: "ModuleScript" },
+      transport,
+    );
+    writeTmp("src/server/Packages/Baz.luau", "return 'v2 -- divergente localmente'");
+    diskIO.readCount = 0; // zera depois da materialização inicial, só nos interessa o handleLocalFileChange abaixo
+
+    await bridge.handleLocalFileChange("src/server/Packages/Baz.luau", transport);
+
+    // A diferença desta tarefa (2026-08-03): antes, isto fazia um readFile
+    // real e só DEPOIS descartava o resultado dentro de pushKnownUuidUpdate.
+    // Agora a checagem de pasta de pacotes Wally acontece ANTES do readFile
+    // (é pura: só Map.get + isInsideExcludedPackageFolder), então o
+    // readFile nem chega a rodar.
+    expect(diskIO.readCount).toBe(0);
+    expect(transport.sent.some((m) => m.kind === "writeSource")).toBe(false);
   });
 
   test("handleLocalFileChange CONTINUA criando arquivo novo dentro de DevPackages (só update é ignorado, não criação)", async () => {

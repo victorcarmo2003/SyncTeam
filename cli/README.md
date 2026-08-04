@@ -34,6 +34,15 @@ executável nativo via `bun build --compile`), não Node puro.
   `default.project.json`). Ver "`start`/`stop`: como o daemon funciona"
   abaixo para o design completo (2 processos, resolução de porta
   interativa, self-invocation).
+  **Achado real (2026-08-03, ver DECISIONS.md "16ª rodada"): não rode isto
+  ao mesmo tempo que a extensão VS Code está sincronizando a MESMA pasta
+  aberta num editor.** `NodeDiskIO` escreve via `node:fs` puro, sem passar
+  por `vscode.workspace.fs` (o que `VscodeDiskIO`, usado pela extensão,
+  faz) — o VS Code não fica sabendo que o arquivo mudou em disco, e o
+  próximo save falha com "The content of the file is newer". Use `start`
+  só quando NÃO tiver essa pasta aberta simultaneamente num editor VS
+  Code que já está sincronizando ela (CI, outro editor, automação sem
+  VS Code).
 - `syncteam stop` — encerra o daemon subido por `start` (lê
   `~/.syncteam/syncteam.pid`, `SIGTERM` gracioso escalando para `SIGKILL`
   após 5s se necessário).

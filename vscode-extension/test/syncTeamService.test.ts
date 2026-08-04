@@ -832,3 +832,162 @@ describe("SyncTeamService.routeSpontaneous — kind 'resyncRequest' (ReSync, 202
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 });
+
+// "Fila FIFO sem coalescência para pulses de buffer" (2026-08-04, bug real
+// reportado pelo usuário — trava de LSP/autocomplete "que demora mais quanto
+// maior o arquivo e persiste depois de parar de digitar"). Hipótese
+// confirmada por este teste ANTES do fix (ver .claude/agent-memory/
+// extension-dev.md e docs/DECISIONS.md desta data): `notifyBufferChange`
+// enfileirava incondicionalmente em `enqueueMutation` — cada pulse de
+// digitação pagava um round-trip REAL (`transport.request`), e como a fila é
+// FIFO estrita, N pulses do MESMO path viravam N round-trips SERIALIZADOS,
+// não coalescidos. Com um round-trip mais lento que o intervalo entre
+// pulses (aqui simulado por um ack atrasado do "plugin" fake), o backlog
+// cresce sem limite — exatamente o sintoma relatado (trava que dura mais
+// tempo quanto mais o usuário digitou, mesmo depois de parar).
+//
+// Usa um socket ws REAL (mesmo padrão de "watchedRoots"/"resyncRequest"
+// acima) porque o que está sendo provado é o comportamento observável do
+// TRANSPORTE (quantos writeSource saem pela rede), não só o dispatch interno
+// — routeSpontaneous/enqueueMutation sozinhos não expõem isso.
+describe("SyncTeamService.notifyBufferChange — coalescência de pulses do MESMO path (2026-08-04)", () => {
+  const ROUND_TRIP_DELAY_MS = 50;
+
+  /** Sobe um serviço real + um "plugin" fake que resolve writeSource só após ROUND_TRIP_DELAY_MS (simula o round-trip real Studio). */
+  async function makeConnectedServiceWithSlowPlugin(logger: Logger): Promise<{
+    service: SyncTeamService;
+    tmpDir: string;
+    client: WebSocket;
+    writeSourceReceived: RawMessage[];
+  }> {
+    const port = await getFreePort();
+    const server = new SyncServer(port, logger);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "syncteam-service-coalesce-"));
+    const diskIO = new NodeDiskIO(tmpDir);
+    const mountPoints: MountPoint[] = [{ dataModelPath: "ServerScriptService", diskPath: "src/server" }];
+    const service = new SyncTeamService(server, mountPoints, diskIO, logger);
+    await service.start();
+
+    const writeSourceReceived: RawMessage[] = [];
+    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    client.on("message", (data: Buffer) => {
+      const message = JSON.parse(data.toString()) as RawMessage;
+      if (message.kind === "listScripts") {
+        client.send(JSON.stringify({ kind: "scriptList", requestId: message.requestId, scripts: [] }));
+      } else if (message.kind === "readSource") {
+        client.send(JSON.stringify({ kind: "sourceContent", requestId: message.requestId, ok: true, source: "-- inicial" }));
+      } else if (message.kind === "writeSource") {
+        writeSourceReceived.push(message);
+        // Round-trip real do Studio simulado: ack só chega depois do delay —
+        // é isso que faz um pulse "estar em voo" por tempo suficiente para um
+        // segundo pulse (ou dez) chegar antes dele terminar.
+        setTimeout(() => {
+          client.send(
+            JSON.stringify({ kind: "writeAck", requestId: message.requestId, ok: true, uuid: message.uuid, api: "UpdateSourceAsync" }),
+          );
+        }, ROUND_TRIP_DELAY_MS);
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", () => resolve());
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({ kind: "hello", protocolVersion: PROTOCOL_VERSION, role: "studio" }));
+    client.send(JSON.stringify({ kind: "scriptAdded", uuid: "uuid-x", path: "ServerScriptService/X", className: "Script" }));
+    await waitFor(() => service.resolveUuidForDiskPath("src/server/X.server.luau") === "uuid-x");
+
+    return { service, tmpDir, client, writeSourceReceived };
+  }
+
+  test("N pulses rápidos no MESMO path resultam em NO MÁXIMO 2 writeSource reais, não N (prova de coalescência)", async () => {
+    const logger = new CapturingLogger();
+    const { service, tmpDir, client, writeSourceReceived } = await makeConnectedServiceWithSlowPlugin(logger);
+
+    const PULSE_COUNT = 12;
+    const relPath = "src/server/X.server.luau";
+    // Dispara os PULSE_COUNT pulses de forma SÍNCRONA (sem nenhum await entre
+    // eles) — o caso mais adversarial possível, e também o mais determinístico
+    // para CI: qualquer atraso via setTimeout entre chamadas fica sujeito à
+    // granularidade real do timer do SO (no Windows, setTimeout(fn, 5) pode na
+    // prática disparar só ~15ms depois — timer coalescing), o que tornaria o
+    // teste flaky (o burst poderia "vazar" para além de uma única janela de
+    // round-trip e produzir mais de 1 rodada de coalescência, cada uma
+    // legitimamente justificada, não um bug). Disparando tudo no mesmo tick,
+    // GARANTE que todos os 12 pulses cheguem MUITO antes do primeiro
+    // round-trip (ROUND_TRIP_DELAY_MS) sequer começar a resolver.
+    for (let i = 0; i < PULSE_COUNT; i++) {
+      service.notifyBufferChange(relPath, `buffer-content-${i}`);
+    }
+
+    // Espera o backlog drenar por completo. Coalescido corretamente, isso
+    // exige no máximo 2 round-trips (~2 * ROUND_TRIP_DELAY_MS); dá uma folga
+    // generosa (10x) para não flakar em CI lento.
+    await new Promise((resolve) => setTimeout(resolve, ROUND_TRIP_DELAY_MS * 10));
+
+    expect(writeSourceReceived.length).toBeLessThanOrEqual(2);
+    // O ÚLTIMO writeSource enviado precisa carregar o conteúdo MAIS RECENTE
+    // (latest-wins) — nenhum pulse intermediário pode "vencer" o mais novo.
+    expect(writeSourceReceived[writeSourceReceived.length - 1]?.source).toBe(`buffer-content-${PULSE_COUNT - 1}`);
+
+    client.terminate();
+    await service.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("pulses de paths DIFERENTES não se atropelam — cada path tem sua própria coalescência", async () => {
+    const logger = new CapturingLogger();
+    const port = await getFreePort();
+    const server = new SyncServer(port, logger);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "syncteam-service-coalesce-multi-"));
+    const diskIO = new NodeDiskIO(tmpDir);
+    const mountPoints: MountPoint[] = [{ dataModelPath: "ServerScriptService", diskPath: "src/server" }];
+    const service = new SyncTeamService(server, mountPoints, diskIO, logger);
+    await service.start();
+
+    const writeSourceReceived: RawMessage[] = [];
+    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    client.on("message", (data: Buffer) => {
+      const message = JSON.parse(data.toString()) as RawMessage;
+      if (message.kind === "listScripts") {
+        client.send(JSON.stringify({ kind: "scriptList", requestId: message.requestId, scripts: [] }));
+      } else if (message.kind === "readSource") {
+        client.send(JSON.stringify({ kind: "sourceContent", requestId: message.requestId, ok: true, source: "-- inicial" }));
+      } else if (message.kind === "writeSource") {
+        writeSourceReceived.push(message);
+        setTimeout(() => {
+          client.send(
+            JSON.stringify({ kind: "writeAck", requestId: message.requestId, ok: true, uuid: message.uuid, api: "UpdateSourceAsync" }),
+          );
+        }, ROUND_TRIP_DELAY_MS);
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", () => resolve());
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({ kind: "hello", protocolVersion: PROTOCOL_VERSION, role: "studio" }));
+    client.send(JSON.stringify({ kind: "scriptAdded", uuid: "uuid-a", path: "ServerScriptService/A", className: "Script" }));
+    client.send(JSON.stringify({ kind: "scriptAdded", uuid: "uuid-b", path: "ServerScriptService/B", className: "Script" }));
+    await waitFor(() => service.resolveUuidForDiskPath("src/server/A.server.luau") === "uuid-a");
+    await waitFor(() => service.resolveUuidForDiskPath("src/server/B.server.luau") === "uuid-b");
+
+    // Mesmo raciocínio do teste acima: burst síncrono, sem await entre
+    // chamadas, para não depender da granularidade real do timer do SO.
+    for (let i = 0; i < 6; i++) {
+      service.notifyBufferChange("src/server/A.server.luau", `a-${i}`);
+      service.notifyBufferChange("src/server/B.server.luau", `b-${i}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, ROUND_TRIP_DELAY_MS * 10));
+
+    const forA = writeSourceReceived.filter((m) => m.uuid === "uuid-a");
+    const forB = writeSourceReceived.filter((m) => m.uuid === "uuid-b");
+    expect(forA.length).toBeLessThanOrEqual(2);
+    expect(forB.length).toBeLessThanOrEqual(2);
+    expect(forA[forA.length - 1]?.source).toBe("a-5");
+    expect(forB[forB.length - 1]?.source).toBe("b-5");
+
+    client.terminate();
+    await service.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});

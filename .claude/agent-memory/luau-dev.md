@@ -3,6 +3,936 @@
 Aprendizados de API do Studio e pegadinhas de Luau encontrados no projeto.
 Atualize ao final de cada tarefa; mantenha curto e acionável.
 
+## Bug real confirmado e corrigido: campo calculado só para log virou causa raiz de um bug funcional (eco de `sourceChanged`, revert/rebuild ao digitar rápido), 2026-08-03
+
+- **Padrão de revisão a repetir sempre que um campo tipo `origin`/`source`/
+  `reason` for calculado só "para efeito de log"**: perguntar explicitamente
+  "esse valor deveria estar decidindo algum `if` em vez de só aparecer numa
+  string?" antes de aceitar o comentário "só para log" como inofensivo. Aqui,
+  `checkSourceChanged` (`plugin/src/SourceWatcher.luau`) computava `origin`
+  (`"plugin"` vs `"studio"`, via `recentWrites[instance]`, janela de 1s
+  desde o último `SourceWatcher.writeSource` NESTA instância) corretamente
+  há tempos, mas só o usava no `Logger.debug` final — nunca para decidir se
+  `sendMessage` deveria rodar. Resultado prático: toda escrita que o PRÓPRIO
+  plugin fazia por causa de um `writeSource` vindo da extensão (inclusive o
+  pulse de buffer a cada ~150ms, feature de 2026-08-02) ecoava de volta pro
+  MESMO cliente WS que causou a escrita — `sendMessage`
+  (`init.server.luau:192-202`) é um único callback module-level ligado a UM
+  `client`, sem roteamento por conexão (produto usa 1 conexão só). Do lado
+  da extensão, esse eco não tinha como ser distinguido de uma mudança
+  genuína vinda de outro Studio via Team Create — `handleSourceChanged`
+  (`SyncBridge.ts`) ignora `origin` (só aparece em log) e a fila FIFO
+  (`enqueueMutation`) + `contentCache` atualizado ANTES do ack do
+  `writeSource` (`pushKnownUuidUpdate`) faziam o eco de um pulse ANTIGO
+  chegar depois de um pulse mais NOVO já ter avançado o cache — `writeToDisk`
+  então tratava o eco como "genuíno" e reescrevia disco/buffer com conteúdo
+  velho. Repetido a cada eco atrasado de uma rajada de digitação rápida
+  (Ctrl+S logo depois de digitar com autocomplete/Tab), dava a aparência
+  exata de "desfaz e reconstrói letra por letra ao longo de 10-15s" — bug
+  relatado pelo usuário, que já tinha a hipótese certa com evidência de
+  código; confirmei sem nenhum furo relendo os dois lados (Luau +
+  TypeScript) ponta a ponta.
+- **Fix**: `checkSourceChanged` só chama `sendMessage` quando `origin ~=
+  "plugin"` — guard novo em volta da chamada existente, dedupe
+  (`lastSourceByInstance`) e `Logger.debug` continuam incondicionais/
+  intocados. Antes de aplicar, confirmei que `writeAck` (`init.server.luau`,
+  por `requestId`) já é o canal real de confirmação de escrita — o eco de
+  `sourceChanged` não carregava nenhuma informação que `writeAck` não
+  carregasse, então suprimir é seguro sem substituto. Avaliado e
+  descartado por falta de evidência real (regra do pedido: não proteger
+  contra cenário hipotético): `UpdateSourceAsync` normalizar o conteúdo
+  (line endings etc.) de um jeito que a extensão nunca saberia sem o eco —
+  `refreshSync` (reconciliação 3-way) já existe como rede de segurança para
+  esse tipo de deriva, e nada em `.claude/research/` confirma essa
+  normalização acontecendo.
+- **Risco residual aceito conscientemente, documentado aqui pra quem
+  revisitar**: a janela de 1s de `origin` é por-INSTÂNCIA, não por-conexão —
+  se o MESMO script for editado por uma via genuinamente diferente
+  (ex.: usuário editando direto no Script Editor nativo do Studio) dentro de
+  1s depois de um `writeSource` vindo da extensão pra ESSE MESMO script,
+  essa edição também seria classificada `origin="plugin"` e teria seu envio
+  suprimido — perda de notificação, não só de log (antes desta tarefa,
+  origin mal-classificado só sujava o log, nunca escondia uma mudança real).
+  Não é uma regressão introduzida por escolha própria; é a heurística de
+  timing já existente (validada só para log) passando a ter efeito
+  funcional. Aceito porque (a) o campo já era usado para essa classificação
+  há tempos sem nenhuma migração para algo mais preciso, (b) o cenário
+  (editar o mesmo script simultaneamente no Script Editor nativo E receber
+  um push da extensão no mesmo <1s) é raro e de baixo custo se acontecer
+  (próximo poll/edição detecta a divergência via dedupe de qualquer forma,
+  e `refreshSync` cobre drift maior), (c) o pedido explícito da tarefa foi
+  não inventar proteção para cenário hipotético sem evidência real.
+- **Validação real (Tools/, 1 Studio só) TENTADA e NÃO concluída** — motivo
+  registrado por completo aqui porque é reaproveitável: bug NÃO depende de
+  replicação Team Create (eco acontece dentro da MESMA conexão
+  plugin↔extensão), então só precisa de 1 Studio. Plugin buildado+implantado
+  (`Tools/build-and-deploy-plugin.sh`, OK) e harness subido
+  (`Tools/start-harness.sh 34980 spikes/m1-test-project`, confirmado
+  `LISTENING` via `netstat`), mas o Studio já aberto (processo confirmado
+  vivo, `tasklist`) não reconectou ao harness mesmo depois de ~5min de
+  espera ativa (`Bash run_in_background` com loop `until grep "plugin
+  conectado"`). Causa mais provável: autostart é opt-in por instalação de
+  Studio desde 2026-07-16 (`Config.resolveAutoStartEnabled`, default OFF) —
+  reconectar depois de um redeploy old exige um clique manual no toggle da
+  toolbar, que é uma ação física dentro do Studio fora do alcance de
+  qualquer ferramenta desta sessão (`ToolSearch` confirmou de novo, como em
+  2026-08-02, que não há MCP `Roblox_Studio` nem Command Bar remoto
+  disponíveis). **Padrão a levar pra próxima tarefa que precise de teste ao
+  vivo com um Studio JÁ ABERTO antes da sessão começar** (diferente do fluxo
+  normal onde o Studio abre DEPOIS do plugin já implantado, e autostart
+  roda no boot do plugin): um redeploy no meio da sessão de um Studio que já
+  estava desconectado (autostart off, ou já tinha caído) não reconecta
+  sozinho — não vale esperar mais que ~1-2min por uma reconexão automática
+  nesse cenário específico; é mais eficiente já reportar como pendente de
+  clique manual do que ficar re-polling. Ver roteiro completo de 4 passos em
+  `docs/DECISIONS.md` 2026-08-03 "17ª rodada".
+- **Validado só estático**: `selene plugin/src` → 0 errors, 42 warnings
+  (baseline idêntica, 0 novos em `SourceWatcher.luau`), `stylua --check`
+  limpo, `lune run plugin/src/SourceWatcher.luau` erra só na 1ª linha que
+  toca `game` (padrão de sempre — confirma sintaxe do resto, incluindo o
+  guard novo). **Lune não é aplicável para testar `checkSourceChanged`
+  diretamente** (função privada, entrelaçada com `instance.Source`/
+  `ScriptRegistry`/`Config`/`game` — research já confirmado
+  `.claude/research/2026-08-02-lune-selene-stylua-testez-luau-tooling.md`:
+  Lune não mocka serviços do Studio, só dá um `Instance`/`DataModel`
+  genérico via `@lune/roblox`) — não forcei um teste headless artificial
+  sem valor real; fica só a leitura de código (alta confiança) + pendência
+  de teste ao vivo.
+
+## Handoff quase-instantâneo de lease: `leaseStaleAfterSeconds` configurável + desacoplar leaderTick do heartbeat de eleição, 2026-08-02 (8ª tarefa do dia)
+
+- **Padrão a repetir sempre que uma constante de coordenação "compartilhada"
+  precisar de um valor MAIS RÁPIDO só para um dos dois usos**: baixar só o
+  threshold (aqui, `STALE_AFTER_SECONDS`) sem desacoplar o LOOP que o
+  checa é decorativo — o piso de detecção fica preso na cadência do loop,
+  não importa o número do threshold. `TeamCreateLease.leaderTick` rodava
+  `task.wait(TeamCreateElection.PULSE_INTERVAL_SECONDS)` (2s, a MESMA
+  constante do heartbeat de eleição); troquei para
+  `task.wait(Config.POLL_INTERVAL_SECONDS)` (0.5s, mesma cadência que
+  `checkLeaseDrift` já usava no mesmo `start()`) — só depois disso um
+  `leaseStaleAfterSeconds` de 2s passou a fazer sentido de verdade.
+  `TeamCreateElection.PULSE_INTERVAL_SECONDS`/o heartbeat de eleição em si
+  NÃO foram tocados — só o loop de `TeamCreateLease` parou de reusar a
+  constante do vizinho.
+- **Decisão de escopo (a mais delicada da tarefa, explicitamente pedida para
+  eu decidir): `TeamCreateElection.STALE_AFTER_SECONDS` (8s fixo, usado por
+  `elect`/`applyJoinSequenceAssignments`/`tick` para detectar sessão/líder
+  morto) NÃO virou configurável — só o de LEASE (agora um valor separado,
+  `Config.getPlaceSetting(pluginObjectRef, "leaseStaleAfterSeconds")`, lido
+  só dentro de `TeamCreateLease.readLiveIntents`)**. Os dois COMPARTILHAVAM
+  a mesma constante antes desta tarefa só por acidente histórico (M3.1
+  definiu STALE_AFTER_SECONDS, M3.2 reaproveitou por conveniência) — são
+  conceitos de natureza diferente: eleição/sessão morta é uma constante de
+  SEGURANÇA de coordenação (risco de split-brain, já validada em 2 Studios
+  reais no RojoCoop incluindo failover forçado, e já corrigida uma vez em
+  2026-07-07 por causa de uma corrida de replicação); lease morta é uma
+  constante de UX/latência de arquivo. Baixar a de eleição também
+  arriscaria reabrir aquele bug por um motivo (latência de lease) que não
+  tem NADA a ver com ele. Regra geral pro projeto: antes de tornar uma
+  constante de coordenação "configurável" só porque outra constante que
+  reusa o mesmo número numa tarefa vizinha precisa mudar, perguntar se as
+  DUAS têm o mesmo motivo de existir — se não, desacoplar em vez de
+  compartilhar o dial.
+- **Novo padrão de "settings por-place lidas continuamente por um loop de
+  runtime"** (primeira vez que isso acontece no projeto — as settings
+  por-place de 2026-08-02 (2ª tarefa) tinham ficado "decorativas", nenhum
+  loop as lia ainda): `TeamCreateLease.start(pluginObject)` (assinatura
+  nova, mesmo contrato de `TeamCreateElection.start`) guarda `pluginObject`
+  num module-level `pluginObjectRef` (nil-safe, resetado em `stop()`) — DIFERENTE
+  de `TeamCreateElection.start`, que só usa `pluginObject` de forma SÍNCRONA
+  dentro do próprio `start()` (não precisa reter, resolve
+  `Config.resolveCustomDisplayName` 1x no boot). Aqui `readLiveIntents` (chamado
+  a cada ciclo do líder, agora 0.5s) precisa reconsultar a setting
+  continuamente — dev pode editar o valor no painel com a sessão já
+  conectada, e o próximo ciclo (até 0.5s depois) já reflete, sem precisar de
+  nenhum evento de "config mudou" ou reconexão. `Config.getPlaceSetting`
+  já é nil-safe para `pluginObjectRef == nil` (degrada pro default 2s) —
+  não precisei adicionar nenhum guard extra.
+- **Diferença importante entre "self-contained callback que só persiste" e
+  "self-contained callback que também precisa republicar"**: ao decidir
+  onde por a lógica de `onLeaseStaleAfterSecondsSubmit` (novo campo do
+  painel), usei `onCustomDisplayNameSubmit` como referência mas achei uma
+  diferença real — `onCustomDisplayNameSubmit` precisa de uma 2ª chamada
+  (`TeamCreateElection.setLocalUsername`) porque o Username é um
+  `StringValue` CACHEADO que só é escrito uma vez (não é relido do zero a
+  cada ciclo); já `leaseStaleAfterSeconds` é relido do zero A CADA ciclo do
+  líder por `readLiveIntents` — então `onLeaseStaleAfterSecondsSubmit` só
+  precisa persistir via `Config.setPlaceSetting`, sem nenhuma chamada de
+  "aplicar agora". Regra pra próxima setting por-place nova: se o valor é
+  lido do Config a cada ciclo de um loop já rodando, só a persistência
+  basta; se é cacheado numa Instance de valor e só escrito uma vez, precisa
+  de uma função de republish explícita.
+- **UI numérica em SettingsRow (2ª vez que aparece no projeto, 1ª foi
+  `CustomDisplayNameField` que é string)**: copiei o esqueleto visual de
+  `CustomDisplayNameField` (TextBox 0.62/0.38 dentro de SettingsRow) mas a
+  validação de `FocusLost` seguiu `PortRow` (`tonumber` + rejeita
+  não-positivo) em vez da validação livre de string. Diferença deliberada
+  de `PortRow`: NÃO force `math.floor` — `leaseStaleAfterSeconds` é
+  segundos, fração (`2.5`) é um valor sensato; porta não pode ser fracionária,
+  segundos-de-timeout pode.
+- **git stash em arquivo que já estava "modified" antes da tarefa (não
+  commitado) reverte para o ÚLTIMO COMMIT, não para "antes da minha edição"
+  — quase apaguei trabalho de sessões anteriores não commitado**: tentei
+  isolar minhas mudanças rodando `git stash push -- <5 arquivos>` só para
+  comparar contagem de warnings do Selene antes/depois. Como esses 5
+  arquivos já apareciam como `M` no `git status` no INÍCIO da tarefa (reskin
+  M4.5/ReSync de sessões anteriores, não commitado ainda), o stash reverteu
+  TUDO isso para o HEAD (`1dc8b22`), não só as minhas edições desta tarefa —
+  `git stash pop` imediato recuperou tudo (confirmado por grep das minhas
+  strings-chave depois). **Nunca usar `git stash` (nem parcial/pathspec) só
+  para "comparar antes/depois" num arquivo que já tinha mudanças não
+  commitadas de outra sessão** — se precisar isolar o efeito de uma edição
+  específica, usar `git diff`/copiar o arquivo pra um path temporário em vez
+  de stash, ou aceitar que a comparação vai incluir o histórico não
+  commitado inteiro.
+- **Efeito colateral do stash/pop nesta máquina (`core.autocrlf=true`):
+  os 5 arquivos tocados pelo stash voltaram com CRLF**, mesmo o projeto
+  usando `line_endings = "Unix"` no `.stylua.toml` e todo o resto do
+  repositório estando em LF — `git stash pop` fez o checkout re-normalizar
+  para CRLF (o mesmo aviso "LF will be replaced by CRLF" que aparece em
+  qualquer `git add`/`stash` nesta máquina). Sintoma: `stylua --check`
+  reportou o arquivo INTEIRO como diff (toda linha "removida" e
+  "re-adicionada" idêntica) — não é erro de formatação real, é diferença de
+  terminador de linha byte-a-byte. Fix: `dos2unix <arquivo>` nos arquivos
+  afetados antes de rodar `stylua --check` de novo (limpo depois). Regra
+  geral: se `stylua --check` mostrar um diff que parece ser o arquivo
+  inteiro reescrito linha por linha com texto IDÊNTICO, suspeitar de CRLF
+  antes de qualquer outra coisa — `file <arquivo>` confirma
+  ("CRLF line terminators" vs sem essa menção).
+- **Validado**: `selene plugin/src` → 0 errors, 42 warnings (baseline local
+  antes desta tarefa não é diretamente comparável por causa do imbróglio de
+  stash acima, mas confirmei manualmente que os únicos avisos novos são
+  exatamente 1 `mixed_table` na `FocusLost` do novo `LeaseStaleAfterSecondsField`
+  — mesma classe/padrão que TODO `vide.create` com função inline + array
+  children já gera neste arquivo, incluindo o `CustomDisplayNameField`
+  logo acima; não é uma categoria de warning nova). `stylua --check` limpo
+  (depois do fix de CRLF) nos 5 arquivos tocados
+  (`Config.luau`/`TeamCreateLease.luau`/`init.server.luau`/
+  `StatusPanel.luau`/`PluginUI.luau`). `lune run` em cada um: erro só na 1ª
+  linha que toca `game`/`script.Parent` (padrão de sempre; `Config.luau`
+  roda inteiro sem erro, não toca `game` em nível de módulo) — confirma que
+  todo código novo compila sem erro de sintaxe. **Nada testado em Studio
+  real** — depende também do lado extensão (`onDidChangeTextDocument`
+  throttled, `extension-dev`, mesma feature, rodando em paralelo) para o
+  roteiro fim-a-fim fazer sentido. Roteiro de 5 passos em
+  `docs/DECISIONS.md`/`docs/PROJECT_STATUS.md`, entrada 2026-08-02 "8ª
+  rodada" (continuação `luau-dev`).
+
+## Spike M1.6 — taxa de streaming de Source: padrão para medir latência ENTRE 2 STUDIOS sem depender de timestamp Roblox, e confirmação de que não há MCP/Command Bar disponível nesta sessão, 2026-08-02 (7ª tarefa do dia)
+
+- **Quando a tarefa pede medir latência/timing entre os 2 Studios reais e a
+  API de timestamp Roblox necessária (`DateTime.now().UnixTimestampMillis`
+  ou similar) NÃO está confirmada em `.claude/research/`, não pare a
+  tarefa inteira nem peça pesquisa só por causa disso** — se existir um
+  processo Node LOCAL que os dois Studios já falam (control-server dedicado
+  do spike, ou um harness), prefira desenhar a medição para que **o
+  processo Node carimbe o instante de recebimento** de cada evento (Node
+  `Date.now()`, relógio único e trivialmente comparável entre os 2
+  Studios, já que ambos rodam na MESMA máquina física neste projeto — 2
+  contas Roblox via "Add Account"). O Luau de cada lado manda só o dado
+  relevante (número de sequência, taxa) via WebSocket; a subtração de
+  `recvMs` no Node dá a "latência" (com um viés pequeno e aprox. constante
+  do hop WS, documentado explicitamente onde isso é usado) sem precisar de
+  NENHUMA API de timestamp Roblox nova. Útil para COMPARAR (ex.: taxa A vs
+  taxa B), não para um número absoluto "puro" — se algum dia for preciso um
+  número absoluto de latência de replicação sem o viés do hop WS, aí sim
+  vale mandar `researcher` confirmar `DateTime.UnixTimestampMillis` antes
+  de codar sobre a hipótese.
+- **Confirmado por `ToolSearch` nesta sessão: MCP `Roblox_Studio` e Command
+  Bar remoto NÃO estavam disponíveis** (`ToolSearch` com
+  `select:mcp__Roblox_Studio__*` e busca livre por "Roblox_Studio" não
+  retornaram nada) — não há como executar Luau dentro de um Studio real
+  remotamente nesta sessão, nem clicar botão de toolbar. Isso muda o que dá
+  para automatizar num spike de 2 Studios: a única interação física
+  restante e inevitável é 1 clique de botão POR STUDIO para escolher o
+  papel (padrão já usado no M0 — não vale a pena tentar eliminar isso com
+  heurística de auto-detecção de papel via setting persistida; avaliei essa
+  alternativa e descartei por fragilidade/acoplamento desnecessário a uma
+  chave de produção só para economizar 2 cliques — ver raciocínio completo
+  no histórico desta tarefa se precisar retomar). Antes de assumir que
+  MCP virou disponível numa sessão nova, checar de novo com `ToolSearch`
+  (pode ter mudado por restart, ver nota em `Tools/README.md`).
+- **Restrição de domínio "nada de teste que exija 2 Studios rodando; escreva
+  o roteiro e reporte pro orquestrador/usuário executar" é literal e
+  prevalece mesmo quando `Tools/README.md`/`CLAUDE.md` descrevem partes do
+  ciclo como "automatizáveis pela IA"** — nesta tarefa, construí e VALIDEI
+  o tooling Node com dado SINTÉTICO (permitido — não envolve nenhum
+  Studio), mas não tentei rodar o roteiro real contra os 2 Studios nem
+  fabriquei número de latência nenhum. Toda alegação de "taxa recomendada"
+  ficou explicitamente marcada como não verificada, com uma recomendação
+  PROVISÓRIA derivada só da pesquisa já existente (não de medição própria)
+  — não confundir as duas coisas em nenhum relatório futuro.
+- **Alvo de spike que não deve ser sincronizado pelo plugin de produção
+  (já rodando nos mesmos 2 Studios via `Tools/`)**: colocar a Instance de
+  teste em `TestService.<AlgumNomeDoSpike>` — `TestService` NÃO está em
+  `Config.getWatchedRoots()` (lista atual: ServerScriptService,
+  StarterPlayerScripts, ReplicatedStorage, ReplicatedFirst, ServerStorage,
+  StarterGui, Workspace), então o plugin de produção nunca tenta
+  sincronizar o script de teste para o projeto VS Code real. Padrão a
+  repetir em qualquer spike futuro que precise de uma Instance descartável
+  nos mesmos 2 Studios que já têm o produto rodando.
+- **Padrão de smoke test para tooling Node de um spike, sem precisar de
+  Studio nenhum**: escrever um "feeder" descartável (client `ws` puro) que
+  simula exatamente o formato de mensagem que o Luau real mandaria (mesmos
+  campos `kind`/`n`/`rateHz`/`via`), incluindo perda/latência PROPOSITAL
+  para confirmar que a análise detecta o que deveria detectar — remover o
+  feeder e o log sintético depois (não fazem parte do roteiro real
+  entregue). Isso valida a metade Node do tooling com confiança real antes
+  de entregar, sem violar a restrição de "nada de 2 Studios".
+- **Processo Node em background sobrevive ao fim do bloco Bash que o
+  iniciou com `&`** (sem `run_in_background:true` da ferramenta) — depois
+  do smoke test, `netstat -ano` confirmou um processo `node` ainda
+  `LISTENING` na porta do control-server mesmo já tendo "saído" daquele
+  bloco de comando. Sempre confirmar com `netstat`/matar explicitamente
+  (`taskkill //F //PID <pid>`, processo do PRÓPRIO agente nesta mesma
+  tarefa — identificado com certeza, reversível, dentro da autoridade de
+  `.claude/rules/authority.md`) depois de qualquer smoke test que suba um
+  servidor local, para não deixar zumbi ocupando a porta na sessão
+  seguinte.
+- **Validado**: `selene spikes/m1.6-source-streaming-rate` (0
+  errors/warnings), `stylua --check` limpo (1 diff de formatação
+  encontrado e corrigido — dois `toolbar:CreateButton` de 1 linha
+  ultrapassavam `column_width=120`, StyLua quebrou em multi-linha), `lune
+  run` erra só na 1ª linha que toca `game` (linha do
+  `game:GetService("HttpService")`), confirmando o resto do arquivo
+  parseado sem erro. `node analyze-log.mjs` confirmado funcional contra log
+  sintético (ver acima). **Nada testado contra Studio real** — roteiro
+  completo em `spikes/m1.6-source-streaming-rate/README.md` e
+  `docs/DECISIONS.md` 2026-08-02 "(6ª rodada, mais recente)", pendente do
+  usuário ou `qa-tester` executar.
+
+## Botão ReSync — padrão exato de "enviar mensagem espontânea do plugin" (reaproveitável pra próxima feature nesse molde), 2026-08-02 (6ª tarefa do dia)
+
+Tarefa com contrato JÁ FECHADO em `docs/DECISIONS.md` (entrada "5ª rodada"),
+rodando em paralelo com `ui-dev` (visual em `StatusPanel.luau`/`Toast.luau`)
+e `extension-dev` (lado VS Code) — minha parte foi só ligar o clique do botão
+(feito pelo `ui-dev`) ao protocolo e tratar a resposta.
+
+- **Receita para uma mensagem espontânea NOVA plugin→extensão (sem
+  `requestId`, sem `request()`/pending)**: (1) o "emissor" é sempre um
+  callback dentro da tabela passada a `PluginUI.init(plugin, {...})` em
+  `init.server.luau` — nunca um novo mecanismo de envio; ele só chama a MESMA
+  `sendMessage(message)` module-level (função privada de `init.server.luau`,
+  já usada por `sourceChanged`/`presenceUpdate`/`scriptAdded`/etc.) com
+  `{kind = "<novoKind>"}`. (2) o callback correspondente entra no MESMO
+  `statusPanelCallbacks` de `PluginUI.luau` como **passthrough puro**
+  (`onXRequest = callbacks.onXRequest`, zero lógica própria ali) — só é
+  self-contained dentro de `PluginUI.luau` quando a ação NÃO depende de nada
+  que só `init.server.luau` conhece (`client`/`sendMessage`/`enabled`); aqui
+  dependia dos dois, então passthrough é a escolha certa (mesmo critério já
+  registrado na entrada de `onAutoReconnectToggle`, 2026-07-20, e confirmado
+  em `.claude/agent-memory/ui-dev.md`).
+- **Receita para tratar a resposta espontânea NOVA extensão→plugin**: vira
+  só mais um `elseif message.kind == "<novoKindResult>" then` dentro da
+  cadeia já existente de `handleMessage` (`init.server.luau`, ~linha
+  464+/514+ conforme o arquivo cresce) — NUNCA um mecanismo de
+  request/pending novo, mesmo que a mensagem "pareça" uma resposta a um
+  pedido (aqui, `resyncResult` respondendo a `resyncRequest`): o par inteiro
+  é tratado como dois eventos espontâneos independentes, correlacionados só
+  por ORDEM/CONVENÇÃO (a extensão manda `resyncResult` depois de processar o
+  `resyncRequest` mais recente), nunca por id de requisição. Extraí a lógica
+  para uma função nomeada `handleResyncResult(message)` (padrão já usado por
+  `handleWriteSource`/`handleDeleteScript`/`handleReadSource`/
+  `handleListScripts` sempre que o corpo tem mais de ~3 linhas ou 2 branches
+  — casos mais simples como `ping`/`presenceUpdate` continuam inline dentro
+  do próprio `elseif`).
+- **Estado visual empurrado por `init.server.luau`, nunca decidido dentro de
+  `PluginUI.luau`**: `resyncStateSource` (`"idle"|"syncing"|"done"`, novo
+  `vide.source`) segue EXATAMENTE o mesmo padrão de
+  `connectionStatusSource`/`portSource` — um setter validado+dedupado
+  exposto (`PluginUI.setResyncState`, tabela `VALID_RESYNC_STATES` +
+  `if valid and state ~= atual then atual(state) end`, cópia do molde de
+  `PluginUI.setConnectionStatus`) chamado de fora por `init.server.luau` em
+  3 pontos: clique (`"syncing"`), sucesso (`"done"`, com `task.delay(1.2,
+  ...)` de volta a `"idle"`), falha (direto a `"idle"`). `PluginUI.luau`
+  nunca decide sozinho quando trocar de estado — só reflete.
+- **Achado de design que vale generalizar**: quando o contrato pede um toast
+  que deve aparecer SEMPRE, independente da preferência "Mostrar
+  notificações" (`Config.NOTIFICATIONS_SETTING_KEY`), NÃO usar
+  `Logger.notify`/`notify` (esse canal É condicionado à preferência via
+  `PluginUI.notify`, mesmo sendo incondicional no log/WS) — usar
+  `Toast.show(text, severity)` DIRETO, exigindo `local Toast =
+  require(script.ui.Toast)` em `init.server.luau` (novo nesta tarefa; antes
+  só `PluginUI.luau` requeria `Toast`). Critério para decidir qual dos dois
+  canais usar num aviso novo: é resposta imediata a uma ação EXPLÍCITA do
+  usuário que acabou de clicar um botão (aqui, RESYNC) → sempre visível,
+  `Toast.show` direto; é evento espontâneo do sistema (lease negada, queda de
+  conexão, reconciliação) → `Logger.notify`, respeita a preferência.
+- **Nota importante para quem mexer aqui achando `Toast.show` quebrado**: no
+  momento desta tarefa, `Toast.luau` (domínio do `ui-dev`, rodando em
+  paralelo) ainda só expõe `Toast.mount(pluginObject) -> {show, destroy}`
+  (função de instância, sem severidade) — **não existe ainda** um
+  `Toast.show(text, severity)` module-level. Escrevi a chamada assumindo essa
+  assinatura por contrato explícito da tarefa ("`Toast.show(text)` sem 2º
+  arg continua funcionando por causa do default `'info'`... não quebra nada
+  se rodar antes do ui-dev terminar") — se `ui-dev` não tiver mesclado até
+  este código rodar em Studio real, `Toast.show` vai ser `nil` e a chamada em
+  `handleResyncResult` vai lançar (capturado por nenhum pcall hoje — decisão
+  deliberada de NÃO envolver em pcall, já que mascarar um erro de
+  contrato-ainda-não-cumprido seria pior que deixar aparecer). Confirmar que
+  `ui-dev` mesclou `Toast.show` module-level antes de testar o fluxo de erro
+  em Studio real.
+- **Validado só por `selene plugin/src` (0 errors, 37 warnings — baseline
+  idêntica, nenhum warning novo, incluindo o `StatusPanel.luau` já tocado
+  pelo `ui-dev` em paralelo), `stylua --check` (limpo, sem diffs) nos 2
+  arquivos tocados, e `lune run`** em `PluginUI.luau` (erra na linha do 1º
+  `require(script.Parent...)`, padrão de sempre) e `init.server.luau` (erra
+  na 1ª linha que toca `game:GetService`) — confirma que todo o código novo,
+  incluindo `handleResyncResult`/`onResyncRequest`/`setResyncState`,
+  compilou sem erro de sintaxe. **Nada testado em Studio real** — depende de
+  `ui-dev` (visual do botão/estado/Toast.show) e `extension-dev`
+  (resyncRequest/resyncResult/modal de confirmação) terminarem a parte deles
+  antes de um roteiro fim-a-fim fazer sentido. Não escrevi roteiro de teste
+  aqui (nem em DECISIONS.md/PROJECT_STATUS.md) por pedido explícito do
+  orquestrador — ele consolida depois de ler os 3 agentes juntos.
+
+## Logger: `print()` removido do Output para log/notify/debug (unificado com debug); 2 prints crus de `sendMessage` tratados de forma ASSIMÉTRICA, 2026-08-02 (4ª tarefa do dia)
+
+- **Pedido literal "retirar todos" não significa tratar todo print
+  igual** — o valor desta tarefa esteve em diferenciar por FREQUÊNCIA REAL
+  de disparo, não só por "é log ou é erro". `render()` em
+  `plugin/src/Logger.luau` perdeu o `print(prefix, ...)` incondicional (só
+  `Logger.debug`, desde 2026-07-16, já não imprimia; agora nenhum dos três —
+  `log`/`notify`/`debug` — imprime). Parâmetro renomeado `shouldPrint` →
+  `trackPanel` porque, pós-mudança, ele só controla se a mensagem alimenta
+  `lastMessageText`/`lastMessageAt` (linha INFO do painel) — não tem mais
+  NENHUMA relação com Output, manter o nome antigo seria enganoso. WS forward
+  (`sendMessage`) e toast (`onNotify`) continuam incondicionais, intocados.
+- **Os 2 `print()` crus de `init.server.luau` (`sendMessage`, fora do Logger
+  por causa de recursão) foram avaliados INDIVIDUALMENTE, não como par** —
+  a tarefa sugeria manter os dois ("caminho raro de erro genuíno"), mas
+  reler o resto do arquivo (`start()`/`stop()` amarram
+  `SourceWatcher`/`TeamCreateElection`/`TeamCreateLease`/`TeamCreatePresence`
+  ao MESMO ciclo de vida do cliente WS, ver `runConnection`) revelou que o
+  branch "descartado (sem conexão): `<kind>`" (`client == nil`) dispara a
+  CADA mensagem espontânea de QUALQUER módulo (`sourceChanged`,
+  `presenceUpdate`, `leaseChanged`, `scriptAdded`...) enquanto a sessão Team
+  Create roda sem a extensão VS Code conectada — cenário nada raro (extensão
+  ainda não aberta, qualquer janela de reconexão com colega ativo do outro
+  lado). Isso o desqualifica como "erro raro"; é o mesmo padrão
+  "rotineiro/alta frequência" que o resto da tarefa suprimiu. REMOVIDO.
+  Já o branch "falha ao enviar: `<err>`" (`client:Send()` lança apesar de
+  `client` parecer vivo) é de fato raro/genuíno e é o ÚNICO canal restante
+  para essa falha exata — MANTIDO como print cru, sem mudança.
+- **Por que não virou `Logger.debug` em vez de deletado**: quando
+  `client == nil`, o encaminhamento por WS já está indisponível POR
+  DEFINIÇÃO nesse exato instante — rotear a notícia do drop por
+  `Logger.debug` não ganharia observabilidade nenhuma (nada para encaminhar
+  agora mesmo) e ainda reintroduziria uma recursão (bounded, mas
+  desnecessária) através de `render()`. Deletar de vez é estritamente mais
+  simples e sem perda. Padrão a repetir: antes de propor "rebaixar para
+  debug" como meio-termo em qualquer decisão parecida, perguntar se o canal
+  alternativo (aqui, WS) está de fato disponível no exato momento do evento
+  — se não estiver, debug e delete são equivalentes em efeito, e delete é
+  mais simples.
+- **Achado sobre a recursão em si (útil se mexer aqui de novo)**: o branch
+  "sem conexão" JÁ tinha um guard `if message.kind ~= "log" then` que
+  limitava qualquer recursão via `Logger.log` a 1 nível (a mensagem de
+  "descartado" gerada pelo próprio Logger, ao tentar se auto-encaminhar,
+  bate nesse guard e para). O branch "falha ao enviar" NÃO tem esse guard —
+  aplica a QUALQUER mensagem que falhe o `:Send()`, inclusive uma futura
+  mensagem de log sobre a própria falha — por isso É o branch onde rotear
+  por `Logger` seria genuinamente perigoso (sem teto natural), e é
+  exatamente por isso que só ele precisa continuar como print puro.
+- **Domínio respeitado, não editado**: `plugin/src/ui/PluginUI.luau`
+  (~linha 181) e `plugin/src/ui/StatusPanel.luau` (~linha 475) têm
+  comentários que agora estão FACTUALMENTE errados ("o log no Output já
+  aconteceu...", "o log no Output NUNCA é condicionado a isso") — o
+  comportamento FUNCIONAL que descrevem não mudou (toast sempre dispara
+  independente da preferência), só a palavra "Output" ficou obsoleta.
+  Sinalizado em `docs/DECISIONS.md`/`docs/PROJECT_STATUS.md` para
+  `ui-dev`/orquestrador corrigir — não tocado aqui por ser arquivo de
+  `plugin/src/ui/` (domínio de `ui-dev`, não `luau-dev`).
+- **Não tocado, fora do escopo pedido (registrado por transparência)**: o
+  pcall interno de `Logger.notify` ("falha ao notificar UI: `<err>`", linha
+  final da função) continua print cru — mesma classe de raciocínio do print
+  mantido em `init.server.luau` (erro raro do próprio mecanismo, sem canal
+  alternativo no instante da falha), mas a tarefa original só mencionou
+  `render()` e os 2 prints de `sendMessage`. Se aparecer um pedido de "zero
+  prints, sem NENHUMA exceção" no futuro, este é o próximo candidato.
+- **Validado por `selene plugin/src` (0 errors, 37 warnings — baseline
+  idêntica, nenhum warning novo), `stylua --check` (limpo) e `lune run`**
+  nos 2 arquivos tocados (`Logger.luau` roda INTEIRO sem erro — não toca
+  `game` em nível de módulo, diferente da maioria dos módulos do plugin;
+  `init.server.luau` erra só na 1ª linha que toca `game`, padrão de sempre).
+  **Nada testado em Studio real** — fica `[Hipótese]`, roteiro de 5 passos
+  em `docs/DECISIONS.md`/`docs/PROJECT_STATUS.md`, entrada 2026-08-02 "(4ª
+  rodada, mais recente)".
+- **Nota de processo**: `docs/PROJECT_STATUS.md`/`docs/DECISIONS.md` já
+  tinham sido editados por OUTRA sessão em paralelo nesta mesma data (linha
+  "Última atualização" e topo do arquivo mudaram entre minha 1ª e 2ª leitura)
+  — reli os dois arquivos por completo imediatamente antes de inserir minha
+  entrada, para inserir no topo certo e não sobrescrever trabalho concorrente.
+  Rebaixei o marcador "(3ª rodada, mais recente)"/"(mais recente)" das
+  entradas anteriores para simples "(3ª rodada)"/sem sufixo, já que minha
+  entrada nova assumiu o topo — mesmo padrão que essas entradas já usavam
+  entre si. Referências antigas em OUTRAS partes do arquivo que citam o texto
+  literal "(3ª rodada, mais recente)" como âncora ficaram levemente
+  desatualizadas (apontam pro título como era quando escritas) — não persegui
+  corrigir cada citação histórica, é churn de baixo valor num changelog
+  append-only.
+
+## Bug confirmado e corrigido: ordem de operações na conversão Folder→ModuleScript derrubava o watch de Source dos filhos, 2026-08-02 (3ª tarefa do dia)
+
+- **Fecha o "achado real (NÃO CORRIGIDO)" registrado na entrada logo abaixo,
+  desta mesma data** — o `researcher` confirmou a hipótese com fonte oficial
+  (`.claude/research/2026-08-02-reparent-descendantremoving-semantics.md`,
+  `Roblox/creator-docs`, `Instance.yaml`): `DescendantRemoving` "fires
+  immediately before the parent Instance changes such that a descendant
+  instance will no longer be a descendant" — bate exatamente com o código
+  antigo, que reparentava cada `oldChild` pra dentro de uma `newInstance`
+  ainda SEM `Parent` (só anexada à árvore no final). Cada `oldChild` de fato
+  deixava de ser descendente da raiz observada, mesmo que momentaneamente —
+  disparando `unwatchScript` incorretamente via `scanAndWatch`'s
+  `DescendantRemoving`. A reconexão via `DescendantAdded` no final NÃO tinha
+  garantia oficial (só relato de fórum, não staff, com ressalva explícita de
+  "não garantido").
+- **Fix em `plugin/src/SourceWatcher.luau`** (dentro do `pcall` de
+  conversão, ramo Folder→Script/LocalScript/ModuleScript de
+  `resolvePath`): inverter a ordem — `newInstance.Parent = current` roda
+  ANTES do loop `for _, oldChild in child:GetChildren() do oldChild.Parent =
+  newInstance end`, não depois. Com `newInstance` já dentro da árvore
+  observada, cada `oldChild.Parent = newInstance` vira um reparent DIRETO
+  dentro da MESMA árvore já observada — nunca deixa de ser descendente da
+  raiz, então não dispara `DescendantRemoving` nenhum. Efeito colateral bom:
+  isso elimina de vez a dependência do comportamento não-garantido de
+  `DescendantAdded` para reconectar os filhos — a conexão de sinal
+  (`watched[oldChild]`) e o registro em `ScriptRegistry` de cada filho nunca
+  são tocados, sobrevivem intactos, sem precisar de nenhum re-watch.
+- **Trade-off aceito e documentado no código**: mais eventos de replicação
+  Team Create (newInstance entra vazia na árvore primeiro, depois cada
+  filho reparenta individualmente — N+2 eventos em vez de 2 na ordem
+  antiga, que montava tudo fora da árvore e anexava de uma vez só). A ordem
+  antiga era deliberadamente mais econômica em replicação (decisão de
+  2026-07-26) — esta correção prioriza corretude sobre esse ganho, porque a
+  ordem antiga estava simplesmente errada (perdia o watch de Source dos
+  filhos, não só "gastava mais rede").
+- **Interação pré-existente que a reordenação NÃO introduz nem piora**
+  (documentada em comentário no código, deliberadamente não corrigida —
+  fora do escopo desta tarefa): se `SignalBehavior` for `Immediate`,
+  `DescendantAdded` do root pode disparar `watchScript(newInstance)` ->
+  `ScriptRegistry.resolveOrAllocate` de forma SÍNCRONA, dentro do próprio
+  `pcall`, alocando um uuid novo pra `newInstance` ANTES de
+  `ScriptRegistry.reassignInstance(existingUuid, ...)` rodar (que só roda
+  DEPOIS que o `pcall` inteiro retorna). Isso já era verdade na ordem antiga
+  também (só que a chance disparava no FIM do `pcall`, em vez do INÍCIO,
+  já que `newInstance.Parent = current` sempre esteve dentro do mesmo
+  `pcall`) — não é uma regressão desta tarefa. Continua dormant hoje porque
+  `existingUuid` é sempre `nil` na prática atual (uma `Folder` pura nunca é
+  registrada no `ScriptRegistry` — só `LuaSourceContainer` é). Se
+  `existingUuid` deixar de ser sempre `nil` no futuro (e algum lugar passar
+  a registrar Folders), revisitar: `reassignInstance` sobrescreve
+  `uuidByInstance[newInstance]` corretamente, mas o registro criado por
+  `resolveOrAllocate` para o uuid novo (efêmero) ficaria orfão em
+  `recordByUuid` (vazamento, não crash).
+- **Padrão a levar pra qualquer análise futura de reparent+observação por
+  `DescendantAdded`/`DescendantRemoving`**: a definição oficial é sobre
+  RELAÇÃO DE DESCENDÊNCIA COM A RAIZ OBSERVADA, não sobre "a Instance mudou
+  de posição". Um reparent de A pra B onde AMBOS já são descendentes da
+  mesma raiz observada nunca deveria disparar nenhum dos dois eventos nessa
+  raiz (a relação de descendência nunca se rompe) — só dispara quando o
+  destino intermediário (ou final) está FORA da árvore observada no momento
+  exato da atribuição, mesmo que seja só um instante (`Instance.new(...)`
+  ainda sem `Parent` conta como "fora"). Ao escrever qualquer lógica nova de
+  "montar fora da árvore, anexar depois" pra minimizar replicação, checar
+  primeiro se algum observador (sinal, sub-processo do próprio código)
+  depende de continuidade de descendência durante a montagem — se depender,
+  inverter pra "anexar primeiro, montar depois" é o fix correto, não um
+  patch alternativo.
+- **Validação**: `selene plugin/src` -> `0 errors, 37 warnings, 0 parse
+  errors` (baseline idêntica à da tarefa anterior, nenhum warning novo em
+  `SourceWatcher.luau`). `stylua --check plugin/src/SourceWatcher.luau` sem
+  diffs. `lune run plugin/src/SourceWatcher.luau` erra só na linha 25
+  (`game:GetService`, 1ª linha que toca `game`, padrão de sempre) —
+  confirma que o resto do arquivo, incluindo o bloco de conversão editado,
+  compila sem erro de sintaxe. **Nada testado em Studio real** — fica
+  `[Hipótese]` corrigida por raciocínio de engine confirmado por pesquisa
+  oficial (alta confiança na causa e no mecanismo do fix, já que é dedução
+  direta da definição textual do `DescendantRemoving` aplicada à ordem real
+  do código), pendente de confirmação em Studio real. Roteiro de 4 passos
+  em `docs/DECISIONS.md`/`docs/PROJECT_STATUS.md`, entrada 2026-08-02 mais
+  recente — exige só 1 Studio (sem Team Create), passo decisivo é editar o
+  `Source` de um filho que já vivia na pasta ANTES da conversão, DEPOIS de
+  convertida, e confirmar que a propagação continua.
+
+## Preservação de UUID na conversão Folder→ModuleScript + settings por-place + achado sobre reparent em massa, 2026-08-02 (2ª tarefa do dia)
+
+- **`ScriptRegistry.reassignInstance(uuid, newInstance)`** (novo): reatribui
+  um uuid JÁ EXISTENTE no registry para uma Instance nova (atualiza
+  `InstanceRef.Value` + os 2 mapas em memória `uuidByInstance`/
+  `recordByUuid`), sem alocar uuid novo. Conectado em
+  `SourceWatcher.resolvePath` no ramo de conversão Folder→Script (existente
+  desde 2026-07-26): captura `ScriptRegistry.getUuid(child)` ANTES de
+  `child:Destroy()`; se não-nil, reaproveita. **Honestidade importante**:
+  hoje uma `Folder` pura NUNCA tem uuid registrado (só `LuaSourceContainer`
+  é registrado via `isInstanceWatchable`/`watchScript`) — então
+  `existingUuid` é sempre `nil` na prática atual, o comportamento observável
+  não muda, e este é um fix DEFENSIVO/futuro-prova, não a correção de um bug
+  reprodutível hoje. Documentado assim, sem inflar a tarefa como "corrigiu
+  bug X" quando na verdade é proteção preventiva pedida explicitamente pelo
+  usuário ("preservar o uuid existente na conversão").
+- **Achado real durante a análise — CORRIGIDO na mesma data, entrada nova no
+  topo deste arquivo ("Bug confirmado e corrigido: ordem de operações...")
+  depois que o `researcher` validou a hipótese abaixo com fonte oficial.**
+  Texto original da hipótese preservado como registro histórico: relendo
+  `resolvePath`'s ramo de conversão, o reparent dos filhos
+  (`oldChild.Parent = newInstance`, com `newInstance` AINDA FORA da árvore
+  — só é anexada com `.Parent = current` DEPOIS de todos os filhos já
+  movidos, decisão deliberada de 2026-07-26 pra minimizar eventos de
+  replicação) dispara `DescendantRemoving` no root observado PRA CADA
+  filho — e o handler de `DescendantRemoving` de `scanAndWatch` JÁ existe e
+  RODA para eles (`if watched[descendant] ~= nil then ... unwatchScript(descendant) end`),
+  desconectando o sinal de Source e removendo da tabela `watched` (usada
+  pelo `pollLoop`). Se `DescendantAdded` NÃO re-registrar cada descendente
+  individualmente quando a subárvore inteira é anexada de volta (só a
+  própria `newInstance`, por exemplo — não confirmado como o Roblox se
+  comporta pra reparent em massa de subárvore já populada), os filhos
+  ficariam PERMANENTEMENTE fora do polling/sinal de Source pelo resto da
+  sessão (delete continuaria detectável via `checkRegistryDrift`, que varre
+  o registry inteiro, não só `watched` — só a detecção de EDIÇÃO de Source
+  pararia). Isto contradiz a afirmação do comentário de 2026-07-26 ("filhos
+  reparentados... continuam válidos sem nenhuma limpeza extra") — aquele
+  comentário está certo sobre a CONEXÃO de sinal em si sobreviver ao
+  reparent (não se importa com árvore), mas não considerou que
+  `DescendantRemoving` dispararia e acionaria `unwatchScript` de qualquer
+  jeito. **Próximo passo se isto for investigado**: `researcher` confirma a
+  semântica exata de `DescendantAdded`/`DescendantRemoving` pra reparent em
+  massa (dispara por descendente ou só pro nó movido?) antes de qualquer
+  fix — ver `docs/DECISIONS.md` 2026-08-02 (3ª rodada, continuação seção 2)
+  pro roteiro de teste manual sugerido (editar Source de um filho já
+  sincronizado DEPOIS de converter a pasta-pai em `init.luau`, confirmar que
+  ainda propaga).
+- **Contrato de protocolo (pedido explícito da tarefa, decisão registrada em
+  `docs/DECISIONS.md`)**: decidido reaproveitar `scriptAdded` (mensagem já
+  existente) em vez de criar `scriptClassChanged` ou reusar `scriptMoved`.
+  Raciocínio central: um sinal NOVO só ajudaria o Studio que INICIOU a
+  conversão (via seu próprio `writeSource`, que já sabe o que pediu) — mas o
+  colaborador afetado pelo bug de duplicação relatado pelo usuário é o
+  OUTRO Studio, que nunca chama `resolvePath` (só observa a conversão via
+  replicação Team Create + seu próprio `scanAndWatch`/`DescendantAdded`,
+  IGUAL a qualquer script novo) — um sinal que só um dos dois lados recebe
+  não resolve o problema relatado. `scriptMoved` está semanticamente errado
+  (implica mesmo uuid/Instance, path mudou — aqui o path é IDÊNTICO na
+  maioria dos casos, é a Instance/classe que muda). Recomendação passada
+  pra frente (não implementada, é tarefa de `extension-dev`): tratar
+  `scriptAdded` pra um path que já tem filhos mapeados como promoção
+  pasta→módulo, removendo qualquer arquivo-folha órfão de uma representação
+  anterior — inferível só com os campos já existentes (`uuid`/`path`/
+  `className`), sem precisar de campo novo de protocolo.
+- **Settings por-place (`Config.luau`)**: `plugin:GetSetting`/`SetSetting` é
+  GLOBAL à instalação do Studio — não existe API por-place. Padrão adotado:
+  UM slot `GetSetting` (`PLACE_SETTINGS_KEY`) guardando
+  `{[tostring(game.PlaceId)] = {chave -> valor}}`; toda leitura/escrita
+  resolve `game.PlaceId` NA HORA da chamada (nunca recebido como parâmetro).
+  3 funções: `getPlaceSettings(pluginObject)` (tabela inteira, mesclada com
+  `PLACE_SETTINGS_DEFAULTS`), `getPlaceSetting(pluginObject, key)` (uma
+  chave, `nil` se desconhecida), `setPlaceSetting(pluginObject, key, value)`
+  (`ok, err` — read-modify-write do slot INTEIRO, preserva outras chaves do
+  mesmo place e sub-tabelas de OUTROS places; `value == nil` remove a
+  chave). Validação genérica por TIPO do default (não hardcoded por nome de
+  chave — extensível): `value` precisa bater `type(default)`, e se for
+  `number`, precisa ser `> 0`. **Padrão a repetir** se o projeto precisar de
+  mais settings por-place no futuro: nunca dar `SetSetting` direto no call
+  site pra uma setting por-place (ao contrário do padrão de settings
+  GLOBAIS existentes, que fazem `pluginObject:SetSetting` direto em
+  `init.server.luau`/`PluginUI.luau`) — o read-modify-write do mapa inteiro
+  PRECISA ficar centralizado em `Config.luau`, senão qualquer call site que
+  esqueça de ler o mapa completo antes de escrever apaga silenciosamente as
+  settings de OUTROS places/chaves.
+- **Escopo deliberadamente NÃO feito**: nenhum loop de runtime
+  (`SourceWatcher.pollLoop`/`TeamCreatePresence.checkPresenceDrift`) foi
+  alterado pra LER as novas settings — continuam com
+  `Config.POLL_INTERVAL_SECONDS` fixo. As settings expostas são
+  "decorativas" até uma tarefa futura fazer esses loops consultarem
+  `Config.getPlaceSetting` (não trivial: precisa de um jeito de reiniciar o
+  loop quando o valor muda em runtime, não investigado). Também não
+  construída: a tela em `StatusPanel.luau` (`ui-dev`).
+- **Validação**: `selene plugin/src` → 0 errors/37 warnings (baseline
+  mantida — 1 warning novo de `manual_table_clone` apareceu e foi corrigido
+  com `table.clone` antes do relatório final). `stylua --check` limpo sem
+  precisar reformatar nada. `rojo build` (via
+  `Tools/build-and-deploy-plugin.ps1`, `OK - plugin implantado`) + `lune
+  run` nos 3 arquivos tocados sem erro de sintaxe (erro esperado só na 1ª
+  linha que toca `game`, exceto `Config.luau` que não toca `game` em nível
+  de módulo — nesse caso `lune run` roda sem NENHUM erro, confirmando o
+  módulo inteiro carrega limpo). **Nada testado em Studio real** — ambos os
+  itens ficam `[Hipótese]`, roteiros completos em `docs/DECISIONS.md`
+  2026-08-02 (3ª rodada, continuação).
+
+## Selene (linter novo, `selene.toml` na raiz): 3 `unused_variable` corrigidos, 2026-08-02
+
+- **Comando confirmado**: `selene plugin/src` (binário em `~/.rokit/bin/selene.exe`,
+  já no PATH). **Exit code é sempre 1 mesmo só com warnings** — nunca julgar
+  sucesso/falha pelo exit code, sempre ler o resumo final `"X errors, Y
+  warnings, Z parse errors"` no output.
+- **3 fixes, sem mudar lógica**: (1) `TeamCreateSchema.luau` — removi de vez
+  `local log = Logger.log` (linha ~89): confirmado por grep que `log(...)`
+  nunca é chamado nesse arquivo (o módulo só usa `Logger.notify` direto, ver
+  comentário "M4.5: toast-worthy" já existente perto de `getOrCreate`). (2)
+  `TeamCreateLease.luau`, dentro de `checkLeaseDrift()` (~linha 574) — o
+  closure passado a `ScriptRegistry.forEach` tinha assinatura
+  `function(uuid, instance, storedPath)` mas só `uuid` era usado no corpo;
+  virou `function(uuid)`.
+- **Decisão de técnica: REMOVER, não renomear com `_`/`_nome`** — escolhida
+  em vez do prefixo `_` porque (a) não achei NENHUM precedente no projeto de
+  parâmetro/local nomeado `_algo` (só o uso padrão de Lua `for _, x in
+  ipairs(...)` para descartar índice, que já é convenção deste repo mas não
+  é o mesmo caso — aqui os 2 params extras não tinham motivo de existir); e
+  (b) confirmei em `ScriptRegistry.forEach` (`plugin/src/ScriptRegistry.luau`,
+  linha ~298) que a chamada é `callback(entry.uuid, entry.instance,
+  entry.storedPath)` — Lua/Luau não exige aridade igual entre callback
+  declarado e args passados (args extras não usados na declaração são só
+  descartados), então remover parâmetros TRAILING não usados de um closure é
+  sempre seguro e não muda nenhum comportamento, mesmo se o chamador continuar
+  passando mais argumentos do que o closure declara. Regra geral pro
+  projeto: quando o warning for de parâmetro TRAILING de closure passado a
+  uma função de ordem superior própria do projeto (não uma API do Studio com
+  assinatura fixa), preferir remover a assinatura em vez de prefixar com `_`
+  — mais limpo, sem introduzir uma convenção nova sem precedente.
+- **Validado**: `selene plugin/src` depois do fix -> `0 errors, 37 warnings,
+  0 parse errors`; nenhum `unused_variable` nem menção a
+  `TeamCreateSchema`/`TeamCreateLease` sobrou no output (confirmado via grep
+  no output). Os 37 warnings restantes são todos `roblox_manual_
+  fromscale_or_fromoffset`/`mixed_table` em `plugin/src/ui/Toast.luau` e
+  `plugin/src/ui/StatusPanel.luau` — fora de escopo desta tarefa (área de
+  UI/`ui-dev`, não tocada).
+- **Nota de processo**: durante a edição, `Edit` avisou que
+  `TeamCreateSchema.luau` "foi modificado no disco desde a última leitura" —
+  investiguei antes de prosseguir (havia uma outra sessão Claude Code rodando
+  em paralelo no mesmo repo nesta data). Reli o arquivo inteiro: a única
+  diferença era a chamada `Logger.notify(...)` reformatada de 1 linha para
+  multi-linha (cosmético, provavelmente algum formatter/hook externo rodando
+  em paralelo — não StyLua deste agente, que não foi invocado aqui) — nenhuma
+  lógica mudou, e o arquivo não constava na lista de arquivos da outra sessão.
+  Segui a edição normalmente. Lição: esse aviso do `Edit` vale a pena
+  investigar (reler o arquivo) sempre que houver risco real de sessão
+  paralela mexendo na mesma área, mas não é motivo automático para abortar —
+  só para conferir antes de prosseguir.
+
+## `watchedRoots` — plugin consome a lista dinâmica de Services da extensão em vez de só a tabela fixa, 2026-07-29
+
+- **Tarefa com contrato JÁ FECHADO e exaustivo em `docs/DECISIONS.md`**
+  (entrada 2026-07-29, escrita por outra sessão especificamente para esta
+  tarefa) — não precisei re-derivar nada do lado da extensão, só ler essa
+  entrada + a doc inline de `WatchedRootsMessage` em
+  `vscode-extension/src/protocol.ts`. Padrão de processo a repetir: quando o
+  orquestrador já deixou um contrato assim, a implementação é bem mais rápida
+  só lendo o contrato + o código real dos arquivos afetados, sem precisar
+  abrir `SyncTeamService.ts` inteiro.
+- **Arquitetura escolhida (3 arquivos)**: `Config.luau` ganha
+  `Config.setDynamicWatchedRoots(names) -> invalidNames` (resolve cada nome
+  via `game:GetService` em `pcall`, substitui inteiramente uma variável
+  module-level `dynamicRoots`, `nil` até a 1ª chamada) e
+  `Config.getWatchedRoots()` passa a devolver a UNIÃO (dedupe por identidade
+  de Instance — Services são singletons, `game:GetService(mesmoNome)` sempre
+  devolve a MESMA Instance, então `seen[root]` funciona entre chamadas
+  diferentes) da lista fixa com `dynamicRoots`, quando não-nil. `Config` em
+  si NUNCA loga (mantive o módulo livre de `require(Logger)` — não há
+  circular dependency real ali, mas não havia necessidade; o chamador loga os
+  nomes inválidos devolvidos). `SourceWatcher.luau`: extraí `scanAndWatch`
+  (antes uma closure local DENTRO de `start()`, capturando `myToken`) para
+  função module-level `scanAndWatch(root, myToken)`, guardada por um `Set`
+  novo `scannedRoots` (Instance → true, `table.clear`ado em `stop()`) que a
+  torna idempotente por root — permite chamar de novo sem duplicar
+  `DescendantAdded`/`DescendantRemoving`. Nova função pública
+  `SourceWatcher.applyWatchedRoots(names)` chama
+  `Config.setDynamicWatchedRoots`, loga nomes inválidos, e escaneia só os
+  roots de `Config.getWatchedRoots()` (já a união) que `scannedRoots` ainda
+  não cobre. `init.server.luau`: novo case `"watchedRoots"` no dispatch de
+  `handleMessage`, mesmo padrão aditivo de `ping`/`deleteScript` (comentário
+  explícito de "não bumpa PROTOCOL_VERSION"), valida `type(message.roots) ==
+  "table"` antes de repassar.
+- **Decisão de timing (a escolha mais delicada da tarefa, avaliada
+  explicitamente entre 2 opções no contrato)**: escolhi NÃO atrasar o scan
+  inicial de `start()` esperando `watchedRoots` (rejeitei introduzir um
+  timeout novo) — em vez disso, `start()` continua escaneando
+  `Config.getWatchedRoots()` na hora (fixa, ou dinâmica de uma reconexão
+  anterior desta sessão), e quando `watchedRoots` chega (mais tarde, via
+  `handleMessage`), `applyWatchedRoots` só ADICIONA os containers novos.
+  Justificativa central: o handler inteiro (`Config.setDynamicWatchedRoots` +
+  `scanAndWatch` dos roots novos: `GetDescendants`/`Instance.new`/`:Connect`)
+  é 100% síncrono, SEM NENHUM `task.wait`/yield no caminho — então o
+  processamento da mensagem `watchedRoots` termina por completo antes do
+  handler retornar, e como o resto do dispatch de `handleMessage` já assume
+  que mensagens WS são processadas até o fim antes da próxima (mesma premissa
+  usada por `connectionRejected` antes do close), o `listScripts` que a
+  extensão manda LOGO DEPOIS do `watchedRoots` já reflete os containers
+  novos — sem precisar de nenhuma fila/lock/timeout adicional. Atrasar o scan
+  inicial (opção alternativa) arriscaria travar a conexão inicial esperando
+  uma mensagem que uma extensão mais velha nunca vai mandar; não valia o
+  ganho, já que o caso comum (mount point em Service já fixo) nem precisa da
+  mensagem para funcionar.
+- **Decisão de UNIÃO, não substituição total** (diferença deliberada do texto
+  literal do contrato, "em vez da tabela fixa" — justificada em
+  DECISIONS.md): a lista fixa NUNCA é removida quando a dinâmica chega, só
+  complementada. Motivo: remover um container já observado arriscaria
+  "esquecer" scripts com uuid/lease já ativos só porque o
+  `default.project.json` no momento exato da mensagem não referencia mais
+  aquele Service — risco desnecessário pro problema real (containers
+  FALTANDO, nunca sobrando). Escanear 1-2 Services fixos a mais que o
+  estritamente necessário é praticamente grátis.
+- **Pegadinha evitada por design**: `scannedRoots` é chaveado pela própria
+  Instance do Service (não pelo nome), e como `game:GetService(nome)` sempre
+  devolve a MESMA Instance (singleton), tanto o dedupe de
+  `Config.getWatchedRoots()` quanto o guard de idempotência de `scanAndWatch`
+  funcionam corretamente entre chamadas separadas no tempo (scan inicial vs.
+  `applyWatchedRoots` chamado minutos depois) sem precisar comparar por nome
+  de string em lugar nenhum.
+- **Validado só por `rojo build` (via `Tools/build-and-deploy-plugin.ps1`,
+  `OK - plugin implantado`) + `lune run`** nos 3 arquivos tocados
+  (`Config.luau`, `SourceWatcher.luau`, `init.server.luau`) — sem erro de
+  sintaxe (erro esperado só na 1ª linha que toca `game`, mesma disciplina de
+  sempre). **Nada testado em Studio real nesta tarefa** — o cenário que
+  motivou tudo isso (mount point novo em Service fora da lista fixa antiga,
+  ex. `ReplicatedFirst/First`, sincronizando sem editar `Config.luau` à mão)
+  fica `[Hipótese]`, roteiro de 4 passos em `docs/DECISIONS.md`/
+  `docs/PROJECT_STATUS.md` (entrada 2026-07-29), pendente do usuário validar.
+
+## Mitigação de undo (Ctrl+Z) destruindo instances de coordenação, 2026-07-26
+
+- **Não existe API oficial pra excluir uma Instance do `ChangeHistoryService`
+  do usuário** (pesquisa completa em
+  `.claude/research/2026-07-26-changehistoryservice-undo-exclusion.md`,
+  ler antes de tocar nesta área de novo). `SetEnabled(false)` desliga
+  GLOBAL e LIMPA o histórico (inviável); `TryBeginRecording`/
+  `FinishRecording` fazem o OPOSTO (tornam algo deliberadamente
+  undo-ável — é o que o Rojo real usa para os próprios patches). Mitigação
+  de 2 camadas, nenhuma garantida: (1) `instance.Archivable = false`
+  gravado ANTES de `.Parent` em toda Instance criada sob
+  `TestService.SyncTeam` — best-effort, relato de comunidade não
+  confirmado por staff; (2) self-healing reativo via
+  `ChangeHistoryService.OnUndo`/`OnRedo` (eventos oficiais, só entregam o
+  NOME da ação desfeita como string, nunca quais instances — não dá pra
+  ser seletivo, só reagir com uma checagem de integridade ampla).
+- **Achado que muda o escopo real de qualquer bug parecido no futuro**:
+  mudanças em `Script`/`LocalScript`/`ModuleScript.Source` são confirmadas
+  por staff da Roblox (abr/2026, "Working as Designed") como NUNCA
+  capturadas pelo `ChangeHistoryService` — Ctrl+Z do usuário NUNCA reverte
+  código sincronizado pelo SyncTeam. Qualquer bug relatado como "undo
+  quebrou o SyncTeam" só pode vir da árvore de metadados
+  (`TestService.SyncTeam`), nunca do `Source` em si — não perder tempo
+  investigando o caminho de escrita de Source quando esse sintoma aparecer.
+- **Módulo novo `plugin/src/TeamCreateUndoGuard.luau`**: conecta
+  `ChangeHistoryService.OnUndo`/`OnRedo` (cada um em `pcall`) 1x no boot de
+  `init.server.luau`, FORA de `start()`/`stop()` (precisa escutar
+  independente do plugin estar conectado — Ctrl+Z pode acontecer a
+  qualquer momento com a place aberta). Debounce deliberadamente simples:
+  só `task.defer` por disparo (coalesce rajadas de undo seguidos), sem
+  fila/tempo — justificativa: `checkIntegrity()` de cada módulo já é barata
+  e idempotente (na maioria das vezes só um `FindFirstChild`/checagem de
+  `Parent` que não faz nada), então disparos redundantes são inofensivos.
+  Orquestra `checkIntegrity()` de 3 módulos, cada chamada em `pcall`
+  individual (uma falha não impede as outras), MESMA ordem de dependência
+  que `init.server.luau` `start()` já usa (Election antes de Lease/
+  Presence, porque `getSessionFolder()` depende da sessão já existir).
+- **Padrão de `checkIntegrity()` — reaproveitar lógica de criação
+  existente, nunca duplicar**: `TeamCreateElection.checkIntegrity()`
+  chama a mesma `ensureOwnSession()` privada já usada em `start()`, só
+  precedida do mesmo refresh de containers que `tick()` já faz a cada
+  pulso (`TeamCreateSchema.ensureRoot()`/`ensureFolder("Sessions")`).
+  `TeamCreateLease`/`TeamCreatePresence.checkIntegrity()` forçam
+  `leasesFolder`/`sessionsFolder = nil` (invalida o guard de cache-once
+  `if leasesFolder ~= nil then return end`) antes de chamar
+  `ensureContainers()` de novo — não precisou tocar a assinatura dessas
+  funções privadas nem duplicar a lógica de criação de Folder/Values.
+- **Bug latente PRÉ-EXISTENTE encontrado e corrigido como efeito colateral
+  desta tarefa, não só especulação sobre undo**: `TeamCreateLease.luau` e
+  `TeamCreatePresence.luau` cacheiam `leasesFolder`/`sessionsFolder`/
+  `rootValues` 1x em `ensureContainers()` (guard `if X ~= nil then return
+  end`) e NUNCA os refazem depois — esse gap já estava documentado como
+  "risco residual aceito" na entrada de 2026-07-07 deste mesmo arquivo
+  (split-brain de liderança), mas nunca tinha sido corrigido porque, até
+  agora, só a eleição de líder (`TeamCreateElection.tick()`) tinha esse
+  refresh contínuo. Isso significa que QUALQUER destruição dessas pastas
+  raiz (não só por undo — reconciliação de duplicata de
+  `TeamCreateSchema.getOrCreate` também as substitui via `Destroy()` da
+  cópia perdedora) deixaria esses dois módulos presos numa referência morta
+  pelo resto da sessão do plugin, ANTES desta correção. `checkIntegrity()`
+  agora cobre isso, mas só é DISPARADO por undo/redo — se algum bug futuro
+  aparecer fora de um cenário de Ctrl+Z (ex.: reconciliação de duplicata
+  destruindo `Leases`/`Sessions` do lado "perdedor"), vale considerar
+  chamar `checkIntegrity()` também de outros gatilhos (ex.: periodicamente,
+  não só reativo a undo).
+- **Decisão de escopo deliberada, não descuido**: só os 3 módulos
+  explicitamente citados na tarefa (Election/Lease/Presence) ganharam
+  `checkIntegrity()` dedicado. `ScriptRegistry.luau` (`Scripts/<uuid>`) e
+  `TeamCreateSchema.luau` (root/`ROOT_VALUES`) ganharam só a camada 1
+  (`Archivable = false`) — `ScriptRegistry` porque a resolução uuid→Instance
+  já sobrevive à destruição da pasta de metadados NESTE Studio (o mapa em
+  memória `recordByUuid[uuid].instance` guarda a referência direta,
+  independente da árvore de `Folder`/`ObjectValue` sob
+  `TestService.SyncTeam` sobreviver) — só a REPLICAÇÃO da identidade para
+  outro Studio que ainda não a viu ficaria comprometida; `TeamCreateSchema`
+  porque já tem reconciliação contínua via `TeamCreateElection.tick()` a
+  cada 2s (não fica sem proteção nenhuma, só sem gatilho dedicado a undo).
+  Documentado como risco residual aceito em ambos os arquivos/DECISIONS.md
+  — revisitar se undo destruindo `Scripts/<uuid>` aparecer como problema
+  real em teste teste com múltiplos Studios.
+- **Validado só por `rojo build` + `lune run`** nos 7 arquivos (5 editados +
+  `TeamCreateUndoGuard.luau` novo + `init.server.luau`) — sem erro de
+  sintaxe, erro esperado só na 1ª linha que toca `game`/`script.Parent`
+  (`TeamCreateUndoGuard.luau` para na linha do `game:GetService`, mesmo
+  padrão de todo módulo novo do projeto). Buildado e implantado via
+  `Tools/build-and-deploy-plugin.ps1` (`OK - plugin implantado`). **Nada
+  testado em Studio real** — mitigação de undo por definição exige apertar
+  Ctrl+Z de verdade dentro do Studio (ação física, fora do alcance de
+  `Tools/`). Fica `[Hipótese]`, roteiro de 6 passos em `docs/DECISIONS.md`
+  2026-07-26 (inclui: apagar `Sessions/<clientId>` pelo Explorer + Ctrl+Z,
+  confirmar log "integridade: ... recriando" e que o plugin não trava;
+  rajada de Ctrl+Z repetidos; confirmar que `Source` nunca é revertido por
+  undo, validando o achado colateral da pesquisa).
+
+## Bug real: `resolvePath` nunca comparava classe do child reusado no segmento final (Folder virando ModuleScript via `init.luau`), 2026-07-26
+
+- **Padrão geral a vigiar em qualquer resolução de path que faz "reusa se
+  existe, cria se não existe"**: `current:FindFirstChild(name)` que existe é
+  SEMPRE reusado sem checar se a CLASSE bate com o que o chamador pediu —
+  isso é uma armadilha silenciosa sempre que uma convenção de projeto permite
+  uma Instance "virar" outra classe com o tempo (aqui: convenção Rojo, pasta
+  ganha `init.luau` e a própria pasta vira o ModuleScript). Vale revisitar
+  qualquer outro lugar do código que resolva/materialize path por
+  `FindFirstChild` reusado cegamente se aparecer bug parecido no futuro.
+- **Fix aplicado em `SourceWatcher.resolvePath`**: no segmento FINAL do path,
+  se o child já existe, tem classe diferente de `createClassName` E não é já
+  um `LuaSourceContainer` (guarda deliberada: só converte Folder-like, nunca
+  um Script/LocalScript/ModuleScript de OUTRA classe — isso é conflito de
+  verdade, fora de escopo), CONVERTE: `Instance.new(createClassName)`, copia
+  `Name`, reparenta TODOS `child:GetChildren()` pra dentro da nova Instance,
+  seta `Parent` da nova = `current`, só então `child:Destroy()`. Tudo dentro
+  de 1 `pcall`, erro claro se falhar. Guard extra `index > 1` (nunca converte
+  o 1º segmento, que é sempre um Service resolvido via `GetService` — proteção
+  defensiva mesmo não sendo alcançável na prática, já que
+  `Config.getWatchedRoots()` nunca produz path de 1 segmento só).
+- **Por que os filhos reparentados não precisam de nenhuma limpeza/migração**:
+  `ScriptRegistry`/`watched` (`SourceWatcher.luau`) são chaveados pela
+  `Instance` (referência de objeto), nunca por path — reparentar não recria a
+  Instance, então uuid/conexão de sinal/cache de dedupe dos filhos continuam
+  válidos sem tocar em nada. E como a pasta convertida mantém o MESMO `Name` e
+  o MESMO `Parent` (só troca de classe), o caminho canônico dos filhos
+  (`SourceWatcher.pathFor`) nem muda de string — o próximo `checkRegistryDrift`
+  não confunde isso com `scriptMoved`. Confirmado por leitura de código, não
+  precisou tocar `ScriptRegistry.luau` (a Folder em si nunca foi registrada —
+  só `LuaSourceContainer` é observado/registrado, via `isInstanceWatchable`/
+  `watchScript`, ambos checam `IsA("LuaSourceContainer")` antes de qualquer
+  coisa).
+- **Ordem de operações escolhida na conversão**: montar a nova Instance FORA
+  da árvore primeiro (Name, reparent dos filhos) e só DEPOIS atribuir
+  `.Parent = current` (anexar à árvore), destruindo a Folder antiga por
+  último. Minimiza eventos de replicação intermediários (Team Create só
+  precisa replicar o estado final da subárvore de uma vez, não passos
+  parciais) — mesmo princípio geral de "montar antes de anexar" já usado em
+  outras partes do projeto para Instances novas.
+- **Validado só por `rojo build` + `lune run`** em `SourceWatcher.luau` — sem
+  erro de sintaxe (erro esperado só na linha que toca `game`, primeira linha
+  do arquivo). Buildado e implantado via `Tools/build-and-deploy-plugin.ps1`.
+  **Nada testado em Studio real nesta tarefa** — cenário exige criar arquivo
+  novo via VS Code apontando pra pasta já materializada no Studio, fora do
+  alcance de automação sem harness rodando nesta sessão. Fica `[Hipótese]` —
+  roteiro de 4 cenários (Folder→ModuleScript com filhos, init.server/client,
+  uuid correto pro colega via Team Create, não-regressão de pasta vazia
+  ganhando init.luau) em `docs/DECISIONS.md`/`docs/PROJECT_STATUS.md`,
+  entrada 2026-07-26.
+
 ## `deleteScript` — plugin destrói Instance ao receber delete do VS Code (contrato fechado com extension-dev), 2026-07-20
 
 - **Tarefa com contrato de protocolo JÁ FECHADO pelo orquestrador** (não

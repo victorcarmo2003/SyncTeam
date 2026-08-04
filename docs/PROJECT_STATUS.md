@@ -1,12 +1,117 @@
 # Status do projeto
 
-Última atualização: 2026-08-03 (logo do SyncTeam no `StatusBarItem` da
-extensão VS Code via fonte de ícone gerada com `fantasticon` — build,
-lint, 275/275 testes e `.vsix` empacotado real conferidos; renderização
-dentro do VS Code de verdade ainda `[Hipótese]`, ver DECISIONS.md "14ª
-rodada")
+Última atualização: 2026-08-04 (regressão do fix anterior — usuário relatou
+que o autocomplete/LSP piorou para trava TOTAL, escalando com tamanho do
+arquivo, persistindo depois de parar de digitar. Causa raiz: fila FIFO
+global de `SyncTeamService` sem coalescência para pulses de buffer — cada
+tecla digitada virava um round-trip real de rede, empilhando um backlog sem
+limite quando a digitação era mais rápida que o round-trip. Medido ao vivo
+(não só hipótese): 12 pulses rápidos no mesmo path geravam 11 `writeSource`
+reais sequenciais ANTES do fix. Corrigido com coalescência "latest-wins, no
+máximo 1 em voo + 1 pendente" por path em
+`vscode-extension/src/sync/SyncTeamService.ts` (`notifyBufferChange`/
+`dispatchBufferPulse`). `[Verificado]`: teste prova no máximo 2 `writeSource`
+reais agora (era 11), 278/278 testes vitest, lint e build limpos; ganho real
+de UX no VS Code continua `[Hipótese]` — não cronometrado nesta sessão. Ver
+DECISIONS.md "19ª rodada")
 
-## Nota de sessão (2026-08-03, mais recente) — Logo do SyncTeam no `StatusBarItem` (fonte de ícone via fantasticon)
+## Nota de sessão (2026-08-04, mais recente) — Backlog sem limite de pulses de buffer na fila FIFO — coalescência por path
+
+Detalhe completo em `docs/DECISIONS.md`, "19ª rodada", e
+`.claude/agent-memory/extension-dev.md`. Resumo: o throttle de AGENDAMENTO
+de `extension.ts::scheduleBufferPulse` (150ms) só limitava a frequência com
+que um novo `setTimeout` era criado — não limitava quantas tarefas de
+buffer-pulse ficavam em voo/na fila FIFO global de
+`SyncTeamService.enqueueMutation`. Cada pulse de digitação disparava um
+`writeSource` com round-trip real ao plugin; com o round-trip mais lento que
+o intervalo entre pulses (digitação contínua), o backlog crescia sem limite,
+cada item pagando um round-trip completo mesmo se um pulse mais recente já
+tivesse superado seu conteúdo. Fix: coalescência "latest-wins, no máximo 1
+em voo + 1 pendente" por `relDiskPath` (`bufferPulseInFlight`/
+`bufferPulsePendingContent`, `SyncTeamService.ts`) — pulses do MESMO path
+que chegam enquanto um já está em voo só atualizam um Map de "pendente" (no
+máximo 1 entrada por path) em vez de enfileirar mais uma tarefa; ao
+terminar, se sobrou pendente, dispara UMA ÚNICA tarefa nova com o conteúdo
+mais recente. Continua passando pela MESMA `enqueueMutation` de sempre — não
+reintroduz a race de 2026-07-27 (ordem FIFO com OUTRAS mutações preservada).
+
+**`[Verificado]`**: `test/syncTeamService.test.ts`, novo describe
+"SyncTeamService.notifyBufferChange — coalescência de pulses do MESMO path",
+com socket ws real e round-trip artificialmente atrasado — ANTES do fix, 12
+pulses síncronos no mesmo path geravam 11 `writeSource` reais (medido, não
+hipótese); DEPOIS do fix, no máximo 2, com o último sempre carregando o
+conteúdo mais recente. Segundo teste prova que paths diferentes coalescem
+independentemente (sem atropelo cruzado). `tsc --noEmit` limpo, `vitest run`
+278/278 (era 276, +2), `esbuild` gera os dois bundles sem erro.
+
+**`[Hipótese]` (pendente, mesma limitação de sempre)**: a melhora real de
+UX percebida no VS Code (LSP não travar mais durante digitação contínua)
+continua não cronometrada nesta sessão — exigiria Extension Development
+Host + digitação interativa, fora do alcance de automação. Observação
+registrada mas fora de escopo: `writeSource` sempre manda o CONTEÚDO
+COMPLETO do arquivo (não um diff), então o payload por round-trip ainda
+cresce com o TAMANHO do arquivo — o backlog agora é limitado, mas um
+arquivo grande ainda paga um payload grande por pulse em voo. Ver
+DECISIONS.md "19ª rodada" para o raciocínio completo.
+
+## Nota de sessão (2026-08-03) — Autocomplete/LSP lento com SyncTeam ativo — watcher sem escopo + I/O antes de filtrar
+
+Detalhe completo em `docs/DECISIONS.md`, "18ª rodada", e
+`.claude/agent-memory/extension-dev.md`. Resumo: o `FileSystemWatcher` de
+`extension.ts` observava `**/*` sobre a raiz inteira do projeto (sem
+exclusão — `.git/`, `sourcemap.json`, pastas Wally grandes), e todo evento
+disparava uma leitura de disco REAL em `SyncBridge.handleLocalFileChange`
+ANTES de checar se o path sequer seria aceito — competindo pela mesma fila
+FIFO e pelo mesmo extension host usado pelo cliente do Luau LSP. Fix: (1)
+um watcher POR ponto de montagem (`mountPoints`) em vez de um único watcher
+sobre a raiz; (2) `handleLocalFileChange` reordenado para checar
+(`uuidByDiskPath`/`resolveDataModelPathForDiskChange`/exclusão de pasta
+Wally — tudo puro, sem I/O) ANTES do `readFile`, não depois.
+
+**`[Verificado]`**: `tsc --noEmit` limpo, `vitest run` 276/276 (era 275,
++1 teste provando via contador de `readFile` que path excluído não gera
+I/O nenhum), `esbuild` gera os dois bundles sem erro.
+
+**`[Hipótese]` (pendente)**: ganho real de latência de autocomplete/LSP
+(~10s → ~1s relatado pelo usuário) não foi cronometrado em VS Code real —
+exigiria Extension Development Host + digitação interativa, fora do
+alcance de automação desta sessão. Também não testado contra o Studio real
+do usuário (porta 1401, oferecido pelo orquestrador) — mudança é
+inteiramente client-side (watcher + SyncBridge, nada em `plugin/src/`), e
+não havia pasta de projeto conhecida com segurança para apontar um harness
+sem risco de escrever no lugar errado.
+
+## Nota de sessão (2026-08-03) — Bug do eco `sourceChanged` (revert/rebuild ao digitar rápido) — fix aplicado, teste ao vivo pendente
+
+Detalhe completo em `docs/DECISIONS.md`, "17ª rodada", e
+`.claude/agent-memory/luau-dev.md`. Resumo: `sendMessage`
+(`plugin/src/init.server.luau`) ecoava de volta pro mesmo cliente WS que
+causou a própria escrita — `origin` (`checkSourceChanged`,
+`SourceWatcher.luau`) já classificava isso corretamente como `"plugin"`
+mas só alimentava um log, nunca suprimia o envio. Combinado com a fila
+FIFO da extensão (`enqueueMutation`) e o `contentCache` sendo atualizado
+para o conteúdo mais novo ANTES do ack do `writeSource`
+(`SyncBridge.pushKnownUuidUpdate`), o eco de um pulse de buffer antigo
+chegava depois e era tratado como "mudança genuína do Studio",
+reescrevendo disco/buffer com conteúdo velho — repetido a cada eco
+atrasado da rajada de digitação, dando a aparência de revert/replay.
+Fix: `checkSourceChanged` só chama `sendMessage` quando `origin ~=
+"plugin"`.
+
+**`[Verificado]` (estático)**: `selene plugin/src` 0 errors/42 warnings
+(0 novos), `stylua --check` limpo, `lune run` confirma sintaxe.
+
+**`[Hipótese]` (pendente)**: teste ao vivo com 1 Studio real via `Tools/`
+— plugin buildado+implantado, harness subido na porta 34980, mas o
+Studio já aberto não reconectou (autostart opt-in, exige clique manual na
+toolbar — ação física fora do alcance desta sessão, sem MCP
+`Roblox_Studio` disponível). Roteiro de 4 passos completo em
+`docs/DECISIONS.md` "17ª rodada" para o usuário (ou uma sessão futura com
+o Studio já conectado) fechar. Harness pode ter ficado rodando em
+background nesta máquina (`Tools/logs/studio-34980.log`) — confirmar/matar
+antes de reiniciar.
+
+## Nota de sessão (2026-08-03) — Logo do SyncTeam no `StatusBarItem` (fonte de ícone via fantasticon)
 
 Detalhe completo em `docs/DECISIONS.md`, "14ª rodada", e
 `.claude/agent-memory/ui-dev.md`. Resumo: `StatusBarItem.text` só aceita

@@ -49,7 +49,11 @@ const PRESENCE_STALE_CHECK_INTERVAL_MS = 5000;
 
 let outputChannel: vscode.OutputChannel | undefined;
 let service: SyncTeamService | undefined;
-let fileWatcher: vscode.FileSystemWatcher | undefined;
+// 2026-08-03 (bug de performance real, ver docs/DECISIONS.md): passou de um
+// ÚNICO FileSystemWatcher (raiz inteira do projeto, "**/*", sem exclusão) para
+// um array, um watcher POR ponto de montagem — ver o comentário completo no
+// ponto de criação (dentro de startService) para o porquê.
+let fileWatchers: vscode.FileSystemWatcher[] = [];
 // Controlador de ciclo de vida (start/stop/restart/setPort) + estado observável
 // para a status bar (ui-dev). Criado uma vez em activate(); as funções
 // exportadas getConnectionState/onDidChangeConnectionState delegam a ele.
@@ -508,8 +512,38 @@ async function startService(
   // mostrar uma mensagem distinta confirmando a posse tomada.
   const reclaimed = service.getLastReclaimed();
 
-  const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(dir, "**/*"));
-  fileWatcher = watcher;
+  // 2026-08-03: bug de performance real reportado pelo usuário — autocomplete/LSP
+  // (VS Code + Luau LSP) ficando ~10s lento com o SyncTeam ativo (~1s desligado).
+  // Causa raiz confirmada por leitura de código: o watcher antigo observava
+  // `dir` INTEIRO recursivamente ("**/*", zero exclusão) — incluindo `.git/`
+  // (churn interno do git), `sourcemap.json` na raiz (reescrito em alta
+  // frequência por `rojo sourcemap --watch`, companion comum do Luau LSP
+  // neste ecossistema, a cada mudança de árvore sob o projeto) e pastas Wally
+  // grandes (`Packages/`/`ServerPackages/`/`DevPackages/`). Cada evento
+  // gerava, via scheduleNotify -> SyncBridge.handleLocalFileChange, uma
+  // LEITURA DE DISCO REAL (`vscode.workspace.fs.readFile`) enfileirada na
+  // MESMA fila FIFO usada por pulses de buffer/mensagens do Studio — mesmo
+  // para paths que iam ser descartados (fora de mount, fora da convenção
+  // Rojo). Volume alto de eventos + IPC de leitura real competindo pelo
+  // extension host (processo Node único, compartilhado com o cliente do
+  // LSP) é a explicação mais direta para a lentidão observada.
+  //
+  // Fix (camada 1, aqui): em vez de UM watcher sobre `dir` inteiro, um
+  // watcher POR ponto de montagem (`mountPoints`, já resolvido acima),
+  // escopado a `${mount.diskPath}/**` — só o que o projeto Rojo-compatível
+  // realmente sincroniza. `.git/`, `sourcemap.json` na raiz e qualquer pasta
+  // fora de todo `$path` do `default.project.json` nunca mais chegam a gerar
+  // evento. Um watcher por mount (em vez de um único glob combinado tipo
+  // `{a/**,b/**}`) porque a sintaxe de OR-group do glob do VS Code não está
+  // confirmada em `.claude/research/` — N watchers com padrão simples evita
+  // depender de comportamento de API não pesquisado (.claude/rules/luau.md
+  // tem regra equivalente do lado Luau; mesmo espírito aqui). Pastas Wally
+  // continuam DENTRO do escopo observado (elas moram sob um mount, ex.
+  // `src/server/Packages/...`) — não dá para excluí-las neste nível do
+  // watcher sem quebrar a descoberta de pacote novo (teste existente
+  // "criação nova dentro de Packages... CONTINUA funcionando normalmente");
+  // ver camada 2 (SyncBridge.handleLocalFileChange) para a redução de custo
+  // ali.
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const scheduleNotify = (uri: vscode.Uri) => {
     const relPath = relDiskPathFromUri(dir, uri);
@@ -525,25 +559,33 @@ async function startService(
       }, WATCH_DEBOUNCE_MS),
     );
   };
-  context.subscriptions.push(
-    watcher.onDidChange(scheduleNotify),
-    watcher.onDidCreate(scheduleNotify),
-    // 2026-07-20: sem isso, uma remoção local (delete de arquivo, ou a
-    // metade "delete" de um rename local) nunca chega a
-    // SyncBridge.handleLocalFileChange pelo watcher ao vivo — o gap coberto
-    // do lado da lógica (readFile null -> deleteScript) ficava morto sem
-    // este fio. Mesmo debounce/scheduleNotify de onDidChange/onDidCreate;
-    // relDiskPathFromUri é só cálculo de path (sem tocar disco), então
-    // funciona igual para uma URI que já não existe mais.
-    watcher.onDidDelete(scheduleNotify),
-    watcher,
-    { dispose: () => {
+  const watchers = mountPoints.map((mount) =>
+    vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(dir, `${mount.diskPath}/**`)),
+  );
+  fileWatchers = watchers;
+  for (const watcher of watchers) {
+    context.subscriptions.push(
+      watcher.onDidChange(scheduleNotify),
+      watcher.onDidCreate(scheduleNotify),
+      // 2026-07-20: sem isso, uma remoção local (delete de arquivo, ou a
+      // metade "delete" de um rename local) nunca chega a
+      // SyncBridge.handleLocalFileChange pelo watcher ao vivo — o gap coberto
+      // do lado da lógica (readFile null -> deleteScript) ficava morto sem
+      // este fio. Mesmo debounce/scheduleNotify de onDidChange/onDidCreate;
+      // relDiskPathFromUri é só cálculo de path (sem tocar disco), então
+      // funciona igual para uma URI que já não existe mais.
+      watcher.onDidDelete(scheduleNotify),
+      watcher,
+    );
+  }
+  context.subscriptions.push({
+    dispose: () => {
       for (const timer of debounceTimers.values()) {
         clearTimeout(timer);
       }
       debounceTimers.clear();
-    } },
-  );
+    },
+  });
 
   logger.info(`SyncTeam ativo — projeto '${projectFileUri.fsPath}', porta ${actualPort}`);
   if (actualPort !== port) {
@@ -563,8 +605,10 @@ async function stopService(): Promise<void> {
   presencePublisher = undefined;
   projectDir = undefined;
   presenceTracker.clear();
-  fileWatcher?.dispose();
-  fileWatcher = undefined;
+  for (const watcher of fileWatchers) {
+    watcher.dispose();
+  }
+  fileWatchers = [];
   // M3.4: serviço parou — leaseTracker some (getter passa a devolver null);
   // sem isto o aviso visual de uma lease antiga ficaria "pendurado" até a
   // próxima troca de editor ativo.

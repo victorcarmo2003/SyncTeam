@@ -3,6 +3,521 @@
 Decisões técnicas e pegadinhas de TypeScript/Node/VS Code do projeto.
 Atualize ao final de cada tarefa; mantenha curto e acionável.
 
+## Bug de performance real: fila FIFO sem coalescência para pulses de buffer = backlog sem limite (2026-08-04, docs/DECISIONS.md "19ª rodada")
+
+Regressão do fix da 18ª rodada (abaixo): usuário testou de novo e reportou
+PIOROU — trava TOTAL de autocomplete (não só lenta), escalando com TAMANHO
+do arquivo, persistindo por um tempo mesmo depois de parar de digitar.
+Padrão diferente do bug anterior (aquele era sobre volume de eventos de
+watcher em pastas irrelevantes, não escala com tamanho de arquivo
+individual sendo editado) — hipótese nova, confirmada por MEDIÇÃO real, não
+só leitura de código.
+
+- **Lição principal, generalizável para qualquer throttle/debounce futuro
+  neste projeto**: throttle de AGENDAMENTO (limitar a frequência com que um
+  novo `setTimeout` é CRIADO) não é a mesma coisa que limitar quantas
+  TAREFAS ficam em voo/pendentes num consumidor assíncrono mais lento. O
+  `BUFFER_PULSE_THROTTLE_MS` de `extension.ts::scheduleBufferPulse` (150ms)
+  só impedia agendar um SEGUNDO timer enquanto o primeiro ainda não tinha
+  DISPARADO — no instante em que dispara, ele se remove do Map e chama
+  `notifyBufferChange` sem aguardar nada, liberando o próximo agendamento
+  imediatamente. Nada ali limitava quantas chamadas de
+  `notifyBufferChange` — cada uma virando um `enqueueMutation` na fila FIFO
+  ÚNICA e GLOBAL do `SyncTeamService` (`queueTail`) — ficavam empilhadas
+  esperando a vez. Cada item da fila faz um `await transport.request(...)`
+  (round-trip REAL até o plugin no Studio); se esse round-trip é mais lento
+  que o intervalo entre pulses (bem provável durante digitação contínua), o
+  backlog cresce SEM LIMITE — não é "mais lento", é "cresce sem parar", daí
+  a trava total e a persistência depois de parar de digitar (a fila ainda
+  está drenando o que acumulou).
+- **Medido ao vivo, não só hipótese**: escrevi um teste com socket ws real
+  e um "plugin" fake que atrasa deliberadamente o ack de `writeSource`
+  (`test/syncTeamService.test.ts`, describe "coalescência de pulses do
+  MESMO path") — ANTES do fix, 12 pulses síncronos no MESMO path geravam
+  **11** `writeSource` reais sequenciais (não coalescidos, quase 1:1); 6+6
+  pulses em dois paths diferentes geravam 5+5. Rodei o teste com a
+  asserção FINAL (`<=2`) contra o código NÃO corrigido de propósito, só
+  para deixar a falha do vitest documentar o número real — é uma forma
+  barata de "instrumentação" sem precisar escrever um script descartável à
+  parte.
+- **Pegadinha de timing ao escrever o teste**: minha primeira tentativa
+  disparava os pulses com `await new Promise(r => setTimeout(r, 5))` entre
+  cada um (achando que 5ms << round-trip de 50ms garantiria 1 única janela
+  de coalescência). Isso deu resultados MELHORES que sem fix, mas ainda
+  MAIORES que 2 (4 e 3, não 2) — não porque o algoritmo de coalescência
+  estivesse errado, mas porque `setTimeout(fn, 5)` no Windows não dispara em
+  5ms de verdade (timer coalescing do SO, resolução tipicamente ~15ms) — o
+  burst inteiro (12 iterações) podia se espalhar por mais tempo que o
+  round-trip, abrindo várias janelas LEGÍTIMAS de coalescência em vez de
+  uma só. **Fix do teste**: disparar o burst SEM NENHUM `await` entre as
+  chamadas (loop síncrono, mesmo tick) — isso é tanto o caso mais
+  adversarial quanto o mais determinístico para CI, porque não depende de
+  precisão de timer do SO. Se uma tarefa futura escrever um teste
+  "N eventos rápidos, no máximo M efeitos", preferir burst síncrono a
+  `setTimeout` de poucos ms entre iterações — o segundo é sujeito a timer
+  coalescing e pode inflar o resultado sem que o código sob teste tenha
+  bug nenhum.
+- **Fix, "latest-wins, no máximo 1 em voo + 1 pendente" por path** — vive em
+  `SyncTeamService.ts` (não em `extension.ts` nem `SyncBridge.ts`): é o
+  único lugar que já possui a fila FIFO (`enqueueMutation`) e enxerga TODAS
+  as fontes que a alimentam. `bufferPulseInFlight: Set<string>` marca — no
+  instante em que a tarefa é ENFILEIRADA, não quando começa a RODAR (a fila
+  pode ter outra coisa na frente) — que já existe um buffer-pulse deste
+  path em algum estágio. `bufferPulsePendingContent: Map<string, string>`
+  guarda só o conteúdo MAIS RECENTE recebido enquanto isso (nunca uma fila
+  própria — cada chamada nova SOBRESCREVE a entrada, não adiciona).
+  `notifyBufferChange`: path em voo → só atualiza o Map pendente, retorna
+  sem enfileirar. Path livre → `dispatchBufferPulse` imediato.
+  `dispatchBufferPulse`: marca em voo, `enqueueMutation(...)`, e no
+  `.finally()` (sucesso OU erro — `Promise.finally`, `lib: ES2022` já
+  cobre) libera o path e, se sobrou pendente, dispara UMA nova tarefa
+  recursivamente (se mais pulses chegarem durante essa 2ª rodada, coalescem
+  de novo do mesmo jeito).
+- **Por que isso NÃO reintroduz a race de 2026-07-27**: cada disparo
+  (imediato ou "pendente") continua entrando na MESMA `enqueueMutation` —
+  a ordem relativa a OUTRAS mutações (save, mensagens espontâneas do
+  Studio, sincronização inicial) continua FIFO estrita. Só pulses de buffer
+  do MESMO path se coalescem entre si; paths diferentes têm suas próprias
+  entradas no Set/Map, nunca se atropelam (teste dedicado prova isso).
+- **`extension.ts::scheduleBufferPulse` não precisou de nenhuma mudança** —
+  seu throttle de agendamento continua útil (evita criar um timer por
+  tecla), só deixou de ser a única linha de defesa contra backlog. A
+  coalescência agora vive na camada que TODOS os chamadores de
+  `notifyBufferChange` passam (extensão, e qualquer harness/CLI futuro que
+  reuse `SyncTeamService`).
+- **Observação registrada, não corrigida (fora de escopo desta tarefa)**:
+  `handleBufferContentChange`/`pushKnownUuidUpdate` sempre mandam o
+  CONTEÚDO COMPLETO do arquivo (`document.getText()`, não um diff) — o
+  payload por round-trip ainda cresce com o TAMANHO do arquivo, não com o
+  tamanho da edição. O backlog agora é limitado (no máximo 2 em voo), mas
+  um arquivo grande ainda paga um payload grande por pulse — reprojetar
+  para diffs incrementais mudaria o protocolo (`writeSource` hoje é sempre
+  `{uuid, source}` completo) e não foi pedido nesta tarefa.
+- **Verificação real**: `tsc --noEmit` limpo, `vitest run` 278/278 (era
+  276, +2 testes novos), `esbuild` gera os dois bundles sem erro. Ganho de
+  UX real no VS Code continua `[Hipótese]` (mesma limitação de sempre:
+  exigiria Extension Development Host + digitação interativa cronometrada,
+  fora do alcance de automação desta sessão).
+
+## Bug de performance real: watcher `**/*` sem escopo + I/O antes de filtrar = LSP lento (2026-08-03, docs/DECISIONS.md "18ª rodada")
+
+Usuário relatou autocomplete/LSP ~10x mais lento (VS Code + Luau LSP) com o
+SyncTeam ativo. Hipótese do usuário (com evidência de código) confirmada
+sem furos por leitura ponta a ponta.
+
+- **Padrão a lembrar para qualquer FileSystemWatcher futuro neste
+  projeto**: nunca observar a raiz inteira do workspace com `"**/*"` sem
+  escopo. `dir` de um projeto Rojo-compatível quase sempre tem `.git/`,
+  possivelmente `sourcemap.json` reescrito em alta frequência (`rojo
+  sourcemap --watch`, companion comum do Luau LSP) e pastas Wally grandes
+  (`Packages/`/`ServerPackages/`/`DevPackages/`). Um watcher sem escopo gera
+  uma avalanche de eventos que, se cada um dispara trabalho real (I/O,
+  fila), compete pelo MESMO extension host (processo Node único,
+  compartilhado com clientes de LSP de outras extensões) — mecanismo direto
+  para lentidão de UI aparentemente não relacionada.
+- **Fix camada 1** (`extension.ts`, dentro de `startService`): trocado UM
+  `createFileSystemWatcher(new RelativePattern(dir, "**/*"))` por **um
+  watcher POR ponto de montagem** (`mountPoints.map(mount =>
+  createFileSystemWatcher(new RelativePattern(dir, \`${mount.diskPath}/**\`)))`),
+  guardados em `fileWatchers: vscode.FileSystemWatcher[]` (era uma variável
+  única `fileWatcher`). **Decisão deliberada de NÃO usar glob combinado
+  `{a/**,b/**}`** (sintaxe de OR-group) — não estava confirmada em
+  `.claude/research/`, e a regra do projeto é não depender de comportamento
+  de API não pesquisado (mesmo espírito de `.claude/rules/luau.md` do lado
+  Luau). N watchers com padrão simples (`mountPoints.length` costuma ser
+  pequeno, poucas unidades) sidesteps a dependência sem custo real. Se uma
+  tarefa futura quiser essa sintaxe, pedir ao `researcher` confirmar
+  primeiro.
+- **Pastas Wally NÃO podem ser excluídas no nível do watcher** — elas moram
+  DENTRO de um mount (ex. `src/server/Packages/...`, confirmado nos
+  fixtures de teste), então escopar por mount as mantém no escopo. Isso é
+  intencional: teste pré-existente (`test/syncBridge.test.ts`, "criação
+  nova dentro de Packages... CONTINUA funcionando normalmente",
+  2026-07-16) exige que descoberta de arquivo NOVO em pasta Wally continue
+  funcionando — só a ATUALIZAÇÃO contínua de conteúdo já rastreado é
+  excluída (por `isInsideExcludedPackageFolder`, dentro de
+  `handleLocalFileChange`/`pushKnownUuidUpdate`/`handleLocalFileRemoved`).
+  Não tentar "resolver" isso excluindo Packages do glob do watcher — quebra
+  esse contrato já testado.
+- **Fix camada 2** (`SyncBridge.ts::handleLocalFileChange`): a função fazia
+  `await this.diskIO.readFile(relDiskPath)` **incondicionalmente**, e só
+  DEPOIS checava `resolveDataModelPathForDiskChange`/`uuidByDiskPath` (as
+  checagens que decidem se o path é aceito). Ou seja: todo evento de
+  watcher pagava uma leitura de disco REAL (`vscode.workspace.fs.readFile`,
+  round-trip IPC) mesmo para paths que iam ser descartados. Reordenado:
+  `uuidByDiskPath.get(key)` (Map lookup puro) e
+  `resolveDataModelPathForDiskChange`/`isInsideExcludedPackageFolder`
+  (funções puras, sem I/O) agora rodam ANTES do `readFile` — se nenhuma das
+  duas aceita o path, retorna sem tocar disco. **Padrão geral a lembrar**:
+  em qualquer handler que faz I/O condicionalmente ao resultado, sempre
+  ordenar as checagens PURAS antes das checagens que exigem I/O, nunca o
+  contrário — parece óbvio em retrospecto, mas o código original tinha
+  ficado assim organicamente (a checagem de "é candidato a criação?" só
+  fazia sentido DEPOIS de já ter o conteúdo, então acabou ficando depois do
+  read por conveniência de fluxo, não por necessidade real).
+- **Teste da redução de I/O**: `CountingDiskIO` em `test/syncBridge.test.ts`
+  ganhou `readCount` (só tinha `writeCount`/`renameCount`) — prova via
+  contador que uma atualização dentro de `Packages` com uuid já conhecido
+  NÃO dispara `readFile` nenhum, não só que o resultado é descartado depois
+  (teste anterior já provava isso via `transport.sent`, mas não provava
+  ausência de I/O). Se qualquer handler futuro ganhar um early-exit
+  parecido, esse é o padrão de teste a reusar (contador de I/O real, não só
+  resultado observável).
+- **Não medido nesta tarefa** (`[Hipótese]`, honesto): o ganho real de
+  latência de LSP em VS Code de verdade — exigiria Extension Development
+  Host + digitação interativa cronometrada, fora do alcance de automação
+  desta sessão (interação de GUI). Também não testado contra Studio real
+  (porta 1401 oferecida pelo orquestrador) — decisão deliberada: a mudança
+  é 100% client-side (nada em `plugin/src/`), o harness Node
+  (`Tools/start-harness.sh`) usa `NodeDiskIO`/`fs.watch`, não
+  `vscode.FileSystemWatcher` — não exercitaria a camada 1 (a maior parte do
+  ganho) de qualquer jeito; e não havia pasta de projeto conhecida com
+  segurança pra apontar um harness sem risco de escrever no lugar errado da
+  sessão real do usuário. A camada 2 já está coberta por teste real
+  (`NodeDiskIO`/tmpdir, mesmo código que o harness usaria).
+
+## `syncteam-cli`: comandos `port`/`start`/`stop`/`extension install` (2026-08-03, docs/DECISIONS.md "12ª rodada")
+
+Continuação do `cli/` (10ª/11ª rodada abaixo). Adicionados 4 comandos novos
+(`plugin install` intocado): `syncteam port <PORT>`, `syncteam start [--dir
+<pasta>]`, `syncteam stop`, `syncteam extension install`. 52 testes no total
+(era 17), `bun run lint` limpo, testado de verdade nesta máquina (Windows)
+incluindo o BINÁRIO COMPILADO real, não só modo interpretado.
+
+### Achado mais importante desta tarefa: self-invocation de binário Bun compilado
+
+`syncteam start` precisa reinvocar A SI MESMO como processo destacado
+(daemon) — não dá pra saber de antemão se está rodando via `bun run
+src/index.ts` (interpretado) ou como `.exe` compilado (`bun build
+--compile`), e as duas formas de spawnar são diferentes. **Duas heurísticas
+erradas tentadas antes de acertar, ambas confirmadas erradas com teste real
+(não só análise)**:
+
+1ª tentativa: comparar `process.argv[1]` contra `fileURLToPath(import.meta.url)`
+do próprio `index.ts` — **falha**: no binário compilado, os dois campos
+resolvem para o MESMO caminho VIRTUAL dentro do bunfs (formato observado:
+`B:/~BUN/root/<nome>.exe`), então a comparação dá "igual" em AMBOS os modos,
+não distingue nada.
+
+2ª tentativa: adicionar `existsSync()` sobre esse caminho, assumindo que o
+caminho virtual "não existe de verdade" — **também falha**: o `fs`
+(`existsSync` incluído) do Bun RECONHECE/VIRTUALIZA esses caminhos
+internos e retorna `true` mesmo para o caminho virtual. Confirmado ao vivo:
+com as duas heurísticas acima, `syncteam.exe start` compilado tentava
+reinvocar a si mesmo passando o caminho virtual como ARGUMENTO REAL
+(`syncteam.exe "B:/~BUN/root/syncteam.exe" start --daemon-child`) — o
+processo filho (o próprio `.exe`) recebia isso como um comando desconhecido
+e morria na hora, fazendo `start` reportar "processo encerrou logo após
+iniciar".
+
+**Sinal que REALMENTE funciona** (confirmado com um probe dedicado,
+`scripts/debug-argv-probe.ts`, rodado em modo interpretado E compilado nesta
+máquina, depois removido — não é suposição):
+
+| Campo | interpretado (`bun run src/index.ts`) | compilado (`.exe`) |
+|---|---|---|
+| `process.execPath` | caminho REAL do `bun.exe` | caminho REAL do próprio `.exe` |
+| `process.argv[0]` | **igual a `execPath`** | **literal `"bun"`** (string fixa, nunca um path) |
+| `process.argv[1]` | caminho REAL do script | caminho VIRTUAL bunfs |
+
+`process.execPath === process.argv[0]` só é verdade em modo interpretado —
+é ESSE o sinal certo (`src/daemon/selfInvocation.ts::resolveSelfInvocation`).
+Quando bate, repassa `argv[1]` (script real) ao processo filho; quando não
+bate (compilado), usa só `execPath` como comando + os args extras, SEM
+repassar nenhum path. `[Verificado no Windows]`, Bun 1.3.13 — não testado em
+macOS/Linux, mas o mecanismo de compilação do Bun é o mesmo cross-platform.
+**Se qualquer tarefa futura mexer em self-respawn de um binário Bun
+compilado, comece por este achado — não tente `argv[1]`/`import.meta.url`/
+`existsSync` de novo, já sei que não funciona.**
+
+### Outras decisões desta tarefa
+
+- **Design de `start` em 2 processos**: o processo em FOREGROUND resolve
+  conflito de porta de forma INTERATIVA (diálogo `[s/N]` via
+  `readline/promises`, `src/prompt/confirmPrompt.ts`) usando um `SyncServer`
+  TEMPORÁRIO com `onPortOccupied` ligado a `attemptPortReclaim` (reusado de
+  `vscode-extension/src/sync/PortOwnership.ts` sem alteração — só a UI de
+  confirmação muda, mesma interface `PortReclaimHost.confirmKill` que a
+  extensão já usa com um modal). Depois de resolver, PARA o servidor
+  temporário (`server.stop()`) e spawna um processo DESTACADO (a auto-
+  reinvocação acima) que liga o motor real numa porta JÁ resolvida, sem hook
+  interativo (processo destacado não tem terminal) e com
+  `portFallbackAttempts: 0` (falha alto e claro em vez de escolher outra
+  porta silenciosamente se uma corrida rara acontecer). O processo em
+  foreground só retorna sucesso depois de CONFIRMAR (lendo o mesmo lockfile
+  de posse de porta, `readPortLock`, checando que o PID bate com o processo
+  que ele acabou de spawnar) que o daemon realmente abriu a porta — não é só
+  "spawnei e torço".
+- **`daemon/engine.ts`** é porte direto de
+  `vscode-extension/tools/run-node-harness.ts` (mesma composição
+  SyncServer+SyncTeamService+NodeDiskIO), mas via IMPORT CROSS-PACOTE dos
+  arquivos-fonte de `vscode-extension/src/` (não uma cópia) — `cli/` não
+  depende de `vscode-extension/` como pacote instalado, mas TypeScript
+  resolve/type-checa a referência relativa normalmente entre os dois
+  diretórios do mesmo repo. Log só via console (stdout/stderr) no daemon —
+  `start.ts` já redireciona os dois para `~/.syncteam/daemon.log` via fd
+  real (`fs.openSync(..., "a")`) no spawn; um segundo logger de arquivo
+  duplicaria cada linha.
+- **Atrito real do cross-import**: `cli/tsconfig.json` tinha
+  `noUncheckedIndexedAccess: true` (vscode-extension NÃO usa essa flag) —
+  isso fazia `tsc --noEmit` do CLI gerar ~8 erros em arquivos já
+  validados/testados de `vscode-extension` (`projectMapping.ts`,
+  `rojoPathMapping.ts`, `PortOwnership.ts`) só porque o CLI type-checa
+  arquivos importados sob as PRÓPRIAS opções do compilador, não as do
+  pacote de origem. **Removida** do `cli/tsconfig.json` para alinhar com a
+  baseline de `vscode-extension` (que também é `"strict": true`, só sem essa
+  flag extra) — decisão registrada em vez de silenciosa. Se uma tarefa
+  futura reusar mais arquivos de `vscode-extension/` no CLI e topar com o
+  mesmo tipo de erro, a causa é essa — não é bug no código importado.
+- **`ws`/`@types/ws` precisaram ser adicionados como dependência REAL do
+  CLI** (`bun install`) — `SyncServer.ts`/`PortOwnership.ts` importam `ws`
+  diretamente; sem isso, o cross-import não resolvia.
+- **`~/.syncteam/`** é o local de config/estado PRÓPRIO do CLI (distinto de
+  `.vscode/settings.json`/`ExtensionContext.globalStorageUri` da extensão,
+  porque o CLI roda sem VS Code aberto) — `config.json` (porta),
+  `syncteam.pid` (`{pid,port,projectDir}` do daemon vivo), `daemon.log`,
+  `port-locks/` (MESMO lockfile de posse de porta da extensão, reusado).
+  Escolha deliberada de NÃO usar `env-paths` (dependência nova) — só
+  `os.homedir() + ".syncteam"`, cross-platform o bastante.
+- **`syncteam extension install`**: mesmo padrão de `plugin install`
+  (`.vsix` embutido via `with {type:"file"}`, `src/types/vsix.d.ts` espelha
+  `rbxm.d.ts`), mas escreve num arquivo TEMPORÁRIO e chama `code
+  --install-extension <path> --force` via subprocess (não existe "pasta de
+  destino" pro VS Code do jeito que o Studio tem pasta de Plugins). Erro
+  `ENOENT` do `code` vira mensagem amigável ("code não encontrado no PATH"),
+  nunca stack cru. `scripts/build-extension-asset.ts` roda `npm run build` +
+  `npx --yes @vscode/vsce package --no-dependencies` dentro de
+  `vscode-extension/` e copia o `.vsix` gerado (nome `<name>-<version>.vsix`)
+  para o nome FIXO `syncteam.vsix` dentro de `cli/src/assets/`.
+- **Nota Windows sobre `stop`**: `process.kill(pid, "SIGTERM")` disparado por
+  OUTRO processo força término IMEDIATO no Windows (já documentado em
+  `PortOwnership.ts` de uma tarefa anterior) — o handler gracioso do daemon
+  (`service.stop()`, que removeria o lockfile de posse de porta) não chega a
+  rodar. Confirmado ao vivo que isso é INÓCUO: a porta é liberada pelo SO de
+  qualquer forma, e um `start` seguinte na MESMA porta funciona normalmente
+  apesar do lockfile órfão (o bind bem-sucedido sobrescreve o lockfile). Em
+  POSIX o SIGTERM deveria disparar o handler gracioso de verdade — não
+  testado nesta máquina.
+- **Testes de ponta a ponta REAIS** (`test/startStop.test.ts`,
+  `test/startPortConflict.test.ts`) — mesma filosofia de nunca mockar
+  fs/child_process/net/ws já estabelecida em `vscode-extension/`: sobem um
+  daemon de verdade, confirmam PID/porta/lockfile reais, encerram de
+  verdade, e testam o diálogo Y/N com um processo Node SEPARADO ocupando a
+  porta (nunca o próprio processo de teste — matar o processo de teste por
+  engano derrubaria a suíte inteira). **Achado real que motivou um ajuste**:
+  `bun run test` roda `vitest`, mas o WORKER que executa cada arquivo de
+  teste é um processo NODE, não bun (`process.execPath` dentro de um teste
+  aponta pra `node.exe` mesmo a suíte tendo sido lançada via `bun run test`)
+  — os testes resolvem `~/.bun/bin/bun.exe` explicitamente em vez de reusar
+  `process.execPath`, senão a auto-reinvocação tentaria rodar `node
+  <arquivo.ts>` (que quebra na hora com `ERR_UNKNOWN_FILE_EXTENSION` no
+  import `.rbxm`/`.vsix` com `with {type:"file"}`, uma sintaxe Bun-only).
+- **Verificação real completa nesta máquina**: `bun run lint` limpo, `bun
+  run test` 52/52 (rodado 2x, sem flakiness), `bun run build:assets` (rbxm +
+  vsix) OK, binário compilado (`bun build --compile --target=bun-windows-x64`)
+  testado DE VERDADE: `start`/`stop` reais (processo destacado sobrevivendo
+  ao pai, porta confirmada via `netstat`, PID confirmado via
+  `Get-Process`), diálogo Y/N de posse de porta nos dois caminhos (aceitar
+  mata o ocupante e reusa a porta configurada; recusar preserva o ocupante e
+  cai no fallback), `syncteam port <N>` persistindo e lendo de volta,
+  `syncteam extension install` confirmado via `code --list-extensions
+  --show-versions` (`dev-hakor.syncteam@0.1.0`). Nada publicado (sem `gh
+  release`/push) — decisão de escopo desta tarefa.
+- **Pendência sinalizada, não resolvida por mim**: `CLAUDE.md` linha ~57
+  ainda diz "Único comando hoje: `syncteam plugin install`" — ficou stale
+  depois desta tarefa, mas não editei `CLAUDE.md` (fora do meu escopo como
+  subagente — sinalizando para o usuário/orquestrador atualizar se quiser).
+  macOS/Linux para `start`/`stop`: mecanismo deveria funcionar (mesma
+  composição, mesmo Bun), mas só testado de verdade no Windows.
+
+## `syncteam-cli` — novo componente `cli/`, TypeScript/Bun standalone, distribuído via Rokit (2026-08-03, docs/DECISIONS.md "10ª rodada")
+
+Primeiro código de produto do CLI (spike anterior, "9ª rodada", só validou
+que `bun build --compile` é aceito pelo Rokit contra um repo descartável).
+`cli/` é projeto TypeScript independente (não importa nada de
+`vscode-extension/`), roda em **Bun**, não Node — primeira vez que este
+projeto usa Bun como runtime de produto, não só ferramenta auxiliar.
+
+- **Estrutura**: `src/index.ts` (único arquivo que toca API do Bun —
+  `Bun.file`, import `with { type: "file" }`), `src/plugin/studioPluginsDir.ts`
+  (puro, resolve pasta de Plugins do Studio por SO, recebe
+  `{platform, homedir, env}` injetado — nunca lê `process.*` direto, mesmo
+  padrão de módulo puro já usado em `vscode-extension/src/mapping/*.ts`),
+  `src/commands/pluginInstall.ts` (orquestração com toda IO injetada via
+  interface `PluginInstallIO`, testável sem compilar nada).
+  `scripts/build-plugin-asset.ts` roda `wally install` + `rojo build` contra
+  `../plugin/` e escreve `src/assets/SyncTeam.rbxm` (gerado, gitignored via
+  regra global `*.rbxm` — NUNCA commitado, usuário final do CLI não precisa
+  de `rojo`/`wally`). `scripts/lib/rokitTools.ts` localiza `rojo`/`wally` em
+  `~/.rokit/tool-storage/<qualquer-autor>/<tool>/<versão>/` com comparador
+  de versão semver-aware PRÓPRIO (`compareVersions`) — não confiar em `sort
+  -V`/`localeCompare` puro para isso, ver pegadinha abaixo.
+- **PEGADINHA REAL que me mordeu**: comentário JSDoc (`/** ... */`) com um
+  path glob literal tipo `.../tool-storage/*/<toolName>/*` **quebra o
+  parser do TypeScript** — a substring `*/` no MEIO do texto fecha o bloco
+  de comentário cedo, e o resto do comentário + código seguinte vira
+  "expressão" inválida (`error TS1109: Expression expected`, apontando pra
+  uma linha bem depois do comentário real, nada óbvio de onde vem). Regra
+  prática: **nunca escrever `*/` literal dentro de um bloco `/** */`**,
+  mesmo dentro de texto/exemplo — se precisar mostrar um glob com `*` perto
+  de `/`, reescrever por extenso (`<qualquer-versão>` em vez de `*`) ou usar
+  `//` linha a linha. Fácil de re-cometer em qualquer doc/comentário futuro
+  que cite paths com wildcard.
+- **`sort -V` (usado por `Tools/build-and-deploy-plugin.sh` para achar a
+  versão mais alta do rojo instalada) NÃO entende semver de verdade** —
+  testado ao vivo: `sort -V` em `["7.6.1", "7.7.0-rc.1", "7.7.0"]` (só os
+  números) põe `7.7.0` ANTES de `7.7.0-rc.1` (errado — release deveria vir
+  DEPOIS/maior que prerelease da mesma versão). O script shell só "funciona
+  por acidente" porque compara o PATH INTEIRO incluindo o separador depois
+  da versão (`7.7.0-rc.1/rojo.exe` vs `7.7.0/rojo.exe` — o `-` de `-rc.1`
+  tem código ASCII menor que `/`, então por pura sorte a comparação
+  lexicográfica do path completo dá o resultado certo). Não reproduzir esse
+  padrão em JS/TS achando que é "sort -V correto" — implementei
+  `compareVersions` de verdade (parseia `major.minor.patch[-prerelease]`,
+  prerelease sempre conta como menor que release da mesma versão), testado
+  explicitamente contra esse caso real (`test/rokitTools.test.ts`).
+- **Import attribute `with { type: "file" }` do Bun**: `src/types/rbxm.d.ts`
+  declara `declare module "*.rbxm" { const path: string; export default
+  path; }` — isso faz `tsc --noEmit` (`bun run lint`) passar mesmo num CLONE
+  LIMPO sem o `.rbxm` gerado ainda (declaração de módulo por padrão de nome,
+  não exige arquivo físico no disco). Só `bun run`/`bun build --compile`
+  precisam do arquivo físico de verdade (é quem embute os bytes). Ordem de
+  build obrigatória: `build:plugin-asset` sempre ANTES de `compile:*` — os
+  scripts npm já encadeiam isso (`&&`), documentado em `cli/README.md`.
+- **Zip cross-platform sem dependência de ferramenta de SO**: `tar -a -c -f
+  x.zip ...` no GNU tar (git-bash Windows) **NÃO gera um zip de verdade** —
+  só renomeia um `.tar` pra `.zip` sem trocar o formato (`file x.zip` acusa
+  "POSIX tar archive", não "Zip archive"), armadilha real encontrada nesta
+  tarefa. `zip`/`Compress-Archive` também não são uniformes nas 3 plataformas
+  alvo. Usei `adm-zip` (devDependency só do script de build, não vai pro
+  binário final) — justificativa registrada em `cli/README.md`.
+- **Localização de binário Rokit**: `~/.rokit/tool-storage/` usa autor
+  DIFERENTE por ferramenta (`rojo-rbx/rojo` mas `upliftgames/wally` —
+  confirmado nesta máquina) — `findRokitTool` varre TODOS os autores sob
+  `tool-storage/`, não assume um autor fixo, mesmo espírito do wildcard
+  `*/wally/*` já usado em `Tools/build-and-deploy-plugin.sh`.
+- **Verificação real (Windows, nesta máquina)**: `bun run build:plugin-asset`
+  gerou `SyncTeam.rbxm` (194540 bytes, rojo 7.7.0 real). `bun run
+  compile:win-x64` gerou PE32+ válido (~117MB). `scripts/verify-embed-hash.ts`
+  — compila, roda `syncteam.exe plugin install` de verdade com `LOCALAPPDATA`
+  redirecionado pra um tmpdir (não toca a instalação real do usuário) —
+  **hash SHA-256 do `.rbxm` extraído do binário bateu 100% com o gerado
+  direto por `rojo build`** (ressalva que a pesquisa do Bun tinha deixado em
+  aberto, agora fechada). `compile:macos-x64`/`compile:macos-arm64` também
+  rodados de verdade nesta máquina — geram Mach-O válidos (`file` confirma
+  x86_64/arm64) — mas **nunca EXECUTADOS** (impossível numa máquina Windows);
+  `plugin install` no macOS real (incluindo se `~/Documents/Roblox/Plugins`
+  está certo) continua `[Hipótese]`. 17/17 testes vitest, `tsc --noEmit`
+  limpo. Nada publicado (sem `gh release create`, `rokit.toml` da raiz
+  intocado) — decisão explícita da tarefa.
+- **Pendência sinalizada, não resolvida por mim**: pasta de Plugins do
+  Studio no macOS (`~/Documents/Roblox/Plugins`) não tem confirmação em
+  `.claude/research/` — implementado por analogia ao Windows, documentado
+  como `[Hipótese]` no código/README/DECISIONS.md. Precisa do `researcher`
+  antes de virar `[Verificado]`.
+
+## "Handoff quase-instantâneo de lease" — pulse de buffer via onDidChangeTextDocument (2026-08-02, docs/DECISIONS.md "8ª rodada")
+
+Objetivo: fazer o `Pulse` do lease do lado Luau (`TeamCreateLease.ensureIntent`)
+atualizar continuamente durante digitação ativa, não só no save — hoje a
+detecção local de edição é 100% via disco (`FileSystemWatcher`), então o dono
+de um lease só parece "morto" ~8-10s depois de parar de digitar.
+
+- **Fonte de verdade de posse REUSADA, nada duplicado**: `LeaseTracker`
+  (`vscode-extension/src/sync/LeaseTracker.ts`) e `resolveUuidForDiskPath`
+  (`SyncTeamService` → `SyncBridge`) já existiam — só adicionei
+  `LeaseTracker.isExplicitlyOwnedByMe(uuid)`, método NOVO e deliberadamente
+  DIFERENTE de `isOwnedByMe` já existente: `isOwnedByMe` é otimista (`true`
+  também quando a lease ainda não foi arbitrada OU está livre — correto para
+  "posso deixar o usuário editar sem aviso visual"), mas este gatilho novo
+  exige posse EXPLÍCITA (`lease !== undefined && lease.ownerClientId ===
+  myClientId`, com guard extra `myClientId !== null`) — a tarefa pedia
+  explicitamente que "arquivo sem lease ainda resolvida" NÃO disparasse nada
+  daqui (o fluxo de pedir lease pela 1ª vez continua só pelo save). Usar
+  `isOwnedByMe` aqui teria disparado pulses ANTES da posse ser confirmada.
+- **`SyncBridge` ganhou `handleBufferContentChange(relDiskPath, content,
+  transport)`**: mesma mensagem `writeSource {uuid, source}` que
+  `handleLocalFileChange` manda no save, só que `content` vem do BUFFER
+  (`document.getText()`, passado pelo chamador) — este módulo nunca lê disco
+  nem importa `vscode`. Extraí o núcleo comum (cache/exclusão Wally/envio/
+  tratamento de ack) para um novo helper privado `pushKnownUuidUpdate(...)`,
+  reusado pelos DOIS caminhos (`handleLocalFileChange`'s update-branch E
+  `handleBufferContentChange`) — evita duplicar a lógica de envio/ack/erro
+  que já existia. Dedupe: mesmo `contentCache` de sempre (`content ===
+  cache` → sai cedo) — é isso que faz um save logo depois de um pulse de
+  buffer com o MESMO conteúdo não gerar um segundo `writeSource` (testado
+  explicitamente).
+- **`SyncBridge.handleBufferContentChange` só age em uuid JÁ conhecido**
+  (`uuidByDiskPath.get(key)`) — nunca tem um "modo criar" como
+  `handleLocalFileChange` tem. Isso é redundante com o gate de
+  `resolveUuidForDiskPath` que `extension.ts` já faz ANTES de chamar, mas
+  mantive como checagem defensiva (early-return + log info) — segurança
+  dupla barata, sem custo real.
+- **`SyncTeamService.notifyBufferChange(relDiskPath, content)`**: passthrough
+  fino que enfileira `bridge.handleBufferContentChange` na MESMA fila FIFO
+  (`enqueueMutation`) que `notifyLocalFileChange`/`routeSpontaneous` usam —
+  mesmo motivo de sempre (mexe nos mesmos mapas mutáveis do SyncBridge, uma
+  pulsação de buffer concorrente com uma rajada do Studio teria a mesma
+  corrida do bug de 2026-07-27). Testado com o MESMO padrão de prova de FIFO
+  já usado pro `notifyLocalFileChange` (dispara `scriptMoved` + a nova
+  chamada SEM esperar entre eles, confirma pela ORDEM das linhas de log que
+  a segunda só começou depois da primeira terminar).
+- **`extension.ts::scheduleBufferPulse` é THROTTLE, não debounce — decisão
+  deliberada, divergindo do padrão de `scheduleNotify`/
+  `schedulePresencePublish` já existentes no mesmo arquivo**: um debounce
+  (reseta o timer a cada evento, só dispara após silêncio) NUNCA dispararia
+  enquanto o usuário digitasse continuamente sem pausa — exatamente o oposto
+  do objetivo ("Pulse atualiza CONTINUAMENTE durante digitação ativa").
+  Implementação: reusa o MESMO mecanismo (`Map<string relPath, Timer>` +
+  `setTimeout`) do `scheduleNotify`, só SEM o `clearTimeout`/reagendamento a
+  cada evento — se já existe um timer pendente pro path, novos eventos
+  dentro da janela (`BUFFER_PULSE_THROTTLE_MS = WATCH_DEBOUNCE_MS = 150ms`)
+  são ignorados; o disparo pendente lê `document.getText()` no MOMENTO em
+  que dispara (não no agendamento), sempre pegando o conteúdo mais recente —
+  `vscode.TextDocument` é o mesmo objeto vivo, `getText()` nunca é um
+  snapshot velho. 150ms foi calibrado pra ficar confortavelmente abaixo do
+  novo `STALE_AFTER_SECONDS` configurável do lado Luau (~2-3s, ver
+  `docs/DECISIONS.md`).
+- **Gate completo em `scheduleBufferPulse` (extension.ts), NÃO no
+  SyncBridge**: (1) `service`/`projectDir` ativos + `document.uri.scheme ===
+  "file"`; (2) `service.resolveUuidForDiskPath(relPath) !== null` (arquivo
+  já sincronizado — fora disso, nada dispara, save cuida da criação); (3)
+  `service.getLeaseTracker()?.isExplicitlyOwnedByMe(uuid)` (posse explícita
+  minha). Só depois disso agenda o throttle. Fez sentido ficar em
+  `extension.ts` porque é o único lugar que já tem acesso a `LeaseTracker`
+  via `service.getLeaseTracker()` (mesmo getter que `LeaseBorderDecoration`
+  já usa) — `SyncBridge`/`SyncTeamService` não sabem nada de lease (quem sabe
+  é só `LeaseTracker`, populado por `leaseChanged`).
+- **Listener registrado UMA VEZ em `activate()`** (`vscode.workspace.
+  onDidChangeTextDocument`), não recriado a cada `startService()` — mesmo
+  padrão dos listeners de presença (`onDidChangeActiveTextEditor`/
+  `onDidChangeTextEditorSelection`) logo acima dele. `bufferPulseTimers`
+  (Map module-level) é limpo só no `dispose()` do próprio listener
+  (desativação da extensão), não em `stopService()` — um timer pendente que
+  dispara depois de um restart só encontra `service` apontando pra uma
+  instância nova; `notifyBufferChange`/`handleBufferContentChange`
+  degradam pra no-op silencioso se o uuid não for conhecido nessa instância
+  nova (nunca crash). Documentado inline como aceito.
+- **Watcher de disco (`FileSystemWatcher`, dentro de `startService`)
+  continua 100% intocado** — as duas vias coexistem por design (a tarefa foi
+  explícita sobre isso): disco continua sendo o fallback para mudanças fora
+  do buffer do VS Code (checkout, outro processo).
+- **Testes**: `LeaseTracker.isExplicitlyOwnedByMe` (5, incluindo o caso
+  `myClientId === null`); `SyncBridge.handleBufferContentChange` (5: envia
+  quando muda, dedupe quando igual, uuid desconhecido não manda nada, pulse
+  seguido de save com mesmo conteúdo não duplica write, exclusão de pasta
+  Wally reusa a mesma checagem); `SyncTeamService.notifyBufferChange` (1,
+  prova de FIFO — mesmo padrão do teste de `notifyLocalFileChange` já
+  existente). 274 testes no total. `npm run lint` (tsc --noEmit) limpo,
+  `npm run build` (esbuild) gera os dois bundles sem erro.
+- **Não testado em Studio real**: depende do lado Luau (`luau-dev`, em
+  paralelo nesta mesma rodada) ter desacoplado `leaderTick` de
+  `PULSE_INTERVAL_SECONDS` — sem isso, mesmo com pulses de buffer chegando
+  mais rápido do lado da extensão, a checagem de staleness no plugin ainda
+  rodaria a cada 2s (constante de heartbeat/eleição, intocada por decisão
+  registrada). Nenhum `[Hipótese]` novo introduzido aqui além do já registrado
+  na entrada da 8ª rodada em `docs/DECISIONS.md`.
+
 - Comparação de paths no Windows precisa ser case-insensitive (bug real
   corrigido no RojoCoop, `FilePresenceDecorations`).
 - **Padrão de dedupe por cache de conteúdo (harness Node), espelhando o que o
@@ -129,6 +644,77 @@ Atualize ao final de cada tarefa; mantenha curto e acionável.
     memória continuam valendo sem mudança (recursive watch não portável pro
     Linux, corrida benigna na sincronização inicial dupla, edição antes da
     conexão não é enfileirada, delete não é tratado).
+
+## "ReSync" — reset forçado sob comando do Studio (2026-08-02)
+
+Contrato completo em `docs/DECISIONS.md` "5ª rodada". Implementei só o lado
+VS Code (`case "resyncRequest"` em `SyncTeamService.routeSpontaneous`,
+`SyncBridge.resyncFromScratch`, modal de confirmação) — `luau-dev`/`ui-dev`
+cuidam do botão/painel no Studio, em paralelo.
+
+- **Regra de arquitetura que a tarefa pedia violar, e por que recusei**: a
+  descrição da tarefa sugeria chamar `vscode.window.showWarningMessage`
+  DIRETO dentro do `case` novo em `SyncTeamService.ts`. Não fiz isso —
+  `SyncTeamService.ts`/`SyncBridge.ts`/`SyncController.ts` são os únicos
+  módulos de `sync/` que NUNCA importam `vscode` (confirmado via grep: só
+  `extension.ts`, `ui/*.ts` — domínio `ui-dev` — `VscodeDiskIO.ts` e
+  `vscodeLogger.ts` importam `vscode` de verdade), e nenhum teste deste
+  projeto mocka `vscode`. Importar `vscode` ali quebraria isso e tornaria o
+  fluxo inteiro intestável sem subir o Extension Development Host. **Padrão
+  reaproveitado em vez disso**: exatamente o mesmo desenho já usado por
+  "posse de porta" (`PortReclaimHost.confirmKill(message): Promise<boolean>`,
+  2026-08-02 3ª rodada) — um callback (`ConfirmResyncCallback`,
+  `setOnConfirmResync`) que `SyncTeamService` chama e cuja implementação REAL
+  (`vscode.window.showWarningMessage(msg, {modal:true}, "Confirmar",
+  "Cancelar")`) só existe em `extension.ts`. Sempre que uma tarefa pedir
+  "mostra um modal aqui" num módulo que hoje não importa `vscode`, este é o
+  padrão a seguir — nunca importar `vscode` direto nesses módulos.
+- **`enqueueMutation` (fila FIFO de `SyncTeamService`) virou genérico**
+  (`<T>(task: () => Promise<T>): Promise<T>`, era `Promise<void>` fixo) —
+  precisei disso porque `resyncFromScratch` devolve `deletedCount` (número) e
+  o chamador (`handleResyncRequest`) precisa desse valor para montar o
+  `resyncResult`. Mudança 100% compatível com todo call site pré-existente
+  (`void` é só mais um `T` válido) — nenhum teste pré-existente quebrou.
+- **`SyncBridge.resyncFromScratch(transport): Promise<number>`**: conta
+  `deletedCount` LOGO APÓS `deleteFile` ter sucesso, ANTES de tentar
+  `removeEmptyDirsUpward` — as duas operações têm try/catch SEPARADOS (delete
+  falhando não deveria impedir a limpeza de diretório de outro arquivo do
+  mesmo lote, e uma falha de `removeEmptyDirsUpward` não deveria "descontar"
+  um delete que já teve sucesso de verdade). Snapshot de
+  `diskPathByUuid.values()` em `Array.from` ANTES de zerar qualquer Map —
+  óbvio em retrospecto, mas fácil de esquecer (os Maps são zerados dentro do
+  mesmo método, então iterar por referência direta depois do clear() daria
+  loop vazio).
+- **Escopo estrito, testado explicitamente**: um arquivo escrito diretamente
+  no tmpdir (bypassando o bridge, nunca aparecendo em `diskPathByUuid`)
+  sobrevive ao `resyncFromScratch` — o método só apaga o que ELE PRÓPRIO
+  rastreia, nunca varre o disco feito `reconcileDiskOnlyFiles` faz para
+  `refreshSync`.
+- **Teste mais forte do que o pedido mínimo**: além do teste de
+  `SyncBridge.resyncFromScratch` com `FakeTransport` direto (prova
+  delete+repull com conteúdo NOVO substituindo o antigo — não só "não lança
+  erro"), escrevi um teste de `SyncTeamService` ponta-a-ponta com um plugin
+  fake via `WebSocket` REAL (`ws://127.0.0.1:<porta>`, mesmo padrão de
+  `syncServer.test.ts`/`syncTeamService.test.ts` watchedRoots) que muda o
+  conteúdo reportado ENTRE a sincronização inicial e o resync — só assim dá
+  pra provar que o `runInitialSync` de dentro do `resyncFromScratch` correu
+  de fato (arquivo aparece com o conteúdo NOVO, não o antigo). Para os casos
+  sem plugin conectado (sem confirmador / cancelado / confirmador que
+  rejeita), bastou `vi.spyOn(server, "sendSpontaneous")` para capturar a
+  resposta sem precisar de socket nenhum — `SyncServer.request()` já rejeita
+  sozinho com "nenhum plugin conectado" quando não há cliente (não precisa de
+  fake plugin pra esses casos, só pro caminho de sucesso onde o CONTEÚDO
+  importa).
+- **`resyncRequest` participa do dedupe de `multiSync`** (mesma assinatura
+  sempre, `"resyncRequest"` sem campo variável) — um clique duplicado
+  replicado por 2 Studios (Team Create) dentro da janela de 800ms não deve
+  empilhar 2 modais de confirmação para o mesmo pedido lógico.
+- **Verificação real**: `npm run lint` (tsc --noEmit) limpo, `npm run test`
+  (vitest run) **263/263** (era 256, +7: 3 em `syncBridge.test.ts`, 4 em
+  `syncTeamService.test.ts`), `npm run build` (esbuild) gera os dois bundles
+  sem erro. **Não testado em Studio real** — depende do lado Studio
+  (`luau-dev`/`ui-dev`) terminar em paralelo; nenhum round-trip Team Create
+  aqui, só lógica local (mesma conclusão de outras fatias client-side-only).
 
 ## M1 — `vscode-extension/` real (2026-07-04)
 
@@ -1035,3 +1621,551 @@ repo, então isso não violou a regra de "não pesquisar API na web"; li
   com Studio aberto e conectado, matar o Studio à força, fechar o VS Code de
   novo, verificar que a porta é liberada rapidamente/`netstat` não mostra
   mais LISTENING nela).
+
+## Fila FIFO em `SyncTeamService` corrige corrida de dados numa rajada de mensagens espontâneas (2026-07-27)
+
+Bug real do usuário (uso real, não spike): reparent em massa no Explorer do
+Studio (arrastar vários irmãos para dentro de um Script existente) gera ~30
+`scriptMoved` em menos de 1.5s. Causa raiz: `SyncTeamService.routeSpontaneous`
+despachava `sourceChanged`/`scriptAdded`/`scriptMoved`/`scriptRemoved`
+fire-and-forget (`this.bridge.handleXxx(message).catch(...)`, sem `await`) a
+partir do handler SÍNCRONO de `message` do `SyncServer` — que processa cada
+frame do WebSocket assim que chega, sem esperar o handler assíncrono anterior
+terminar. Uma rajada disparava N chamadas CONCORRENTES a
+`SyncBridge.handleScriptMoved`/etc., todas mutando os MESMOS mapas
+(`scripts`/`diskPathByUuid`/`uuidByDiskPath`/`contentCache`) com I/O de disco
+intercalado — resultado real relatado: `init.server.luau` de promoção nunca
+criado + pasta antiga intacta + pasta nova aninhada com CÓPIA (duplicação).
+Detalhe completo da análise de causa raiz em `docs/DECISIONS.md` 2026-07-27.
+
+- **Onde a fila vive: `SyncTeamService`, não `SyncBridge`.** Decisão
+  deliberada — `SyncBridge` tem métodos que se chamam entre si internamente
+  (`handleScriptMoved` chama `recomputeAndApplyLayout`, `refreshSync` chama
+  `handleLocalFileChange`/`applyStudioContent` internamente). Se a fila
+  vivesse dentro de `SyncBridge` envolvendo esses MESMOS métodos públicos, uma
+  chamada interna de um método já enfileirado para outro método também
+  enfileirado causaria AUTO-DEADLOCK (a tarefa externa nunca libera o slot da
+  fila porque está esperando uma chamada interna que só roda depois que o
+  slot for liberado). Como `SyncTeamService` é o único orquestrador que chama
+  TODOS os pontos de entrada mutantes do `SyncBridge`
+  (`runInitialSync`/`handleSourceChanged`/`handleScriptAdded`/
+  `handleScriptMoved`/`handleScriptRemoved`/`handleLocalFileChange`/
+  `refreshSync`) e o `SyncBridge` NUNCA chama de volta pro `SyncTeamService`,
+  colocar a fila lá captura todos os entry points sem nenhum risco de
+  recursão/deadlock — as chamadas internas do `SyncBridge` continuam diretas
+  (não passam pela fila de novo), só os pontos de entrada EXTERNOS
+  (`routeSpontaneous`, `notifyLocalFileChange`, `onClientConnected`,
+  `refreshSync()` público) passam por `enqueueMutation`.
+- **Padrão "mutex por fila" via encadeamento de Promise**
+  (`SyncTeamService.queueTail`/`enqueueMutation`):
+  ```ts
+  private queueTail: Promise<void> = Promise.resolve();
+  private enqueueMutation(task: () => Promise<void>): Promise<void> {
+    const result = this.queueTail.then(task);
+    this.queueTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+  ```
+  `queueTail` em si NUNCA rejeita (o `.then(noop, noop)` engole
+  resultado/erro só para decidir "posso liberar o próximo") — isso é o que
+  garante que um handler que falha não trava a fila inteira. Quem chama
+  `enqueueMutation` ainda recebe a Promise ORIGINAL (`result`, não o
+  `queueTail` atualizado) — preserva o `.catch(...)` de log que cada call
+  site já fazia antes, sem mudar a assinatura pública de nada
+  (`routeSpontaneous`/`notifyLocalFileChange` continuam `void`,
+  `refreshSync()` continua `Promise<void>`).
+- **Escopo do que entra na fila** — TUDO que muta `SyncBridge`/toca disco:
+  `sourceChanged`/`scriptAdded`/`scriptMoved`/`scriptRemoved` (em
+  `routeSpontaneous`), `notifyLocalFileChange` (watcher local — MESMOS mapas
+  compartilhados, então uma edição local concorrente com uma rajada do Studio
+  tem a mesma corrida — isso NÃO estava no pedido original da tarefa mas foi
+  avaliado e incluído porque o mecanismo já existia e o custo de incluir era
+  zero), `runInitialSync` (chamado em `onClientConnected`, também era
+  fire-and-forget antes) e `refreshSync()` público (comando manual). **Fora
+  da fila, deliberadamente**: `leaseChanged`/`presenceChanged`/`presenceLeft`/
+  `log` — nunca tocam `this.bridge`/disco (só `LeaseTracker`/callbacks de
+  UI/logger), enfileirá-los só adicionaria latência artificial a mensagens de
+  alta frequência (presença/cursor por movimento do cursor) sem nenhum ganho.
+- **Por que os testes provam a serialização SEM precisar de timers reais
+  nem mock de scheduler**: JS é single-thread — chamar `routeSpontaneous(msgA)`
+  seguido de `routeSpontaneous(msgB)` SINCRONAMENTE (sem `await` entre eles,
+  exatamente como o `SyncServer` despacha frames reais um atrás do outro) faz
+  cada chamada rodar sua parte SÍNCRONA até o primeiro `await` interno antes
+  de ceder controle. Sem a fila, ambos chegam a interlear no I/O de disco
+  (é isso que reproduz a corrida de verdade). Com a fila,
+  `this.queueTail.then(taskB)` só agenda `taskB` depois que a Promise de
+  `taskA` (incluindo TODOS os awaits internos) resolver — `taskB` nem começa
+  sua parte síncrona até `taskA` terminar por completo. Isso permitiu escrever
+  um teste 100% determinístico (sem `setTimeout`/`vi.useFakeTimers`) que
+  dispara 3 `scriptMoved` synchronously e confirma o resultado final em disco.
+- **`test/syncTeamService.test.ts`, novo describe "fila FIFO serializa rajada
+  de mensagens mutantes"**: 3 testes novos.
+  1. Mecanismo puro (cast para `enqueueMutation` privado, sem `SyncBridge`
+     nem disco): 3 tarefas, a 1ª deliberadamente lenta (`setTimeout` 20ms) e
+     a 2ª rejeitando de propósito — confirma ordem FIFO estrita via array
+     `order` (`["1-start","1-end","2-start","3-start","3-end"]`) e que a
+     rejeição da 2ª não impede a 3ª de rodar.
+  2. **Regressão do bug real**: helper novo `makeServiceWithMounts(logger,
+     mountPoints)` (variante de `makeService` que expõe o `tmpDir` real do
+     `NodeDiskIO` — necessário para inspecionar o layout materializado em
+     disco, mesma prática de `syncBridge.test.ts`). Cenário: um `Script`
+     "Server" (leaf) + 3 scripts irmãos soltos; dispara 3 `scriptMoved`
+     reparentando os 3 irmãos para dentro de "Server" SEM aguardar entre eles;
+     confirma que "Server" foi promovido para `Server/init.server.luau`
+     (conteúdo preservado), o `Server.server.luau` achatado antigo NÃO
+     sobrou, os 3 filhos materializaram dentro da pasta nova com conteúdo
+     íntegro e os paths antigos (soltos) sumiram — sem nenhuma pasta/arquivo
+     órfão duplicado.
+  3. `notifyLocalFileChange` provadamente na MESMA fila que `routeSpontaneous`:
+     dispara um `scriptMoved` e, sem aguardar, `notifyLocalFileChange` para um
+     path não relacionado — prova por ORDEM DE LOG (`CapturingLogger.lines`
+     é um array append-only em ordem de execução real) que a linha de log do
+     `notifyLocalFileChange` só aparece DEPOIS de todas as linhas do
+     `scriptMoved`, provando que os dois entram na mesma fila serial (não
+     filas independentes que rodariam concorrentemente).
+  - **Pegadinha ao popular o estado inicial sem transport funcional**: os
+    testes de `syncTeamService.test.ts` nunca chamam `server.start()` (porta
+    nunca é bindada), então `transport.request(...)` SEMPRE rejeita
+    ("nenhum plugin conectado") — `handleScriptAdded` chamaria `readSource`
+    e falharia se `sourceCache` não tivesse o uuid ainda. Contornado
+    mandando `sourceChanged` ANTES de `scriptAdded` para cada uuid de setup:
+    `handleSourceChanged`/`applyStudioContent` populam `sourceCache.set(uuid,
+    content)` incondicionalmente (mesmo com `diskPath` ainda desconhecido, só
+    loga "layout ainda não resolvido" sem erro) e NUNCA chamam `transport` —
+    depois `scriptAdded` vê `this.sourceCache.has(uuid) === true` e retorna
+    cedo, sem precisar de `readSource`. `handleScriptMoved` também nunca toca
+    `transport` (só estado local + disco), então a rajada em si (a parte que
+    importa pro teste) não depende de transport funcional de jeito nenhum.
+- **Verificação**: `npx tsc --noEmit` limpo, `npx vitest run --pool=threads`
+  191/191 (era 188, +3), `npm run build` gera os dois bundles sem erro.
+- **`[Verificado]` (automatizado) / `[Hipótese]` (Studio real)**: o mecanismo
+  da fila em si está confirmado por teste determinístico com mensagens
+  concorrentes simuladas. O round-trip genuíno (reproduzir a rajada real de
+  ~30 `scriptMoved` no Studio de verdade, arrastando filhos de uma Folder
+  para dentro de um Script) continua pendente de roteiro manual/2 Studios
+  reais — não prometi mais que isso nos docs.
+
+## `watchedRoots` — extensão manda os serviços de topo do projeto ao plugin (2026-07-29)
+
+Bug real: usuário adicionou mount point novo (`ReplicatedFirst/First`) e nada
+sincronizou, porque o plugin Studio tinha lista FIXA hardcoded de "watched
+roots" (`plugin/src/Config.luau::Config.getWatchedRoots()`) sem
+`ReplicatedFirst`. Fix estrutural: a extensão (única que lê
+`default.project.json`) manda a lista de serviços de topo do projeto ATUAL ao
+plugin, via mensagem nova. **Só o lado da extensão foi feito nesta tarefa** —
+lado do plugin é tarefa seguinte, separada, do `luau-dev`. Contrato exaustivo
+em `docs/DECISIONS.md` 2026-07-29 (kind, campo, tipos, ORDEM no handshake) —
+é a interface entre as duas tarefas, escrito para o `luau-dev` não precisar
+re-ler `SyncTeamService.ts` inteiro.
+
+- **`computeWatchedRoots(mountPoints: MountPoint[]): string[]`** — função pura
+  nova em `projectMapping.ts` (perto de `computeFullLayout`/
+  `resolveDataModelPathForDiskChange`, mesmo arquivo — é onde toda lógica que
+  só sabe de `MountPoint[]` já mora). Pega o **primeiro segmento** de
+  `mount.dataModelPath.split("/")[0]` de cada mount, deduplicado via `Set`,
+  ordem de primeira aparição (não alfabética — irrelevante pro plugin, que
+  trata como conjunto, mas deixa o teste determinístico). Nada de I/O, nada de
+  depender de `computeFullLayout`/`computeLayout` — só olha `dataModelPath`.
+- **Protocolo**: `WatchedRootsMessage {kind: "watchedRoots", roots: string[]}`
+  em `protocol.ts` — aditiva, **não** muda `PROTOCOL_VERSION` (mesmo
+  precedente de `ping`/`leaseChanged`/`presenceUpdate`/`connectionRejected`).
+  Espontânea (sem `requestId`/ack), via `SyncServer.sendSpontaneous` (mesmo
+  mecanismo de `sendPresenceUpdate`).
+- **Onde exatamente no ciclo de conexão**: `SyncTeamService`'s
+  `onClientConnected` handler (registrado no construtor via
+  `server.setHandlers({...})`) — chamado de dentro de `SyncServer.handleHello`
+  DEPOIS de `protocolVersion` validado. Ordem dentro do handler: `leaseTracker`
+  novo → `this.onPresenceReset?.()` → **`watchedRoots` mandada aqui** →
+  `this.enqueueMutation(() => this.bridge.runInitialSync(...))`. Ou seja,
+  ANTES do primeiro `listScripts`, que é o requisito da tarefa (plugin precisa
+  saber quais containers escanear antes de responder `scriptList`).
+- **Pegadinha real que me mordeu ao ler o código antes de codar**: o
+  construtor de `SyncTeamService` recebia `mountPoints: MountPoint[]` como
+  parâmetro comum (sem `private readonly`) e só repassava para
+  `new SyncBridge(mountPoints, ...)` — **não ficava acessível depois** em
+  nenhum outro método da classe. `SyncBridge` já guarda `mountPoints` como
+  campo privado seu, mas não expunha getter. Resolvido com a mudança MÍNIMA:
+  adicionar `private readonly` ao parâmetro do construtor de
+  `SyncTeamService` (TypeScript parameter property — dentro do próprio
+  construtor, o identificador `mountPoints` cru continua se referindo ao
+  parâmetro local, então `new SyncBridge(mountPoints, ...)` não precisou virar
+  `new SyncBridge(this.mountPoints, ...)` — as duas formas valem o mesmo
+  valor). Não toquei em `SyncBridge` (não precisou de getter novo lá).
+- **Teste de integração exigiu socket `ws` REAL** (não dá pra testar via
+  `routeSpontaneous` privado, que é o padrão usado no resto deste arquivo de
+  teste — o envio acontece dentro de `onClientConnected`, que só dispara com
+  um `hello` de verdade aceito por `SyncServer.handleHello`). Copiei o mesmo
+  padrão de `test/syncServer.test.ts` (`getFreePort`/`waitFor` via `net`/
+  `WebSocket` de `ws`) direto para `syncTeamService.test.ts` (arquivos de
+  teste deste projeto não compartilham helpers entre si — duplicar essas ~15
+  linhas é o padrão aceito, não vale a pena um módulo de test-utils só por
+  isso). Dois testes: (1) `watchedRoots` chega antes de `listScripts` com
+  `roots` corretos calculados a partir de mount points reais passados ao
+  serviço; (2) `mountPoints: []` ainda manda a mensagem com `roots: []` (não
+  pula silenciosamente — importante porque um projeto com
+  `default.project.json` mal formado/sem mounts válidos não deve deixar o
+  plugin sem NENHUM sinal, mesmo que o sinal seja "lista vazia").
+- **Verificação**: `npx tsc --noEmit` limpo, `npm run test` 199/199 (era 191,
+  +8: 6 de `computeWatchedRoots` + 2 de integração), `npm run build` +
+  `npx @vscode/vsce package --no-dependencies` geraram
+  `vscode-extension/syncteam-0.1.0.vsix` novo (não instalado, combinado com o
+  usuário).
+- **Não testado em Studio real** (não é o escopo desta tarefa): o lado do
+  plugin nem existe ainda. Quando o `luau-dev` implementar, o roteiro de
+  validação é: plugin recebe `watchedRoots` logo após conectar, atualiza sua
+  lista de containers ANTES de responder ao `listScripts` que chega logo em
+  seguida, e um mount point novo em serviço fora da lista fixa antiga (ex.:
+  `Lighting`) passa a sincronizar sem precisar tocar em `Config.luau`.
+
+## Fallback automático de porta ocupada (2026-08-02)
+
+Implementação real do exemplo motivador de `.claude/rules/authority.md`
+(regra criada na mesma sessão, ver `docs/DECISIONS.md` para o texto
+completo/justificativa). Resumo técnico para quem tocar `SyncServer`/
+`SyncController`/`ConnectionState` de novo:
+
+- **`SyncServer.start()` virou `tryListen(candidatePort, attempt)` recursivo**
+  (`vscode-extension/src/sync/SyncServer.ts`): cada tentativa cria um
+  `WebSocketServer` NOVO (o antigo, que já deu `error`, não é reaproveitável —
+  não tentei `.close()`/limpar listeners nele, já que ele nunca chegou a
+  bindar nada, então não há recurso para liberar). Em `onFirstError`, só
+  `error.code === "EADDRINUSE"` acorda o fallback; qualquer outro código
+  rejeita na hora — decisão deliberada porque só "porta ocupada" é o
+  obstáculo recuperável coberto pela regra de autoridade, trocar de porta não
+  resolve `EACCES`/porta inválida. `resolve(this.tryListen(nextPort, attempt+1))`
+  — resolver uma Promise com outra Promise (thenable) faz a externa adotar o
+  estado dela automaticamente; é assim que a recursão encadeia sem precisar
+  de `await`/`then` explícito dentro do executor.
+- **Só EADDRINUSE aciona fallback — cuidado ao testar "erro que não é
+  EADDRINUSE"**: não existe jeito portável (Windows/Unix) de forçar um
+  `EACCES` de verdade em CI (portas privilegiadas <1024 nem sempre falham no
+  Windows). Usei uma porta FORA do intervalo válido (`70000`) — Node valida
+  o `port` sincronamente dentro de `net.Server.listen()` e **lança
+  synchronous** (`RangeError` `ERR_SOCKET_BAD_PORT`) ANTES de sequer emitir
+  `error`; como isso acontece dentro do executor da Promise (`new
+  Promise((resolve, reject) => { const wss = new WebSocketServer(...); ...
+  })`), o throw síncrono vira rejeição automática da Promise — o código de
+  fallback (`onFirstError`) nem chega a rodar. É um caminho de código
+  DIFERENTE do que testar um `EADDRINUSE` real, mas o comportamento
+  OBSERVÁVEL (rejeita imediato, zero tentativas de fallback logadas) é
+  exatamente o que a regra exige, e evita depender de comportamento
+  específico de SO. Documentei isso explicitamente no teste para quem ler
+  depois não estranhar.
+- **Esquema exato**: incremento de 1 em 1 (`port+1`, `port+2`, ...), 5
+  tentativas alternativas por padrão (`portFallbackAttempts`, `0` desliga),
+  nunca ultrapassa `MAX_PORT` (65535, importado de `util/port.ts` — não
+  duplicar o número mágico). Full write-up em `docs/DECISIONS.md`
+  2026-08-02 "(2ª rodada)".
+- **Como a porta real fica visível SEM eu tocar em nenhum arquivo de UI**:
+  a status bar (`ui-dev`, `src/ui/StatusBarItem.ts` + `statusBarMenu.ts`) já
+  lê `ConnectionState.port` via `getConnectionState()`/
+  `onDidChangeConnectionState` para montar o texto/tooltip. Eu só mudei o
+  SIGNIFICADO desse campo (era "sempre a configurada", passou a ser "a
+  REAL, pode diferir se houve fallback") e adicionei `portFallbackFrom?:
+  number` (a porta original, só presente durante um fallback ativo) — a
+  status bar já existente passa a mostrar a porta certa de graça, sem
+  nenhuma mudança visual nova. `portFallbackFrom` fica disponível pro
+  `ui-dev` usar num destaque visual futuro (tooltip diferenciado), não
+  implementado agora (fora do escopo "lógica + ponto de integração").
+  **Sinalizei isso no relatório final ao invés de inventar UI.**
+- **`StartServiceResult.actualPort`**: novo campo opcional que
+  `extension.ts::startService` preenche com `service.getActualPort()` só
+  quando difere da porta pedida — é o que `SyncController.doStart` usa para
+  decidir se mostra a mensagem normal de sucesso ou a de fallback (com as
+  DUAS portas) e para atualizar `this.currentPort`/`this.portFallbackFrom`.
+- **Persistência deliberadamente intocada**: um fallback NUNCA escreve em
+  `syncteam.port`. Cada novo start/restart tenta a porta configurada
+  ORIGINAL de novo (fallback de novo se ainda ocupada) — evita mover a
+  config do usuário silenciosamente por uma ocupação transitória.
+- **`getConfiguredPort()`/`getActualPort()` novos em `SyncServer` E em
+  `SyncTeamService`** (passthrough simples, mesmo padrão de
+  `isClientConnected`/`getConnectedCount` já existente) — `actualPort` é
+  `null` enquanto parado, resetado em `stop()`.
+- **Testes com sockets/portas REAIS** (`net.createServer` para "ocupar" uma
+  porta antes do teste, mesma filosofia que todo o resto de
+  `syncServer.test.ts` já usa — nunca mockei `ws`): 5 em
+  `syncServer.test.ts` (sucesso do fallback com cliente ws real conectando na
+  porta nova, esgotamento de tentativas, `portFallbackAttempts:0`,
+  erro-não-EADDRINUSE via porta inválida, respeito a `MAX_PORT`), 5 em
+  `syncController.test.ts` (`FakeHost`, cobre mensagens/estado/reset de
+  `portFallbackFrom`), 1 em `syncTeamService.test.ts` (passthrough
+  `getActualPort` de ponta a ponta com start/stop reais). 210 testes no
+  total (era 199). `npm run lint` limpo, `npm run test` 210/210 (rodei a
+  suíte cheia 2x pra afastar flakiness de porta real), `npm run build` gera
+  os dois bundles sem erro.
+- **Não precisa de Studio real**: é bind de porta local puro, testável 100%
+  com vitest — nenhum `[Hipótese]` pendente de Team Create nesta tarefa.
+
+### Correção pós-revisão do `code-reviewer` (mesmo dia): `stop()` não resetava `currentPort`/`portFallbackFrom`
+
+Bug REAL (achado rodando teste de verdade, não só leitura de código):
+`SyncController.stop()` zerava `this.running` mas nunca recalculava
+`this.currentPort`/`this.portFallbackFrom` de volta para a porta CONFIGURADA.
+Consequência: depois de um `start()` com fallback (ex.: 1400 ocupada, real
+1401) seguido de `stop()`, `getConnectionState()` continuava devolvendo
+`port: 1401, portFallbackFrom: 1400` com `running: false` — contradizia o
+próprio doc-comment do campo (`ConnectionState.port`: "enquanto parado, é a
+última porta CONFIGURADA lida") e faria a status bar mostrar a porta errada
+com o servidor parado.
+
+- **Por que só `stop()` tinha o bug**: `start()`/`restart()`/`setPort()` todos
+  passam por `doStart()`, que SEMPRE recalcula `currentPort`/`portFallbackFrom`
+  a partir de `host.getConfiguredPort()` + o resultado de `startService`. Só
+  `stop()` tinha seu próprio caminho que nunca tocava esses dois campos —
+  qualquer método novo de ciclo de vida que eu adicionar no futuro precisa
+  ou passar por `doStart` ou replicar esse recálculo explicitamente; não
+  assumir que "zerar `running`" é suficiente.
+- **Fix**: em `stop()`, antes de `emitState()`: `this.currentPort =
+  this.host.getConfiguredPort(); this.portFallbackFrom = undefined;`.
+- **Teste novo** (`syncController.test.ts`, mesmo describe "fallback
+  automático de porta ocupada", agora 6 testes no describe/20 no arquivo):
+  start com fallback (1400→1401) → `stop()` → `getConnectionState()` deve
+  devolver `port: 1400` (a configurada original) e `portFallbackFrom`
+  undefined, com `running: false`.
+- **Achado secundário de baixo risco, corrigido junto**: `ui/statusBarMenu.ts`
+  redeclarava sua PRÓPRIA interface `ConnectionState` (estruturalmente
+  compatível com a de `SyncController.ts`, mas duplicada, com um comentário de
+  campo desatualizado — "porta configurada em `syncteam.port`", quando na
+  verdade é a porta REAL em uso, que diverge da config durante fallback).
+  Eliminei a duplicata em vez de só corrigir o comentário: troquei a
+  `interface` local por `import type { ConnectionState } from
+  "../SyncController.js"; export type { ConnectionState };` — o `export
+  type {X} from` sozinho NÃO traz `X` para o escopo local (é só um
+  re-export), por isso precisei do `import type` separado ANTES do `export
+  type` sem `from` para o resto do arquivo (`buildStatusVisual`/
+  `buildMenuOptions`) continuar enxergando o nome. `import type` é elidido em
+  tempo de compilação, então `statusBarMenu.ts` continua sem depender de
+  `vscode` em runtime (`SyncController.ts` também não importa `vscode`) — não
+  quebrou a disciplina de "nenhum arquivo tocado por teste importa vscode".
+  `StatusBarItem.ts` e `test/statusBarMenu.test.ts` continuam importando
+  `ConnectionState` do mesmo lugar (`./statusBarMenu.js`) sem mudança, porque
+  o re-export preserva o caminho de import.
+- **Verificação real**: `npm run lint` (tsc --noEmit) limpo; `npm run test`
+  (vitest run) 211/211 (era 210, +1); `npm run build` (esbuild) gera os dois
+  bundles sem erro.
+
+## "Posse de porta" — encerrar processo que ocupa a porta configurada (2026-08-02)
+
+Item 1 do plano de 4 frentes (docs/DECISIONS.md "3ª rodada"): além do
+fallback automático que já existia (2ª rodada, port+1...), a extensão agora
+pode OFERECER encerrar o processo que ocupa a porta CONFIGURADA, com
+confirmação explícita sempre — nunca automático, nem para o "zumbi
+identificado" default.
+
+- **Módulo novo `src/sync/PortOwnership.ts`** — lockfile (grava
+  `{pid,port,startedAt}` em todo bind bem-sucedido, num dir persistente
+  passado de fora — `ExtensionContext.globalStorageUri` em produção),
+  detecção do dono de uma porta (Windows: `netstat -ano -p TCP` +
+  `tasklist /FI "PID eq N" /FO CSV /NH`; Unix: `lsof -iTCP:N -sTCP:LISTEN -t`
+  + `ps -p N -o comm=`), sondagem de handshake (`probePortSignal`) e a
+  orquestração completa (`attemptPortReclaim`).
+- **Gotcha #1 confirmado por teste real nesta máquina (Windows) antes de
+  codar** (não usei `.claude/research/` pra isso — são utilitários de SO
+  estáveis/básicos, não API Roblox/VS Code/Node sujeita a pesquisa prévia,
+  mesma régua já dada a `ws`/`esbuild`/`vitest`): `netstat -ano -p TCP` linha
+  = `Proto LocalAddr ForeignAddr State PID` (5 tokens por whitespace: `TCP
+  127.0.0.1:PORT 0.0.0.0:0 LISTENING PID`); `tasklist ... /FO CSV /NH`
+  devolve `"nome.exe","PID",...` (stdout começa com `"`) OU, se o PID não
+  existe mais, `"INFO: No tasks are running..."` (sem aspas — dá pra
+  distinguir só olhando o 1º char). **Rodar via `execFile` direto (nunca via
+  bash/`Bash` tool)** — Git Bash MANGLA `/FI` (tenta expandir como path
+  Unix, vira `C:/Program Files/Git/FI` e quebra); `child_process.execFile`
+  passa os args direto pro processo, sem esse problema.
+- **Gotcha #2 confirmado por teste real**: `process.kill(pid, 0)` (existência,
+  não mata) e `process.kill(pid)` (mata de verdade) funcionam como
+  documentado no Windows — `0` não lança se o processo existe (`ESRCH` se não
+  existe, `EPERM` se existe mas sem permissão — ainda conta como "vivo"), e
+  `process.kill(pid)` sem segundo argumento TERMINA o processo à força no
+  Windows independente do "sinal" (Windows não tem sinais POSIX de verdade).
+  Não precisei de `taskkill` externo pra matar — só pra IDENTIFICAR o nome.
+- **Gotcha #3, real, achado escrevendo o teste de `probePortSignal`**:
+  `probePortSignal` conecta como cliente `ws` na porta ocupada e **nunca
+  manda `hello`** — se mandasse, e não houvesse ninguém realmente conectado
+  do outro lado, a PRÓPRIA sonda viraria "o plugin" daquela conexão (o
+  `SyncServer` remoto só registra alguém em `this.clients` depois de validar
+  o `hello` em `handleHello`) — disparando `onClientConnected`/notificação
+  de "plugin conectado" no VS Code de quem estiver rodando aquele servidor.
+  Ficar muda funciona porque a REJEIÇÃO de 2º cliente
+  (`SyncServer.handleConnection`) é decidida no momento da conexão TCP, ANTES
+  de qualquer mensagem — não precisa mandar nada pra observar o sinal
+  `"busy"`.
+- **Gotcha #4, real, me mordeu ao testar `probePortSignal` contra um
+  `net.Server` puro de teste (simulando "porta ocupada por processo
+  não-WebSocket")**: chamar `socket.removeAllListeners()` ANTES de
+  `socket.terminate()` numa conexão `ws` ainda em handshake HTTP pendente
+  quebra tudo — `terminate()` nesse estado pode emitir um `'error'`
+  ASSÍNCRONO internamente (abort do request pendente), e SEM NENHUM listener
+  de erro conectado o Node relança isso como exceção não tratada do
+  processo, travando o teste inteiro em timeout (o `setTimeout` de
+  fallback/resolve já tinha disparado, mas o processo/test runner ficava
+  destruído pelo throw). **Fix: nunca remover os listeners** — deixar o
+  listener de `'error'` conectado para sempre; o guard `if (settled) return`
+  no topo de `finish()` absorve com segurança qualquer disparo tardio.
+- **Gotcha #5, só no test helper (não é bug de produto)**: testar essa mesma
+  sondagem contra um `net.Server` de teste "ocupando a porta" pode deixar uma
+  conexão TCP pendurada do lado do servidor de teste depois que o cliente
+  `ws` chama `terminate()` — `net.Server.close()` só chama seu callback
+  depois que TODAS as conexões existentes terminam (mesmo padrão que já
+  motivou `stopSafetyTimeoutMs` em `SyncServer.stop()`, 2026-07-20), e nem
+  sempre o SO propaga o fechamento do lado servidor a tempo. Fix (só no
+  helper de teste): rastrear (`Set<net.Socket>` num `WeakMap<net.Server,
+  Set>`) as conexões aceitas e `.destroy()` cada uma manualmente ANTES de
+  `close()`. `net.Server` (ao contrário de `http.Server`) NÃO tem
+  `closeAllConnections()` — esse método só existe em `http.Server`.
+- **Design do hook em `SyncServer.tryListen`**: `onPortOccupied` só é chamado
+  para a porta CONFIGURADA (nunca uma já de fallback) e só na 1ª tentativa —
+  novo parâmetro `hookTried` na recursão privada garante no máximo 1 chamada
+  por `start()`, mesmo que o retry (`{action:"retrySamePort"}`) esbarre em
+  EADDRINUSE de novo (cai então no fallback normal de sempre, sem loop). A
+  decisão de "o que fazer" (detectar dono, sondar, mostrar diálogo, matar)
+  fica TODA fora de `SyncServer` (em `PortOwnership.ts`/`extension.ts`) — o
+  `SyncServer` só sabe "hook disse retry ou fallback", mantendo o mesmo nível
+  de pureza/testabilidade com sockets reais que já tinha.
+- **`StartServiceResult.portReclaimed`** (novo campo, paralelo a
+  `actualPort`): mutuamente exclusivo com `actualPort` diferente da porta
+  pedida na prática (posse de porta bem-sucedida = servidor ficou na porta
+  ORIGINALMENTE pedida, o oposto de fallback) — `SyncController.doStart`
+  mostra uma mensagem distinta ("porta N estava ocupada por X — encerrado com
+  sucesso") em vez da de fallback quando presente.
+- **Testes**: 34 novos (248 no total, era 214) — `test/portOwnership.test.ts`
+  (22, cobre lockfile/detecção/sondagem/orquestração completa incluindo
+  "nunca confiar cegamente no lockfile quando o SO reporta um PID diferente
+  ouvindo"), `syncServer.test.ts` (+8: hook retry/fallback/só-porta-
+  configurada/hook-rejeita/retry-otimista-que-falha, +3 de lockfile),
+  `syncController.test.ts` (+4: mensagem de posse reclamada). `npm run lint`
+  limpo, `npm run test` 248/248 (suíte cheia rodada 2x, sem flaky), `npm run
+  build` gera os dois bundles sem erro.
+- **Não precisa de Studio real**: detecção/kill de processo + bind de porta é
+  100% lógica local, testável com vitest — nenhum `[Hipótese]` pendente de
+  Team Create nesta tarefa. Único residual: variações de locale/versão do
+  Windows ou Unix sem `lsof` não testadas — ambas já degradam para "processo
+  não identificado" sem quebrar (nunca lança).
+
+## Reentrância de start/restart/setPort durante diálogo modal bloqueado (2026-08-02)
+
+Bug real achado pelo `code-reviewer` na feature de "posse de porta" acima, não
+uma nova feature — mas com implicação de design que vale registrar para
+qualquer callback assíncrono futuro que possa ficar pendurado esperando
+input do usuário (modal, input box, etc.) no meio de um fluxo com estado
+próprio de "está rodando".
+
+- **Padrão do bug (generalizável)**: qualquer classe de controller que só usa
+  `this.running`/`this.started` (setado no FIM de uma operação assíncrona)
+  para bloquear reentrada tem um buraco: enquanto a operação está PENDENTE
+  (ainda não setou o flag de "rodando"), esse mesmo flag não bloqueia uma
+  SEGUNDA chamada concorrente. Se a operação pendente tiver dentro dela um
+  await que pode ficar bloqueado por tempo arbitrário esperando o usuário
+  (aqui: `vscode.window.showWarningMessage({modal:true})` dentro de
+  `attemptPortReclaim`/`host.confirmKill`, chamado de dentro de
+  `host.startService`), a janela de exposição deixa de ser "alguns ms de
+  event loop" e vira "o usuário pode deixar aberto por minutos" — qualquer
+  gap de reentrância que antes era teórico/improvável de ser explorado vira
+  prático. **Regra a aplicar de cor**: sempre que uma classe adicionar um
+  ponto de espera em input do usuário (modal ou não) no meio de um fluxo,
+  reverificar se o flag de "operação em andamento" já existente cobre
+  literalmente o INÍCIO da chamada (antes de qualquer side-effect), não só o
+  resultado final.
+- **Fix em `SyncController.ts`**: campo novo `startOperationInProgress`
+  (booleano), checado e liberado (via `try/finally`) em `start()`/`restart()`/
+  `setPort()` — TODOS os três, não só `start()` (o gap existia nos três,
+  porque `restart()` não tinha NENHUMA guarda de reentrada antes desta
+  correção, nem mesmo checando `running`). A checagem acontece como a
+  PRIMEIRA linha de cada método público (síncrona, antes de qualquer
+  `await`) — importante para não ter uma janela entre "checou a flag" e
+  "setou a flag" onde duas chamadas síncronas concorrentes pudessem passar
+  pela checagem antes de qualquer uma setar. `restart()`/`setPort()`
+  compartilham `restartCore()` privado (stop+doStart) que deliberadamente NÃO
+  checa a flag — os dois únicos chamadores já a seguram antes de invocá-lo;
+  checar de novo ali rejeitaria a PRÓPRIA chamada em andamento (bug fácil de
+  introduzir se algum dia refatorar isso — documentado inline no código).
+  `stop()` não precisou de nenhuma mudança: como o guard pré-existente
+  `!this.running` já impede `stop()` de fazer qualquer coisa enquanto
+  `running` ainda é `false` (que é o caso durante TODA a janela de uma
+  operação de start pendente), não havia gap ali.
+- **Mesmo padrão de mensagem de `refreshInProgress`** (`extension.ts`,
+  `runRefreshSync`) — reaproveitado, não reinventado: rejeita com
+  `host.info`/`showInformationMessage` claro, nunca enfileira, nunca permite
+  paralelo.
+- **Técnica de teste para simular um `host.startService` "pendurado" igual a
+  um modal bloqueado**: reatribuir `host.startService` (método de instância
+  de uma classe TS comum — sobrescrever funciona normalmente, cria uma own
+  property que sombra o método do protótipo) para retornar uma Promise cujo
+  `resolve` é capturado numa variável externa, permitindo ao teste chamar
+  `controller.start()` (não aguardado ainda), disparar uma SEGUNDA chamada
+  concorrente e só DEPOIS resolver a primeira manualmente. Sem essa técnica
+  não dá pra testar reentrância de forma determinística sem `setTimeout`
+  real. Ver `test/syncController.test.ts`, describe "reentrância durante
+  start/restart/setPort pendente" (5 testes: start↔start, start↔restart,
+  start↔setPort, restart↔restart, autostart-silencioso↔start-explícito).
+- **Verificação**: `npm run lint` (tsc) limpo, `npm test` 253/253 (era 248,
+  +5), `npm run build` gera os dois bundles. Documentado em
+  `docs/DECISIONS.md` (continuação de "3ª rodada" §1) e
+  `docs/PROJECT_STATUS.md`. **Não testado em VS Code real** (mesma limitação
+  de sempre para `SyncController` — nenhum teste toca `vscode`).
+
+## Correção do sinal `"busy"` em "posse de porta": nunca tratar sinal indireto como certeza absoluta (2026-08-02)
+
+Pedido direto do usuário revertendo parte da heurística da feature "posse de
+porta" acima, no mesmo dia. Registrar de cor para qualquer heurística futura
+de "sinal forte o suficiente pra pular confirmação": **nenhum sinal indireto
+de "outro processo está vivo/ativo agora", obtido por sondagem/protocolo
+atravessando rede/outro processo, é certeza absoluta o bastante para pular
+`host.confirmKill` — só o usuário decide, sempre; o que varia é só a força do
+texto do diálogo.**
+
+- **O que existia**: `attemptPortReclaim` tratava `probeSignal === "busy"` (o
+  `SyncServer` remoto respondeu `connectionRejected`/`port_in_use` — prova de
+  que HÁ um cliente registrado agora) como short-circuit definitivo para
+  `{action:"fallback"}`, nunca chamando `findOwner`/`readLock`/
+  `host.confirmKill`. Meu raciocínio original: "prova definitiva, nunca
+  arriscar matar sessão de colega".
+- **Por que estava errado**: `"busy"` prova que o SERVIDOR REMOTO acredita
+  ter um cliente registrado — não prova que esse cliente ainda existe de
+  verdade agora. Cenário real que o usuário apontou: o Studio do colega
+  crasha/fecha, mas o `HeartbeatMonitor` do lado do servidor remoto (extensão
+  dele) só detecta a queda depois do timeout (~15s, 3x o intervalo de ping,
+  ver entrada "Heartbeat WS ping/pong" acima). Durante essa janela, uma sonda
+  `probePortSignal` honestamente observa `"busy"` porque o servidor remoto,
+  no seu próprio estado interno, ainda tem um socket "conectado" — mesmo que
+  o processo do outro lado (Studio) já não exista. Tratar isso como certeza
+  absoluta negava ao usuário a chance de recuperar a porta numa trava real.
+- **Fix**: `"busy"` agora participa do MESMO fluxo de identificação
+  (`findOwner`/`readLock`, chamados normalmente — antes nem eram chamados) e
+  SEMPRE mostra o diálogo quando um PID é identificável, com a mensagem mais
+  forte de todas as variantes (mais forte que `"respondsWs"` sem
+  identificação). Checado ANTES de `isOwnOrphan` na escolha da mensagem —
+  mesmo que o lockfile também bata com o PID detectado, a evidência de
+  "sessão ativa agora" pesa mais e usa sua própria mensagem (mais forte), não
+  a de "zumbi amigável". Se nenhum PID for identificável (`findOwner`/
+  lockfile vazios), comportamento idêntico aos outros sinais: fallback sem
+  diálogo (nada concreto pra oferecer).
+- **`host.confirmKill` continua sendo a ÚNICA porta pra `killProcess` rodar**
+  — isso nunca mudou, em nenhuma versão desta feature. O que mudou foi só
+  "quando o diálogo aparece", nunca "se pode matar sem confirmação".
+- **O que NÃO mudou**: a restrição de timing (o diálogo nunca dispara
+  enquanto uma tentativa de conexão legítima do plugin Studio estiver em
+  andamento naquela porta) — isso é questão do timing do próprio bind
+  (`SyncServer.tryListen`/`onPortOccupied`, só a 1ª tentativa da porta
+  configurada), não do sinal `"busy"` em si.
+- **Teste**: o teste único que afirmava `confirmCalls === 0` pro caso "busy"
+  foi substituído por 4 testes (`test/portOwnership.test.ts`, describe
+  "attemptPortReclaim"): recusa (fallback, mensagem contém "CONECTADA AGORA"/
+  "MUITO PROVÁVEL"/"PERDA DE TRABALHO NÃO SALVO"), confirmação (mata,
+  `retrySamePort`), sem PID identificável (fallback sem diálogo), e "busy"
+  prevalecendo sobre "zumbi identificado" mesmo com lockfile batendo (mensagem
+  de "busy", não a de zumbi). 256 no total (era 253).
+- **Verificação**: `npm run lint` (tsc) limpo, `npm test` 256/256, `npm run
+  build` gera os dois bundles. Documentado em `docs/DECISIONS.md`
+  (continuação de "3ª rodada" §1, bloco "Correção do sinal `busy`") e
+  `docs/PROJECT_STATUS.md`. Sem `[Hipótese]` nova de Team Create — mudança é
+  100% lógica local.
+- **Generalização pra memória futura**: qualquer sinal de "processo do outro
+  lado está X" obtido por sondagem/protocolo (não por confirmação direta do
+  usuário) carrega uma janela de staleness implícita — o que ele prova é "o
+  que o outro lado ACHA que é verdade agora", não "o que é verdade agora".
+  Só decidir sozinho (sem perguntar) faz sentido quando a ação é reversível E
+  o sinal é uma prova de fato PURAMENTE LOCAL (ex.: `process.kill(pid, 0)`
+  prova existência de PID local, sem rede/timing de outro processo
+  envolvido) — qualquer sinal que atravessa rede/outro processo/outro
+  relógio (heartbeat, handshake remoto, etc.) é heurística, nunca certeza,
+  para efeito de decidir SEM perguntar ao usuário.

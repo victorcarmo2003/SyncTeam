@@ -2718,7 +2718,24 @@ local function checkSourceChanged(instance, via)
 		return
 	end
 	local uuid = ScriptRegistry.getUuid(instance)
-	if sendMessage ~= nil then
+	-- Bug real reportado pelo usuário (2026-08-03, docs/DECISIONS.md): digitar
+	-- rápido no VS Code + Ctrl+S fazia o arquivo "desfazer e reconstruir" ao
+	-- longo de vários segundos. Causa raiz: `sendMessage` não tem roteamento
+	-- por conexão (produto usa 1 conexão só) — toda escrita que o PRÓPRIO
+	-- plugin faz por causa de um writeSource vindo da extensão (inclusive o
+	-- pulse de buffer a cada ~150ms) ecoava de volta pro MESMO cliente que
+	-- causou a escrita. A extensão não distingue esse eco de uma mudança
+	-- genuína vinda de outro Studio via Team Create, e sua fila FIFO podia
+	-- processar o eco DEPOIS que o contentCache já tinha avançado para um
+	-- pulso mais novo, reescrevendo disco/buffer com conteúdo velho — repetido
+	-- a cada eco atrasado, dando exatamente a aparência de revert/replay.
+	-- origin=="plugin" (writeSource desta MESMA instância há <1s) é
+	-- exatamente esse eco: suprime só o envio, nunca o dedupe acima
+	-- (lastSourceByInstance já foi atualizado) nem o Logger.debug abaixo.
+	-- writeAck (init.server.luau) já confirma a escrita para quem pediu, e
+	-- refreshSync (reconciliação 3-way) continua como rede de segurança para
+	-- qualquer deriva de normalização que UpdateSourceAsync introduza sem eco.
+	if origin ~= "plugin" and sendMessage ~= nil then
 		sendMessage({
 			kind = "sourceChanged",
 			uuid = uuid,

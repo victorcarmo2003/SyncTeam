@@ -132,6 +132,45 @@ export class SyncTeamService {
   // frequência (presença/cursor) sem nenhum ganho de correção.
   private queueTail: Promise<void> = Promise.resolve();
 
+  // Coalescência de pulses de buffer por path (bug real reportado
+  // 2026-08-04 — ver .claude/agent-memory/extension-dev.md e
+  // docs/DECISIONS.md mesma data: "fila FIFO sem coalescência para pulses de
+  // buffer"). O throttle de AGENDAMENTO em extension.ts::scheduleBufferPulse
+  // (150ms) só limita a FREQUÊNCIA com que um novo `setTimeout` é agendado —
+  // NÃO limita quantas tarefas de buffer pulse ficam pendentes/em voo na
+  // fila FIFO global (`enqueueMutation`/`queueTail`). Cada pulse de
+  // digitação vira um `writeSource` com round-trip REAL até o plugin
+  // (WS -> Luau -> UpdateSourceAsync -> ack); se esse round-trip demora mais
+  // que o intervalo entre pulses (bem provável durante digitação contínua),
+  // pulses se acumulam na fila MAIS RÁPIDO do que ela drena — um backlog sem
+  // limite superior, cada item pagando um round-trip completo, mesmo que o
+  // conteúdo de vários pulses intermediários já tenha sido superado por um
+  // pulse mais recente antes de sequer começar a rodar. Medido ao vivo nesta
+  // tarefa: 12 pulses rápidos do MESMO path sem esta coalescência geravam 11
+  // `writeSource` reais sequenciais (não 2) — ver teste
+  // "SyncTeamService.notifyBufferChange — coalescência de pulses do MESMO
+  // path" em test/syncTeamService.test.ts.
+  //
+  // Padrão "latest-wins, no máximo 1 em voo + 1 pendente" por path:
+  // `bufferPulseInFlight` marca (na hora em que a tarefa é ENFILEIRADA, não
+  // quando ela começa a RODAR — a fila pode ter outras tarefas na frente)
+  // que já existe uma tarefa de buffer-pulse deste path em algum estágio
+  // (enfileirada ou executando) até ela terminar. Enquanto isso, uma
+  // chamada nova a `notifyBufferChange` para o MESMO path não enfileira
+  // outra tarefa — só substitui `bufferPulsePendingContent` pelo conteúdo
+  // mais recente (Map com no máximo 1 entrada por path, nunca uma fila
+  // própria). Quando a tarefa em voo termina, se sobrou um conteúdo
+  // pendente, UMA ÚNICA tarefa nova é disparada com esse conteúdo (o mais
+  // recente visto até aquele momento) — nunca uma por pulse perdido no
+  // meio. Isso NÃO reintroduz a race condition que motivou a fila FIFO
+  // (bug de 2026-07-27, ver comentário de `queueTail` acima): cada disparo
+  // (imediato ou "pendente") continua passando por `enqueueMutation`, então
+  // a ORDEM relativa a outras mutações (save, mensagens espontâneas do
+  // Studio, sincronização inicial) continua sendo FIFO estrita — só pulses
+  // de buffer do MESMO path se coalescem entre si.
+  private readonly bufferPulseInFlight = new Set<string>();
+  private readonly bufferPulsePendingContent = new Map<string, string>();
+
   // Genérico desde 2026-08-02 (ReSync): `resyncFromScratch` precisa devolver
   // `deletedCount` (número) para quem chamou, diferente das demais mutações
   // enfileiradas até então (todas `Promise<void>`, valor descartado). `T`
@@ -681,10 +720,38 @@ export class SyncTeamService {
    * nos mesmos mapas compartilhados do `SyncBridge`, então uma pulsação de
    * buffer concorrente com uma rajada de mensagens do Studio (ou com o
    * próprio save) tem o mesmo tipo de corrida.
+   *
+   * Coalescência por path (2026-08-04, ver comentário de
+   * `bufferPulseInFlight`/`bufferPulsePendingContent` acima): se já existe
+   * uma tarefa de buffer-pulse para ESTE `relDiskPath` enfileirada/em
+   * execução, esta chamada NÃO enfileira outra — só atualiza o conteúdo
+   * pendente, que será disparado (uma única vez) assim que a tarefa em voo
+   * terminar. Isso é o que impede o backlog sem limite: sem isso, digitação
+   * contínua mais rápida que o round-trip ao Studio enfileirava um
+   * `writeSource` por pulse, sem nunca coalescer.
    */
   notifyBufferChange(relDiskPath: string, content: string): void {
-    this.enqueueMutation(() => this.bridge.handleBufferContentChange(relDiskPath, content, this.transport)).catch((error: Error) => {
-      this.logger.error(`buffer → Studio: erro processando mudança de buffer '${relDiskPath}': ${error.message}`);
-    });
+    if (this.bufferPulseInFlight.has(relDiskPath)) {
+      this.bufferPulsePendingContent.set(relDiskPath, content);
+      return;
+    }
+    this.dispatchBufferPulse(relDiskPath, content);
+  }
+
+  /** Dispara de fato uma tarefa de buffer-pulse (imediata ou o "pendente" acumulado) — sempre via a mesma fila FIFO de sempre. */
+  private dispatchBufferPulse(relDiskPath: string, content: string): void {
+    this.bufferPulseInFlight.add(relDiskPath);
+    this.enqueueMutation(() => this.bridge.handleBufferContentChange(relDiskPath, content, this.transport))
+      .catch((error: Error) => {
+        this.logger.error(`buffer → Studio: erro processando mudança de buffer '${relDiskPath}': ${error.message}`);
+      })
+      .finally(() => {
+        this.bufferPulseInFlight.delete(relDiskPath);
+        const pending = this.bufferPulsePendingContent.get(relDiskPath);
+        if (pending !== undefined) {
+          this.bufferPulsePendingContent.delete(relDiskPath);
+          this.dispatchBufferPulse(relDiskPath, pending);
+        }
+      });
   }
 }

@@ -205,5 +205,16 @@ export async function runStartCommand(opts: StartCommandOptions): Promise<StartC
     logger.info(`SyncTeam iniciado em segundo plano (PID ${childPid}), porta ${confirmedPort}. Log: "${paths.daemonLogFile}".`);
   }
 
+  // Achado real (2026-08-03, DECISIONS.md): este daemon escreve em disco via
+  // node:fs puro (NodeDiskIO), não pela API do VS Code (vscode.workspace.fs,
+  // usada pela extensão) — se o mesmo projeto estiver aberto e sendo editado
+  // numa janela do VS Code AO MESMO TEMPO, o VS Code não sabe que o arquivo
+  // mudou e recusa salvar depois ("The content of the file is newer").
+  logger.info(
+    `Aviso: não use "syncteam start" ao mesmo tempo que a extensão VS Code está ` +
+      `sincronizando esta MESMA pasta num editor aberto — escolha um dos dois. ` +
+      `"start" é pra rodar sem VS Code aberto neste projeto (CI, outro editor).`,
+  );
+
   return { ok: true, pid: childPid, port: confirmedPort ?? resolvedPort };
 }
