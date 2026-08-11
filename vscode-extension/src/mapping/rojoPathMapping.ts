@@ -138,7 +138,7 @@ export function computeLayout(entries: LayoutInputEntry[]): LayoutOutputEntry[] 
  * Interpreta um caminho relativo em disco (separador "/" ou "\") de volta
  * para `{instancePath, className, isInit}`, ou `null` se `relativeDiskPath`
  * não corresponder a nenhum padrão reconhecido da convenção Rojo (extensão
- * ausente/errada, ou arquivo `init.*` na raiz sem pasta pai).
+ * ausente/errada).
  *
  * Aceita tanto `.luau` quanto `.lua` como extensão válida na entrada (só a
  * escrita em disco feita por `computeLayout` é sempre `.luau`).
@@ -165,9 +165,15 @@ export function parseDiskPath(relativeDiskPath: string): ParsedDiskPath | null {
   if (match.base === "init") {
     const parentSegments = segments.slice(0, -1);
     if (parentSegments.length === 0) {
-      // init.* direto na raiz: não há pasta pai para ser a instância dona
-      // deste Source, então não é um caminho reconhecível.
-      return null;
+      // init.* direto na raiz (sem pasta pai): instancePath "" significa que
+      // este init.* representa o próprio contêiner ao qual este caminho está
+      // anexado (ex.: a raiz de um mount nomeado) — não que não haja dono, só
+      // que o dono não é determinável a partir deste path isolado. Quem chama
+      // com contexto de mount (ex.: resolveDataModelPathForDiskChange) sabe
+      // resolver isso para `mount.dataModelPath`; quem usa isso sem mount
+      // nenhum trata `instancePath: ""` como "a raiz do que quer que
+      // estejamos processando".
+      return { instancePath: "", className, isInit: true };
     }
     return { instancePath: parentSegments.join("/"), className, isInit: true };
   }

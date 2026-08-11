@@ -272,6 +272,23 @@ describe("resolveDataModelPathForDiskChange (disco -> DataModel)", () => {
     expect(resolveDataModelPathForDiskChange("src/server/notes.txt", mountPoints)).toBeNull();
   });
 
+  test("init.*.luau na raiz exata de um mount nomeado resolve pro próprio mount (bug real, projeto Towers)", () => {
+    const mounts: MountPoint[] = [
+      { dataModelPath: "ServerScriptService/Server", diskPath: "src/server" },
+      { dataModelPath: "StarterPlayer/StarterPlayerScripts/Client", diskPath: "src/client" },
+    ];
+    expect(resolveDataModelPathForDiskChange("src/server/init.server.luau", mounts)).toEqual({
+      dataModelPath: "ServerScriptService/Server",
+      className: "Script",
+      isInit: true,
+    });
+    expect(resolveDataModelPathForDiskChange("src/client/init.client.luau", mounts)).toEqual({
+      dataModelPath: "StarterPlayer/StarterPlayerScripts/Client",
+      className: "LocalScript",
+      isInit: true,
+    });
+  });
+
   test("round-trip: computeFullLayout -> resolveDataModelPathForDiskChange volta ao original", () => {
     const entries = [
       { path: "ServerScriptService/Server/Main", className: "Script" as const },

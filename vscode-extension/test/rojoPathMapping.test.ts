@@ -149,8 +149,13 @@ describe("parseDiskPath", () => {
   test("retorna null para caminhos que não seguem a convenção", () => {
     expect(parseDiskPath("Foo.txt")).toBeNull();
     expect(parseDiskPath("Foo")).toBeNull();
-    expect(parseDiskPath("init.luau")).toBeNull(); // init na raiz, sem pasta pai
     expect(parseDiskPath("")).toBeNull();
     expect(parseDiskPath(".luau")).toBeNull(); // nome-base vazio
+  });
+
+  test("init.*.luau na raiz (sem pasta pai) resolve pro próprio contêiner (instancePath vazio)", () => {
+    expect(parseDiskPath("init.luau")).toEqual({ instancePath: "", className: "ModuleScript", isInit: true });
+    expect(parseDiskPath("init.server.luau")).toEqual({ instancePath: "", className: "Script", isInit: true });
+    expect(parseDiskPath("init.client.luau")).toEqual({ instancePath: "", className: "LocalScript", isInit: true });
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "syncteam-cli",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "CLI standalone do SyncTeam (instala o plugin de Roblox Studio, entre outros comandos futuros), distribuído via Rokit.",
   "type": "module",
