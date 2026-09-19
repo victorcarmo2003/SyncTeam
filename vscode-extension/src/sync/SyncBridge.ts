@@ -752,7 +752,6 @@ export class SyncBridge {
       return;
     }
     const { dataModelPath, className } = resolved;
-    this.contentCache.set(key, content);
 
     this.logger.info(`disco → Studio: '${relDiskPath}' (${dataModelPath}, ${className}) é novo, enviando writeSource (criar)`);
     try {
@@ -770,6 +769,18 @@ export class SyncBridge {
       }
       this.scripts.set(newUuid, { path: dataModelPath, className });
       this.sourceCache.set(newUuid, content);
+      // Só AGORA, com o ack de sucesso na mão. O contentCache significa "este
+      // conteúdo ja foi sincronizado para este path"; gravá-lo antes do envio
+      // torna a frase falsa sempre que o envio falha — e a mentira e
+      // permanente, porque a proxima tentativa (watcher, ou o
+      // reconcileDiskOnlyFiles do Refresh Sync) bate no early-return de "eco
+      // de escrita que a propria ponte ja fez" e desiste em silencio.
+      //
+      // Medido: arquivo criado com o plugin desconectado ficava invisivel
+      // para sempre. O Refresh Sync subia um arquivo solto nunca tentado e
+      // pulava o que ja tinha falhado uma vez, sem nenhuma diferenca aparente
+      // entre os dois.
+      this.contentCache.set(key, content);
       this.registerDiskPath(newUuid, relDiskPath);
       this.logger.info(`disco → Studio: '${relDiskPath}' criado no Studio como uuid '${newUuid}' (api=${String(ack.api)})`);
       // Efeito colateral possível: este path novo pode fazer um ancestral já
