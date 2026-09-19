@@ -692,6 +692,23 @@ export class SyncBridge {
         return;
       }
     } else if (resolveDataModelPathForDiskChange(relDiskPath, this.mountPoints) === null) {
+      // Antes de desistir: o evento pode ser a remoção de uma PASTA, e não de
+      // um arquivo. `Foo/` não termina em `.luau`, então não passa pela
+      // convenção Rojo, e o uuid está registrado em `Foo/init.luau` — não em
+      // `Foo`. Pelos dois motivos o path cai aqui e a remoção morria em
+      // silêncio.
+      //
+      // Isso pega em cheio quem organiza módulo como pasta (script + irmãos),
+      // que é o caso do Modux: apagar, renomear ou mover um módulo nunca
+      // chegava ao Studio, e o script ficava órfão lá. Medido em
+      // spikes/bancada-gestos: 3 deleteScript no log inteiro, todos de arquivo
+      // solto, zero de pasta.
+      if (await this.handleLocalDirectoryRemoved(relDiskPath, transport)) {
+        return;
+      }
+      if (await this.handleLocalDirectoryAdded(relDiskPath, transport)) {
+        return;
+      }
       this.logger.info(
         `'${relDiskPath}' fora de qualquer ponto de montagem ou não segue a convenção de nomenclatura Rojo — ignorado (sem leitura de disco)`,
       );
@@ -773,6 +790,100 @@ export class SyncBridge {
    * mesma exclusão de pastas de pacotes Wally que o modo "atualizar" respeita
    * (`isInsideExcludedPackageFolder`).
    */
+  /**
+   * Aparição de uma PASTA: propaga a criação de todo script que veio dentro.
+   *
+   * Metade espelhada de `handleLocalDirectoryRemoved`, e pelo mesmo motivo: o
+   * watcher entrega um evento com o path da PASTA, não um por arquivo que
+   * chegou junto. Mover ou renomear uma pasta no explorer, colar uma feature
+   * inteira vinda de outro projeto, ou um `git checkout` que materializa um
+   * diretório — em todos, os arquivos aparecem de uma vez e nenhum evento
+   * individual chega.
+   *
+   * Sem isto, renomear um módulo apagava o antigo no Studio e nunca criava o
+   * novo: o código continuava no disco e sumia do jogo. Medido em
+   * spikes/bancada-gestos, onde `client/EpsilonNovo/` sobrava no disco sem
+   * nenhum writeSource correspondente.
+   *
+   * Cada arquivo encontrado volta por `handleLocalFileChange`, que é quem já
+   * sabe filtrar convenção Rojo, pasta de pacotes Wally e eco de escrita
+   * própria — aqui não se decide nada disso de novo.
+   *
+   * Devolve `true` quando a pasta existia e tinha algo dentro.
+   */
+  private async handleLocalDirectoryAdded(relDiskPath: string, transport: Transport): Promise<boolean> {
+    let dentro: string[];
+    try {
+      dentro = await this.diskIO.listFiles(relDiskPath);
+    } catch (error) {
+      this.logger.error(`erro listando '${relDiskPath}': ${(error as Error).message}`);
+      return false;
+    }
+    if (dentro.length === 0) {
+      return false;
+    }
+
+    this.logger.info(`disco → Studio: '${relDiskPath}' é pasta com ${dentro.length} arquivo(s) — propagando cada um`);
+    for (const arquivo of dentro) {
+      // Só o que ainda não é conhecido OU mudou; `handleLocalFileChange`
+      // resolve as duas coisas e é idempotente para o resto.
+      await this.handleLocalFileChange(arquivo, transport);
+    }
+    return true;
+  }
+
+  /**
+   * Remoção de uma PASTA: propaga o sumiço de todo script que morava dentro.
+   *
+   * O watcher entrega um evento com o path da pasta (`src/server/Foo`), não um
+   * evento por arquivo que estava lá dentro. Como nenhum uuid está registrado
+   * NA pasta — eles estão em `src/server/Foo/init.luau`, `.../Type.luau` — o
+   * caminho normal não acha nada e desiste.
+   *
+   * Aqui a busca é por prefixo: todo diskPath conhecido que começa com
+   * `pasta/` é candidato. Só propaga o que de fato sumiu do disco, conferindo
+   * arquivo por arquivo — um evento de pasta também chega quando algo mudou
+   * lá dentro sem a pasta ter ido embora, e apagar no Studio por causa disso
+   * seria destruir código de verdade.
+   *
+   * Rename e move de pasta caem aqui também, como delete(antigo) seguido de
+   * create(novo). Continua sem correlacionar os dois — o uuid antigo morre e
+   * um novo nasce —, que é a mesma limitação já aceita para rename de arquivo.
+   *
+   * Devolve `true` quando reconheceu o path como pasta conhecida (mesmo que
+   * nada tenha sumido), para quem chama não registrar "ignorado" em cima.
+   */
+  private async handleLocalDirectoryRemoved(relDiskPath: string, transport: Transport): Promise<boolean> {
+    const prefixo = `${contentCacheKey(relDiskPath)}/`;
+    const dentro = [...this.uuidByDiskPath.entries()].filter(([diskKey]) => diskKey.startsWith(prefixo));
+    if (dentro.length === 0) {
+      return false;
+    }
+
+    this.logger.info(
+      `disco → Studio: '${relDiskPath}' é pasta de ${dentro.length} script(s) conhecido(s) — conferindo quais sumiram`,
+    );
+
+    for (const [, uuid] of dentro) {
+      const diskPath = this.diskPathByUuid.get(uuid);
+      if (diskPath === undefined) {
+        continue;
+      }
+      let ainda: string | null;
+      try {
+        ainda = await this.diskIO.readFile(diskPath);
+      } catch (error) {
+        this.logger.error(`erro conferindo '${diskPath}' ao remover a pasta '${relDiskPath}': ${(error as Error).message}`);
+        continue;
+      }
+      if (ainda !== null) {
+        continue; // o arquivo continua lá; a pasta não foi embora inteira
+      }
+      await this.handleLocalFileRemoved(diskPath, contentCacheKey(diskPath), transport);
+    }
+    return true;
+  }
+
   private async handleLocalFileRemoved(relDiskPath: string, key: string, transport: Transport): Promise<void> {
     const knownUuid = this.uuidByDiskPath.get(key);
     if (knownUuid === undefined) {
