@@ -33,6 +33,43 @@ function getFreePort(): Promise<number> {
   });
 }
 
+/**
+ * Uma porta livre com as `seguintes` logo depois TAMBEM ligaveis.
+ *
+ * `getFreePort` pede uma efemera ao SO e devolve so aquela. Os dois testes de
+ * fallback dependem de `port + 1` (e `+ 2`) responderem, o que ninguem
+ * garantiu. No Windows uma porta alta pode recusar com EACCES, nao
+ * EADDRINUSE, por reserva do sistema — e nesta maquina a faixa efemera comeca
+ * em 1024 (`netsh int ipv4 show dynamicport tcp`), entao o sorteio cai em
+ * qualquer lugar.
+ *
+ * Medido: com os arquivos ja serializados (ver vitest.config.mts), 3 falhas em
+ * 25 execucoes, todas EACCES em `port + 1` ou `port + 2`, so nestes dois
+ * testes.
+ *
+ * Aqui o bloco inteiro e confirmado ligavel antes de ser devolvido.
+ */
+async function getFreePortBlock(seguintes: number): Promise<number> {
+  for (let tentativa = 0; tentativa < 40; tentativa++) {
+    const base = await getFreePort();
+    const abertos: net.Server[] = [];
+    let serve = true;
+    for (let i = 0; i <= seguintes; i++) {
+      try {
+        abertos.push(await occupyPort(base + i));
+      } catch {
+        serve = false;
+        break;
+      }
+    }
+    await Promise.all(abertos.map((srv) => closeServer(srv)));
+    if (serve) {
+      return base;
+    }
+  }
+  throw new Error(`nao achei ${seguintes + 1} portas consecutivas ligaveis em 40 tentativas`);
+}
+
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 function waitFor(condition: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -468,7 +505,7 @@ describe("SyncServer — multiSync", () => {
 // reais em vez de fakes).
 describe("SyncServer — fallback de porta ocupada", () => {
   test("porta configurada ocupada: cai para a próxima porta livre, reporta getActualPort() correto e loga com clareza", async () => {
-    const port = await getFreePort();
+    const port = await getFreePortBlock(1);
     const occupier = await occupyPort(port);
     const logger = new CapturingLogger();
     const server = new SyncServer(port, logger);
@@ -498,7 +535,7 @@ describe("SyncServer — fallback de porta ocupada", () => {
   });
 
   test("todas as tentativas de fallback esgotadas: rejeita com EADDRINUSE, sem matar nenhum processo", async () => {
-    const port = await getFreePort();
+    const port = await getFreePortBlock(2);
     const occupiers = [await occupyPort(port), await occupyPort(port + 1), await occupyPort(port + 2)];
     const logger = new CapturingLogger();
     // portFallbackAttempts=2 -> tenta port, port+1, port+2 (3 no total) — todas ocupadas.
