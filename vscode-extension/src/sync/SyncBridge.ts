@@ -580,12 +580,23 @@ export class SyncBridge {
       return;
     }
 
-    this.contentCache.set(key, content);
-    this.sourceCache.set(knownUuid, content);
     this.logger.info(`${logPrefix}: '${relDiskPath}' (uuid '${knownUuid}') mudou, enviando writeSource (atualizar)`);
     try {
       const ack = await transport.request({ kind: "writeSource", uuid: knownUuid, source: content });
       if (ack.ok) {
+        // Os dois caches so DEPOIS do ack, pelo mesmo motivo do caminho de
+        // criacao: `contentCache` afirma "este conteudo ja foi sincronizado
+        // para este path" e `sourceCache` e a linha de base que o merge de 3
+        // vias do refreshSync usa como ancestral. Grava-los antes do envio
+        // torna as duas frases falsas quando o envio falha.
+        //
+        // Aqui doi mais que na criacao, porque atinge toda EDICAO: um envio
+        // que falha uma vez (plugin caiu por um instante, ack de erro) deixa
+        // aquele conteudo exato impossivel de reenviar — a proxima passada
+        // bate no early-return de eco e desiste calada —, e ainda faz o
+        // refreshSync comparar contra um ancestral que o Studio nunca teve.
+        this.contentCache.set(key, content);
+        this.sourceCache.set(knownUuid, content);
         this.logger.info(`${logPrefix}: '${relDiskPath}' aplicado no Studio (api=${String(ack.api)})`);
       } else {
         const errorMsg = String(ack.error ?? "motivo desconhecido");
