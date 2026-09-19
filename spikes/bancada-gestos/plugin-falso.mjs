@@ -10,7 +10,12 @@
 // desta bancada (o que a extensao decide quando uma pasta some por move e o
 // que ela decide quando some por unlink).
 //
-// Uso:  node plugin-falso.mjs <porta> <arquivo-de-saida>
+// Uso:  node plugin-falso.mjs <porta> <saida.jsonl> [estado.json]
+//
+// Com `estado.json` o "Studio" LEMBRA os scripts entre execucoes, que e o que
+// acontece de verdade quando o plugin cai e volta na mesma place. Sem ele,
+// cada conexao e um Studio que esqueceu tudo — tambem um caso real (place
+// recem-aberta, uuids realocados) e o suspeito numero um da duplicata.
 // `ws` vem da extensao, que ja o tem. Instalar uma segunda copia so para a
 // bancada arriscaria versao diferente da que o servidor usa.
 import { createRequire } from "node:module";
@@ -32,8 +37,24 @@ const registrar = (direcao, msg) => {
 
 // O que o Studio "tem". A bancada comeca vazia de proposito: o que aparecer
 // aqui foi a extensao que mandou criar, e e isso que se quer medir.
+const arquivoEstado = process.argv[4] ?? null;
 const scripts = new Map(); // uuid -> { path, className, source }
 let proximoUuid = 1;
+
+if (arquivoEstado && fs.existsSync(arquivoEstado)) {
+	const guardado = JSON.parse(fs.readFileSync(arquivoEstado, "utf8"));
+	for (const [uuid, s] of Object.entries(guardado.scripts ?? {})) scripts.set(uuid, s);
+	proximoUuid = guardado.proximoUuid ?? 1;
+	console.log(`[bancada] estado carregado: ${scripts.size} script(s)`);
+}
+
+const salvar = () => {
+	if (!arquivoEstado) return;
+	fs.writeFileSync(
+		arquivoEstado,
+		JSON.stringify({ scripts: Object.fromEntries(scripts), proximoUuid }, null, 2),
+	);
+};
 
 const ws = new WebSocket(`ws://127.0.0.1:${porta}`);
 
@@ -106,14 +127,29 @@ ws.on("message", (bruto) => {
 				});
 			} else {
 				const s = scripts.get(uuid);
-				if (s) s.source = msg.source ?? s.source;
+				if (s) {
+					s.source = msg.source ?? s.source;
+				} else {
+					// Update para um uuid que este "Studio" nao conhece. Acontece
+					// quando a extensao guardou o mapeamento path->uuid de uma
+					// sessao anterior e o plugin voltou sem ele. Descartar aqui
+					// fazia a bancada mentir: o script existia do lado da
+					// extensao e nunca aparecia no estado do plugin.
+					scripts.set(uuid, {
+						path: msg.path ?? "(sem path)",
+						className: msg.className ?? "ModuleScript",
+						source: msg.source ?? "",
+					});
+				}
 			}
+			salvar();
 			responder({ kind: "writeAck", requestId: msg.requestId, uuid, ok: true });
 			break;
 		}
 
 		case "deleteScript":
 			scripts.delete(msg.uuid);
+			salvar();
 			responder({ kind: "writeAck", requestId: msg.requestId, uuid: msg.uuid, ok: true });
 			break;
 

@@ -3,3 +3,8 @@ obs*.jsonl
 .lixeira/
 projeto/src/server/
 projeto/src/client/
+.estado*.json
+.est*.json
+.plugin.log
+.rec*.jsonl
+.a*.jsonl
