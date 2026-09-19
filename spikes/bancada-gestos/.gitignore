@@ -1,0 +1,5 @@
+observado.jsonl
+obs*.jsonl
+.lixeira/
+projeto/src/server/
+projeto/src/client/
