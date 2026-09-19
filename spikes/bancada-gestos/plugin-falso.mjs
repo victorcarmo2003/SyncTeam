@@ -10,7 +10,13 @@
 // desta bancada (o que a extensao decide quando uma pasta some por move e o
 // que ela decide quando some por unlink).
 //
-// Uso:  node plugin-falso.mjs <porta> <saida.jsonl> [estado.json]
+// Uso:  node plugin-falso.mjs <porta> <saida.jsonl> [estado.json] [comandos.jsonl]
+//
+// Com `comandos.jsonl` o plugin falso tambem EMITE: cada linha acrescentada
+// ao arquivo e uma mensagem mandada para a extensao tal como esta. E assim
+// que a bancada exercita o sentido Studio -> disco (sourceChanged,
+// scriptAdded, scriptRemoved, scriptMoved) sem Studio aberto e sem ninguem
+// digitando.
 //
 // Com `estado.json` o "Studio" LEMBRA os scripts entre execucoes, que e o que
 // acontece de verdade quando o plugin cai e volta na mesma place. Sem ele,
@@ -38,6 +44,7 @@ const registrar = (direcao, msg) => {
 // O que o Studio "tem". A bancada comeca vazia de proposito: o que aparecer
 // aqui foi a extensao que mandou criar, e e isso que se quer medir.
 const arquivoEstado = process.argv[4] ?? null;
+const arquivoComandos = process.argv[5] ?? null;
 const scripts = new Map(); // uuid -> { path, className, source }
 let proximoUuid = 1;
 
@@ -170,6 +177,54 @@ ws.on("message", (bruto) => {
 			break;
 	}
 });
+
+// Le o arquivo de comandos por polling e manda cada linha nova. Polling, e
+// nao watch, de proposito: o teste escreve com `>>` de shell e um watch de fs
+// no Windows perde append pequeno com frequencia — aqui atraso de 200ms nao
+// atrapalha e nao perder nenhuma linha importa.
+if (arquivoComandos) {
+	fs.writeFileSync(arquivoComandos, "");
+	let lidas = 0;
+	setInterval(() => {
+		let linhas;
+		try {
+			const bruto = fs.readFileSync(arquivoComandos, "utf8");
+			linhas = bruto.split(String.fromCharCode(10)).map((x) => x.trim()).filter(Boolean);
+		} catch {
+			return;
+		}
+		while (lidas < linhas.length) {
+			const bruta = linhas[lidas++];
+			let msg;
+			try {
+				msg = JSON.parse(bruta);
+			} catch {
+				console.error("[bancada] comando invalido:", bruta.slice(0, 120));
+				continue;
+			}
+			// Mantem o "Studio" coerente com o que ele diz ter feito, senao o
+			// listScripts da proxima conexao contradiz os eventos emitidos.
+			if (msg.kind === "scriptAdded") {
+				scripts.set(msg.uuid, { path: msg.path, className: msg.className, source: msg.source ?? "" });
+			} else if (msg.kind === "sourceChanged") {
+				const s = scripts.get(msg.uuid);
+				if (s) s.source = msg.source ?? "";
+			} else if (msg.kind === "scriptRemoved") {
+				scripts.delete(msg.uuid);
+			} else if (msg.kind === "scriptMoved") {
+				const s = scripts.get(msg.uuid);
+				if (s) s.path = msg.newPath;
+			}
+			salvar();
+			// `source` viaja no scriptAdded so para a bancada preencher o
+			// estado; o protocolo real nao tem esse campo ali.
+			const { source, ...paraEnviar } = msg.kind === "scriptAdded" ? msg : { ...msg, source: undefined };
+			const saida = msg.kind === "scriptAdded" ? paraEnviar : msg;
+			registrar("->", saida);
+			ws.send(JSON.stringify(saida));
+		}
+	}, 200);
+}
 
 ws.on("close", () => {
 	console.log("[bancada] conexao fechada");

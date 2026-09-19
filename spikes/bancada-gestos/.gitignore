@@ -1,9 +1,7 @@
 # tudo que uma execucao produz. O prefixo com ponto e de proposito: sao
 # artefatos, nao fazem parte do arnez.
-*.jsonl
-.estado*.json
-.est*.json
-.plugin.log
-.lixeira/
+.*
+!.gitignore
+projeto/rokit.toml
 projeto/src/server/
 projeto/src/client/
