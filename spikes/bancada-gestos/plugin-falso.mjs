@@ -45,6 +45,12 @@ const registrar = (direcao, msg) => {
 // aqui foi a extensao que mandou criar, e e isso que se quer medir.
 const arquivoEstado = process.argv[4] ?? null;
 const arquivoComandos = process.argv[5] ?? null;
+
+// Quando ligado, todo writeSource volta com ok=false e a mesma mensagem que o
+// plugin real manda ao negar lease. E assim que a bancada reproduz "o colega
+// esta com o arquivo" sem precisar de dois Studios em Team Create: o efeito
+// que a extensao ve e exatamente este ack.
+let negarEscrita = false;
 const scripts = new Map(); // uuid -> { path, className, source }
 let proximoUuid = 1;
 
@@ -156,6 +162,15 @@ ws.on("message", (bruto) => {
 					});
 				}
 			}
+			if (negarEscrita) {
+				responder({
+					kind: "writeAck",
+					requestId: msg.requestId,
+					ok: false,
+					error: "lease negada — script sendo editado por outro-dev",
+				});
+				break;
+			}
 			salvar();
 			responder({ kind: "writeAck", requestId: msg.requestId, uuid, ok: true });
 			break;
@@ -200,6 +215,12 @@ if (arquivoComandos) {
 				msg = JSON.parse(bruta);
 			} catch {
 				console.error("[bancada] comando invalido:", bruta.slice(0, 120));
+				continue;
+			}
+			// Comando da bancada, nao do protocolo: nao vai para a extensao.
+			if (msg.kind === "__negar") {
+				negarEscrita = Boolean(msg.valor);
+				console.log("[bancada] negar escrita:", negarEscrita);
 				continue;
 			}
 			// Mantem o "Studio" coerente com o que ele diz ter feito, senao o

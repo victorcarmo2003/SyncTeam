@@ -1,5 +1,8 @@
-# tudo que uma execucao produz. O prefixo com ponto e de proposito: sao
-# artefatos, nao fazem parte do arnez.
+# Tudo que uma execucao produz. Ja vazou para o indice tres vezes: o arnez
+# escreve com nomes variados (observado/obs2/.rec1/.sd/.lease), entao a regra
+# pega por EXTENSAO e por ponto, nao por nome.
+*.jsonl
+*.log
 .*
 !.gitignore
 projeto/rokit.toml
