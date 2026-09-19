@@ -723,7 +723,8 @@ export class SyncBridge {
       return;
     }
     if (content === null) {
-      this.contentCache.delete(key);
+      // A limpeza do contentCache mora dentro de handleLocalFileRemoved, que
+      // e por onde os dois caminhos (arquivo e pasta) passam.
       await this.handleLocalFileRemoved(relDiskPath, key, transport);
       return;
     }
@@ -885,6 +886,20 @@ export class SyncBridge {
   }
 
   private async handleLocalFileRemoved(relDiskPath: string, key: string, transport: Transport): Promise<void> {
+    // O arquivo sumiu do disco — isso e verdade INDEPENDENTE de o deleteScript
+    // dar certo. O contentCache e uma afirmacao sobre o DISCO ("ja escrevi
+    // isto ali"), entao mante-lo aqui faz o cache mentir, e a mentira so
+    // aparece depois: numa reconexao, `writeToDisk` compara o conteudo vindo
+    // do Studio com o cache, acha igual e NAO reescreve — o arquivo nunca
+    // volta.
+    //
+    // Medido: script apagado com o plugin fora do ar nao era restaurado na
+    // volta quando o conteudo era o mesmo, e era restaurado na hora quando o
+    // conteudo diferia. O caminho de arquivo ja limpava antes de chamar aqui;
+    // o de pasta (handleLocalDirectoryRemoved) nao, e por isso a limpeza
+    // subiu para ca, onde vale para os dois.
+    this.contentCache.delete(key);
+
     const knownUuid = this.uuidByDiskPath.get(key);
     if (knownUuid === undefined) {
       this.logger.info(`'${relDiskPath}' não encontrado (removido?) — nenhum uuid conhecido para este path, nada a propagar ao Studio`);

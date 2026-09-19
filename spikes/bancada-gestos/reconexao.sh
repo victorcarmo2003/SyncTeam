@@ -64,6 +64,9 @@ modulo() {
 }
 
 echo "== bancada de reconexao, porta $PORTA =="
+echo "   ATENCAO: recarregue a janela do VS Code antes de rodar."
+echo "   A extensao guarda path->uuid entre sessoes do plugin; sem recarregar,"
+echo "   ela reaproveita uuids de execucoes anteriores e os cenarios mentem."
 netstat -ano 2>/dev/null | grep -q "127.0.0.1:$PORTA .*LISTENING" || {
 	echo "  extensao nao esta na $PORTA — abra $PROJ no VS Code"; exit 1; }
 

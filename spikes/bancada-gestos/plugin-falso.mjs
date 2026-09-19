@@ -119,7 +119,14 @@ ws.on("message", (bruto) => {
 			// o uuid que ja existe.
 			let uuid = msg.uuid;
 			if (!uuid) {
-				uuid = `bancada-${proximoUuid++}`;
+				// Sufixo aleatorio, nao so um contador. A extensao guarda o
+				// mapeamento path->uuid entre sessoes do plugin, entao ela
+				// repete uuids de execucoes anteriores; um contador que
+				// reinicia em 1 colide com eles e uma entrada sobrescreve a
+				// outra em silencio. Ja aconteceu: uma bateria inteira reportou
+				// 2 scripts onde havia 4, e o cenario que dependia disso deu
+				// resultado errado.
+				uuid = `bancada-${proximoUuid++}-${Math.random().toString(36).slice(2, 8)}`;
 				scripts.set(uuid, {
 					path: msg.path ?? "(sem path)",
 					className: msg.className ?? "ModuleScript",

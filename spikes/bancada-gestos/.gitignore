@@ -1,10 +1,9 @@
-observado.jsonl
-obs*.jsonl
-.lixeira/
-projeto/src/server/
-projeto/src/client/
+# tudo que uma execucao produz. O prefixo com ponto e de proposito: sao
+# artefatos, nao fazem parte do arnez.
+*.jsonl
 .estado*.json
 .est*.json
 .plugin.log
-.rec*.jsonl
-.a*.jsonl
+.lixeira/
+projeto/src/server/
+projeto/src/client/
