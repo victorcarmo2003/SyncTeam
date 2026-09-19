@@ -74,6 +74,10 @@
 --       -- customizado" — persiste a setting E atualiza o Username já
 --       -- publicado na sessão atual, se houver (ver TeamCreateElection.setLocalUsername,
 --       -- chamado por PluginUI.luau; este módulo só invoca, nunca reimplementa).
+--     onModeChange: (mode: "individual" | "teams") -> (),
+--       -- clique no seletor entre CONNECT e RESYNC. Passthrough puro: este
+--       -- modulo nao decide nada sobre sincronizacao nem persiste a escolha,
+--       -- so avisa. Quem reflete de volta e state.mode.
 --     onResyncRequest: () -> (),
 --       -- dispara o pedido de ReSync (limpar+repuxar Source do VS Code). Ver
 --       -- contrato completo em docs/DECISIONS.md (5ª rodada) — você só chama,
@@ -135,6 +139,7 @@ local INFO_ROW_HEIGHT = 44 -- caixa de 34px (era 20px, linha de 30 — desacopla
 -- Modux Companion real (`actionRow` em UI.luau: Connect/Disconnect a 30px) —
 -- pedido do usuário ("Connect... em tamanho menor").
 local CONNECT_ROW_HEIGHT = 30
+local MODE_ROW_HEIGHT = 26 -- entre CONNECT (30) e RESYNC (28): e um seletor, nao uma acao
 local RESYNC_ROW_HEIGHT = 28
 local HEADER_HEIGHT = 22
 -- Altura FIXA da tabela de sessões (era flex:1/preenchia o painel inteiro).
@@ -589,6 +594,104 @@ end
 
 -- ------------------------------------------------------------------ ReSync
 
+-- Seletor de modo entre CONNECT e RESYNC: [ Individual | Teams ].
+--
+-- Um trilho com dois rotulos e UM frame deslizante por baixo marcando o
+-- ativo. O frame anda com TweenPosition da esquerda para a direita — nao e
+-- enfeite: o movimento e o que diz QUAL lado ficou ativo, num controle onde
+-- os dois rotulos ficam visiveis o tempo todo e so a cor os distinguiria.
+--
+-- "individual" e o default e fica a esquerda, porque e o modo que nao depende
+-- de mais ninguem estar online.
+--
+-- Este modulo so LE `state.mode()` e chama `callbacks.onModeChange(novo)` —
+-- mesma disciplina do resto do StatusPanel. Quem decide o que cada modo faz
+-- de verdade e quem persiste a escolha e PluginUI/init.server; clicar aqui
+-- nao muda sincronizacao nenhuma por conta propria.
+local function ModeRow(state, callbacks)
+	local hovered = vide.source("")
+
+	-- O deslizante e criado uma vez e movido por tween; recriar ou saltar a
+	-- posicao mataria justamente a informacao que ele carrega.
+	local slider = vide.create "Frame" {
+		Name = "Slider",
+		Size = UDim2.new(0.5, -2, 1, -4),
+		Position = UDim2.fromOffset(2, 2),
+		BackgroundColor3 = Theme.Color.Purple,
+		BorderSizePixel = 0,
+	}
+	vide.create "UICorner" { CornerRadius = UDim.new(0, 4), Parent = slider }
+
+	vide.effect(function()
+		local aEsquerda = state.mode() ~= "teams"
+		slider:TweenPosition(
+			UDim2.new(if aEsquerda then 0 else 0.5, 2, 0, 2),
+			Enum.EasingDirection.Out,
+			Enum.EasingStyle.Quad,
+			0.18,
+			true
+		)
+	end)
+
+	local function rotulo(texto, modo, xScale)
+		local botao = vide.create "TextButton" {
+			Name = texto,
+			Size = UDim2.fromScale(0.5, 1),
+			Position = UDim2.fromScale(xScale, 0),
+			BackgroundTransparency = 1,
+			AutoButtonColor = false,
+			Font = Theme.Font.Rounded,
+			TextSize = 13,
+			-- O lado ativo usa ButtonText (mesma leitura do texto sobre
+			-- botao colorido); o inativo cai para Muted e clareia no hover,
+			-- para o alvo de clique ficar obvio sem competir com o ativo.
+			TextColor3 = function()
+				if state.mode() == modo then
+					return Theme.Color.ButtonText
+				end
+				return if hovered() == modo then Theme.Color.SubText else Theme.Color.Muted
+			end,
+			Text = texto,
+
+			MouseEnter = function()
+				hovered(modo)
+			end,
+			MouseLeave = function()
+				if hovered() == modo then
+					hovered("")
+				end
+			end,
+			Activated = function()
+				if state.mode() ~= modo then
+					callbacks.onModeChange(modo)
+				end
+			end,
+		}
+		Theme.applyBold(botao)
+		return botao
+	end
+
+	local trilho = vide.create "Frame" {
+		Name = "Trilho",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Theme.Color.Border,
+		BorderSizePixel = 0,
+
+		slider,
+		rotulo("Individual", "individual", 0),
+		rotulo("Teams", "teams", 0.5),
+	}
+	vide.create "UICorner" { CornerRadius = UDim.new(0, 4), Parent = trilho }
+
+	return vide.create "Frame" {
+		Name = "ModeRow",
+		Size = UDim2.new(1, 0, 0, MODE_ROW_HEIGHT),
+		BackgroundTransparency = 1,
+
+		trilho,
+	}
+end
+
 -- Botão largura-cheia abaixo de ConnectRow, 3 estados visuais em
 -- state.resyncState() ("idle"/"syncing"/"done" — este módulo só LÊ, mesma
 -- disciplina do resto do StatusPanel). SEM lógica de envio de mensagem aqui
@@ -884,6 +987,7 @@ local function MainView(state, callbacks)
 		InfoRow(state),
 		PortRow(state, callbacks),
 		ConnectRow(state, callbacks),
+		ModeRow(state, callbacks),
 		ResyncRow(state, callbacks),
 		TableHeader(),
 		SessionsTable(state),

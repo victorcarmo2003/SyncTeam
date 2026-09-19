@@ -88,6 +88,10 @@ local sessionsMapSource = vide.source({})
 -- abaixo) — este módulo nunca decide sozinho quando mudar de estado, só
 -- reflete o que init.server.luau empurra.
 local resyncStateSource = vide.source("idle")
+-- Modo do seletor entre CONNECT e RESYNC. "individual" e o default por ser o
+-- que nao depende de mais ninguem estar online. Por enquanto so alimenta a UI:
+-- nada no fluxo de sincronizacao le isto ainda.
+local modeSource = vide.source("individual")
 
 -- Item 1 da tarefa 2026-07-21 (linha INFO no gap entre título e Porta, ver
 -- StatusPanel.luau): `infoTextSource` reflete a última mensagem IMPRESSA por
@@ -391,6 +395,18 @@ function PluginUI.init(pluginObject, callbacks)
 			-- sendMessage/o client WS. Este módulo só invoca o callback e
 			-- reflete o estado de volta via resyncState/PluginUI.setResyncState.
 			onResyncRequest = callbacks.onResyncRequest,
+			-- O seletor guarda a escolha e avisa quem estiver ouvindo. A
+			-- decisao do que cada modo faz nao mora aqui — quando existir,
+			-- entra por `callbacks.onModeChange`, do mesmo jeito que
+			-- onResyncRequest.
+			onModeChange = function(mode)
+				if mode ~= modeSource() then
+					modeSource(mode)
+					if callbacks.onModeChange then
+						callbacks.onModeChange(mode)
+					end
+				end
+			end,
 		}
 
 		local state = {
@@ -405,6 +421,7 @@ function PluginUI.init(pluginObject, callbacks)
 			infoText = infoTextSource,
 			infoElapsedSeconds = infoElapsedSecondsSource,
 			resyncState = resyncStateSource,
+			mode = modeSource,
 		}
 
 		-- `StatusPanel.build` (e tudo que ele cria por dentro — `vide.create`
