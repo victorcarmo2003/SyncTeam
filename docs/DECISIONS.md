@@ -54,8 +54,19 @@ comum — o cleanup do outro Studio — não passava por lá.
 
 **Reproduzido de forma determinística** antes de consertar, no Studio real do
 usuário com o build antigo: destruir `Sessions/<clientId>` pelo Command Bar e
-observar por 14s. `voltou=false`, restando só a sessão do outro dev. Com o
-build corrigido a pasta volta em <= `PULSE_INTERVAL_SECONDS` (2s).
+observar por 14s. `voltou=false`, restando só a sessão do outro dev.
+
+**Validado depois**, com os dois Studios conectados e o build corrigido:
+
+```
+inicial n=2  54ec2677(nome="llBossnightll" p=6)  6bb6ad29(nome="dev_Hakor" p=6)
+recriada em 2.08s
+apos +3s n=2  54ec2677(nome="llBossnightll" p=9)  6bb6ad29(nome="dev_Hakor" p=2)
+```
+
+Volta em 2,08s com o mesmo clientId e o nome intacto, sem tocar na sessão do
+outro dev — cujo `Pulse` seguindo (6 -> 9) durante o teste também mostra que a
+replicação estava fluindo nos dois sentidos o tempo todo.
 
 **Fix** (`plugin/src/TeamCreateElection.luau`): novo helper
 `ensureOwnSessionAlive(motivo)`, chamado por `tick()` a cada pulso — depois do
@@ -78,6 +89,16 @@ Detalhes deliberados:
 - **`Presence/` e `LeaseIntents/` não são recriados**: ambos se refazem
   sozinhos na próxima mensagem do editor, e recriá-los vazios publicaria um
   estado falso de "sem script ativo / sem intent".
+- **`Username` PRECISA ser republicado** — regressão da própria auto-cura,
+  pega no teste ao vivo e corrigida na sequência. Diferente de
+  `Presence`/`LeaseIntents`, o nome não se refaz sozinho: é resolvido uma
+  única vez em `start()`, num `task.spawn` que já terminou há muito. A pasta
+  recriada nascia com `Username` vazio e o colega passava a ver um GUID
+  (`"dev_Hakor"` virou `"db8dc80c"`). Novo cache module-level
+  `publishedUsername`, alimentado pelos dois pontos que publicam
+  (`resolveAndPublishRobloxUsername` e `setLocalUsername`) e reaplicado em
+  `ensureOwnSession`. Nunca guarda string vazia, então a chamada de dentro
+  de `start()` — que roda antes de qualquer resolução — continua no-op.
 - **`Logger.notify` (toast), não `Logger.log`**: perder a própria sessão nunca
   é rotina, e nos dois casos possíveis o usuário viu (ou vai ver) um
   "colaborador saiu" errado. Mesmo critério da reconciliação de duplicatas.
