@@ -1,0 +1,11 @@
+{
+  "name": "BancadaGestos",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": { "server": { "$path": "src/server" } },
+    "ReplicatedStorage": { "shared": { "$path": "src/shared" } },
+    "StarterPlayer": {
+      "StarterPlayerScripts": { "client": { "$path": "src/client" } }
+    }
+  }
+}
