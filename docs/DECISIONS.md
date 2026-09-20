@@ -1,6 +1,102 @@
 # Decisões registradas
 
-## 2026-08-04 (19ª rodada, mais recente) — Bug real do usuário: fila FIFO sem coalescência para pulses de buffer — backlog sem limite causava trava total de LSP escalando com tamanho do backlog (regressão do fix da 18ª rodada)
+## 2026-09-19 (20ª rodada, mais recente) — Bug real do usuário: sessão própria destruída por outro Studio nunca voltava; cada Studio se via sozinho, cursor/seleção mortos junto
+
+Usuário, com dois Studios reais em Team Create: "opa notei um erro, eles
+estão falando que o colaborador saiu, em um studio um está sozinho e em
+outro o outro está sozinho" — e, antes disso, "só a parte do cursor que
+parece meio falha, tanto a do cursor quanto a de seleção de texto, tipo os 2
+meio que não conseguem selecionar juntos". A replicação de `Source` pelo Team
+Create já estava medida e sadia (524ms de média, 5 tentativas), então o
+transporte não era o problema — só os metadados de sessão.
+
+**Causa raiz.** `ensureOwnSession()` era chamado UMA vez, dentro de
+`TeamCreateElection.start()`, e `sessionFolder` ficava cacheado para sempre.
+O `tick()` reavaliava a raiz e `Sessions/` a cada pulso (correção de
+2026-07-07 contra o split-brain de liderança) mas NUNCA a própria sessão, e
+seu guard de topo era:
+
+```lua
+if not enabled or sessionFolder == nil or sessionFolder.Parent == nil then
+	return
+end
+```
+
+Um early-return silencioso e terminal. Qualquer coisa que destruísse
+`Sessions/<clientId>` deixava o plugin incrementando `Pulse` numa Instance
+órfã (Parent nil, não replica), invisível em `Sessions/` dos dois lados, para
+sempre.
+
+O que destrói essa pasta não é evento raro: é `cleanupStaleSessions`, o
+caminho NORMAL do protocolo — o líder apaga toda sessão com `heartbeatAge >=
+CLEANUP_AFTER_SECONDS` (20s). Basta um falso positivo para o líder matar um
+colega vivo. Dois gatilhos plausíveis, os dois presentes no setup do usuário:
+Studio em segundo plano (a Roblox estrangula `task.wait` na janela sem foco,
+e com 2 Studios na mesma máquina UM SEMPRE está em segundo plano) e atraso de
+replicação do `Pulse` pelo Team Create. `LeaderTerm` estava em **62** na place
+de teste — 62 trocas de liderança, exatamente o flapping que esse ciclo
+produz.
+
+Cursor e seleção caíam junto pela mesma raiz, não por bug próprio:
+`TeamCreatePresence.updateOwnPresence` e `TeamCreateLease.ensureIntent`
+escrevem via `TeamCreateElection.getSessionFolder()`, que devolve nil assim
+que a pasta vira órfã. Sem sessão não há `Presence/`, sem `Presence/` não há
+cursor nem seleção remota — e sem contraparte a eleição de lease também fica
+sem com quem negociar.
+
+**O comentário de `checkIntegrity` (2026-07-26) já descrevia este estado
+terminal palavra por palavra** — "deixaria tick() preso para sempre no guard
+`sessionFolder.Parent == nil` do topo (early return silencioso) — heartbeat/
+eleição param, e getSessionFolder() passa a devolver nil pra sempre,
+quebrando leases/presença junto". A recuperação existia e estava certa. Só
+estava ligada a `ChangeHistoryService.OnUndo/OnRedo`, a porta RARA. A porta
+comum — o cleanup do outro Studio — não passava por lá.
+
+**Reproduzido de forma determinística** antes de consertar, no Studio real do
+usuário com o build antigo: destruir `Sessions/<clientId>` pelo Command Bar e
+observar por 14s. `voltou=false`, restando só a sessão do outro dev. Com o
+build corrigido a pasta volta em <= `PULSE_INTERVAL_SECONDS` (2s).
+
+**Fix** (`plugin/src/TeamCreateElection.luau`): novo helper
+`ensureOwnSessionAlive(motivo)`, chamado por `tick()` a cada pulso — depois do
+refresh de schema (precisa da `sessionsFolder` canônica) e antes do
+incremento de `Pulse` (senão o incremento vai para a órfã). O guard do topo
+de `tick()` passa a testar só `enabled`. `checkIntegrity()` reusa o mesmo
+helper em vez de duplicar a lógica.
+
+Detalhes deliberados:
+
+- **`Parent ~= sessionsFolder`, não `Parent == nil`**: a reconciliação de
+  duplicatas do `TeamCreateSchema` pode deixar a pasta pendurada numa casca de
+  `Sessions` que perdeu o desempate e ainda não foi destruída — Parent
+  não-nil, mas invisível para quem lê a canônica. Mesmo órfão, sintoma
+  idêntico.
+- **`CLEANUP_AFTER_SECONDS` continua 20s**: com auto-cura por pulso, um falso
+  positivo custa <= 2s de invisibilidade em vez da sessão inteira. Afrouxar o
+  prazo só atrasaria a limpeza de sessão realmente morta, sem resolver nada
+  que a auto-cura já não resolva.
+- **`Presence/` e `LeaseIntents/` não são recriados**: ambos se refazem
+  sozinhos na próxima mensagem do editor, e recriá-los vazios publicaria um
+  estado falso de "sem script ativo / sem intent".
+- **`Logger.notify` (toast), não `Logger.log`**: perder a própria sessão nunca
+  é rotina, e nos dois casos possíveis o usuário viu (ou vai ver) um
+  "colaborador saiu" errado. Mesmo critério da reconciliação de duplicatas.
+
+**Achado secundário, no próprio ferramental**: `Tools/build-and-deploy-plugin.sh`
+fazia `rm -f` + `cp` e o watcher de plugins do Studio drenou os dois eventos
+FORA DE ORDEM, processando a remoção depois da adição:
+
+```
+Detected add/change: user_SyncTeam.rbxm; loading/reloading the plugin now!
+Detected removal:    user_SyncTeam.rbxm; unloading the plugin now!
+```
+
+O plugin fica descarregado com o arquivo novo no lugar e nenhum sinal de
+erro — o deploy parece ter dado certo. Corrigido com pausa entre as duas
+operações e um `cp` extra no fim (o último evento passa a ser sempre
+add/change).
+
+## 2026-08-04 (19ª rodada) — Bug real do usuário: fila FIFO sem coalescência para pulses de buffer — backlog sem limite causava trava total de LSP escalando com tamanho do backlog (regressão do fix da 18ª rodada)
 
 Usuário testou de novo depois de reiniciar o PC (com o fix da 18ª rodada —
 watcher por mount point + reordenar checagens antes do `readFile` — já

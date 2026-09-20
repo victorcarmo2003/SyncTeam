@@ -38,7 +38,20 @@ echo "== rojo build ($ROJO_BIN) =="
 (cd "$PLUGIN_DIR" && "$ROJO_BIN" build -o "$PLUGIN_NAME")
 
 echo "== implantando em $PLUGINS_FOLDER =="
+# 2026-09-19: o delete+copy tem uma CORRIDA — o watcher de plugins do Studio
+# pode drenar os dois eventos fora de ordem e processar a remoção DEPOIS da
+# adição, ficando com o plugin descarregado apesar do arquivo novo estar no
+# lugar. Observado no Output do Studio, nesta ordem:
+#   Detected add/change: user_SyncTeam.rbxm; loading/reloading the plugin now!
+#   Detected removal:    user_SyncTeam.rbxm; unloading the plugin now!
+# Resultado: nenhuma sessão em TestService.SyncTeam.Sessions e nenhum sinal de
+# erro — parece que o deploy funcionou. A pausa dá tempo do Studio consumir a
+# remoção antes de ver a adição; o `cp` extra no fim é a rede de segurança
+# (se a ordem ainda embaralhar, o último evento é sempre add/change).
 rm -f "$PLUGINS_FOLDER/$PLUGIN_NAME"
+sleep 2
+cp "$PLUGIN_DIR/$PLUGIN_NAME" "$PLUGINS_FOLDER/$PLUGIN_NAME"
+sleep 2
 cp "$PLUGIN_DIR/$PLUGIN_NAME" "$PLUGINS_FOLDER/$PLUGIN_NAME"
 
 # Companion plugin em XML (.rbxmx), commitado em dist-plugin/ — pra quem

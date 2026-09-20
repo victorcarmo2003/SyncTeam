@@ -3400,6 +3400,62 @@ local function ensureOwnSession()
 	sessionValues = values
 end
 
+-- CORREÇÃO (2026-09-19, docs/DECISIONS.md — "o colaborador saiu" com os dois
+-- Studios abertos e vivos, relatado em teste real com 2 Studios em Team
+-- Create): a própria Sessions/<clientId> pode ser destruída POR OUTRO STUDIO
+-- a qualquer momento, não só por um Ctrl+Z local. `cleanupStaleSessions` é o
+-- caminho normal e esperado: o líder destrói toda sessão com heartbeatAge >=
+-- CLEANUP_AFTER_SECONDS. Basta um falso positivo — Studio em segundo plano
+-- (a Roblox estrangula `task.wait` na janela sem foco, e com 2 Studios na
+-- mesma máquina UM SEMPRE está em segundo plano), ou replicação de Pulse
+-- atrasada pelo Team Create — para o líder concluir que o colega morreu e
+-- apagar a pasta dele.
+--
+-- Antes desta correção isso era PERMANENTE, não transitório: `sessionFolder`
+-- era capturado 1x em `ensureOwnSession()` dentro de `start()` e nunca mais
+-- reavaliado, e o guard do topo de `tick()` (`sessionFolder.Parent == nil`)
+-- fazia early-return silencioso para sempre. O lado apagado seguia
+-- incrementando `Pulse` numa Instance órfã (Parent nil, não replica), sumia
+-- de `Sessions/` dos dois lados, e `getSessionFolder()` passava a devolver
+-- nil — levando junto presença (cursor/seleção, TeamCreatePresence) e leases
+-- (TeamCreateLease). Resultado observado: cada Studio se vê sozinho e cada
+-- um avisa que o colaborador saiu.
+--
+-- O comentário de `checkIntegrity` (2026-07-26) já descrevia exatamente este
+-- estado terminal, mas a recuperação só estava ligada a
+-- ChangeHistoryService.OnUndo/OnRedo — a porta rara. A porta comum é o
+-- cleanup do outro Studio, e ela não passava por lá.
+--
+-- Com a recriação por pulso, um cleanup indevido custa <= PULSE_INTERVAL
+-- (2s) de invisibilidade em vez de a sessão inteira. Por isso
+-- CLEANUP_AFTER_SECONDS continua em 20s: com auto-cura o falso positivo é
+-- barato, e afrouxar o prazo só atrasaria a limpeza de sessão realmente
+-- morta.
+--
+-- `Parent ~= sessionsFolder` (e não `Parent == nil`) de propósito: a
+-- reconciliação de duplicatas do TeamCreateSchema pode deixar a pasta
+-- pendurada numa casca de `Sessions` que perdeu o desempate e ainda não foi
+-- destruída — Parent não-nil, mas invisível para quem lê a canônica. Mesmo
+-- órfão, sintoma idêntico.
+--
+-- Presence/ e LeaseIntents/ NÃO são recriados aqui: ambos se refazem sozinhos
+-- na próxima mensagem do editor (`TeamCreatePresence.updateOwnPresence`,
+-- `TeamCreateLease.ensureIntent`), e recriá-los vazios aqui só publicaria um
+-- estado falso de "sem script ativo / sem intent".
+local function ensureOwnSessionAlive(motivo)
+	if sessionFolder ~= nil and sessionFolder.Parent == sessionsFolder then
+		return false
+	end
+	-- Logger.notify (toast), não Logger.log: perder a própria sessão nunca é
+	-- rotina — é sempre ou um undo destrutivo ou um cleanup indevido do outro
+	-- Studio, e nos dois casos o usuário viu (ou vai ver) um "colaborador
+	-- saiu" errado. Mesmo critério da reconciliação de duplicatas em
+	-- TeamCreateSchema.
+	Logger.notify(("sessão local havia sumido de Sessions/ (%s) — recriada"):format(motivo))
+	ensureOwnSession()
+	return true
+end
+
 -- Lê uma entrada de Sessions/<clientId> já existente (própria ou de outro
 -- Studio, replicada via Team Create). nil se a entrada estiver incompleta
 -- (schema versionado/validação é M3.2/M3.3, fora de escopo desta fatia).
@@ -3537,7 +3593,7 @@ end
 -- ------------------------------------------------------------------- tick
 
 local function tick()
-	if not enabled or sessionFolder == nil or sessionFolder.Parent == nil then
+	if not enabled then
 		return
 	end
 
@@ -3556,6 +3612,11 @@ local function tick()
 	local root = TeamCreateSchema.ensureRoot()
 	rootValues = root.values
 	sessionsFolder = TeamCreateSchema.ensureFolder("Sessions")
+
+	-- Ver ensureOwnSessionAlive (2026-09-19): tem de vir DEPOIS do refresh
+	-- acima (precisa da `sessionsFolder` canônica para comparar o Parent) e
+	-- ANTES do Pulse (senão o incremento vai para a Instance órfã e some).
+	ensureOwnSessionAlive("cleanup de outro Studio, ou reconciliação")
 
 	local now = os.clock()
 	sessionValues.Pulse.Value += 1
@@ -3789,10 +3850,11 @@ function TeamCreateElection.checkIntegrity()
 	rootValues = root.values
 	sessionsFolder = TeamCreateSchema.ensureFolder("Sessions")
 
-	if sessionFolder == nil or sessionFolder.Parent == nil then
-		log("integridade: sessão local ausente (undo/redo?) — recriando")
-		ensureOwnSession()
-	end
+	-- Mesma recuperação que tick() faz a cada pulso desde 2026-09-19 (ver
+	-- ensureOwnSessionAlive): aqui continua valendo a pena chamar na hora,
+	-- sem esperar até PULSE_INTERVAL_SECONDS, porque o undo já aconteceu e
+	-- ChangeHistoryService nos deu o gancho síncrono.
+	ensureOwnSessionAlive("undo/redo")
 end
 
 -- ---------------------------------------------------------- leitura p/ UI (M4.5)
@@ -5614,6 +5676,10 @@ local sessionsMapSource = vide.source({})
 -- abaixo) — este módulo nunca decide sozinho quando mudar de estado, só
 -- reflete o que init.server.luau empurra.
 local resyncStateSource = vide.source("idle")
+-- Modo do seletor entre CONNECT e RESYNC. "individual" e o default por ser o
+-- que nao depende de mais ninguem estar online. Por enquanto so alimenta a UI:
+-- nada no fluxo de sincronizacao le isto ainda.
+local modeSource = vide.source("individual")
 
 -- Item 1 da tarefa 2026-07-21 (linha INFO no gap entre título e Porta, ver
 -- StatusPanel.luau): `infoTextSource` reflete a última mensagem IMPRESSA por
@@ -5917,6 +5983,18 @@ function PluginUI.init(pluginObject, callbacks)
 			-- sendMessage/o client WS. Este módulo só invoca o callback e
 			-- reflete o estado de volta via resyncState/PluginUI.setResyncState.
 			onResyncRequest = callbacks.onResyncRequest,
+			-- O seletor guarda a escolha e avisa quem estiver ouvindo. A
+			-- decisao do que cada modo faz nao mora aqui — quando existir,
+			-- entra por `callbacks.onModeChange`, do mesmo jeito que
+			-- onResyncRequest.
+			onModeChange = function(mode)
+				if mode ~= modeSource() then
+					modeSource(mode)
+					if callbacks.onModeChange then
+						callbacks.onModeChange(mode)
+					end
+				end
+			end,
 		}
 
 		local state = {
@@ -5931,6 +6009,7 @@ function PluginUI.init(pluginObject, callbacks)
 			infoText = infoTextSource,
 			infoElapsedSeconds = infoElapsedSecondsSource,
 			resyncState = resyncStateSource,
+			mode = modeSource,
 		}
 
 		-- `StatusPanel.build` (e tudo que ele cria por dentro — `vide.create`
@@ -6097,6 +6176,10 @@ return PluginUI
 --       -- customizado" — persiste a setting E atualiza o Username já
 --       -- publicado na sessão atual, se houver (ver TeamCreateElection.setLocalUsername,
 --       -- chamado por PluginUI.luau; este módulo só invoca, nunca reimplementa).
+--     onModeChange: (mode: "individual" | "teams") -> (),
+--       -- clique no seletor entre CONNECT e RESYNC. Passthrough puro: este
+--       -- modulo nao decide nada sobre sincronizacao nem persiste a escolha,
+--       -- so avisa. Quem reflete de volta e state.mode.
 --     onResyncRequest: () -> (),
 --       -- dispara o pedido de ReSync (limpar+repuxar Source do VS Code). Ver
 --       -- contrato completo em docs/DECISIONS.md (5ª rodada) — você só chama,
@@ -6158,6 +6241,7 @@ local INFO_ROW_HEIGHT = 44 -- caixa de 34px (era 20px, linha de 30 — desacopla
 -- Modux Companion real (`actionRow` em UI.luau: Connect/Disconnect a 30px) —
 -- pedido do usuário ("Connect... em tamanho menor").
 local CONNECT_ROW_HEIGHT = 30
+local MODE_ROW_HEIGHT = 26 -- entre CONNECT (30) e RESYNC (28): e um seletor, nao uma acao
 local RESYNC_ROW_HEIGHT = 28
 local HEADER_HEIGHT = 22
 -- Altura FIXA da tabela de sessões (era flex:1/preenchia o painel inteiro).
@@ -6612,6 +6696,104 @@ end
 
 -- ------------------------------------------------------------------ ReSync
 
+-- Seletor de modo entre CONNECT e RESYNC: [ Individual | Teams ].
+--
+-- Um trilho com dois rotulos e UM frame deslizante por baixo marcando o
+-- ativo. O frame anda com TweenPosition da esquerda para a direita — nao e
+-- enfeite: o movimento e o que diz QUAL lado ficou ativo, num controle onde
+-- os dois rotulos ficam visiveis o tempo todo e so a cor os distinguiria.
+--
+-- "individual" e o default e fica a esquerda, porque e o modo que nao depende
+-- de mais ninguem estar online.
+--
+-- Este modulo so LE `state.mode()` e chama `callbacks.onModeChange(novo)` —
+-- mesma disciplina do resto do StatusPanel. Quem decide o que cada modo faz
+-- de verdade e quem persiste a escolha e PluginUI/init.server; clicar aqui
+-- nao muda sincronizacao nenhuma por conta propria.
+local function ModeRow(state, callbacks)
+	local hovered = vide.source("")
+
+	-- O deslizante e criado uma vez e movido por tween; recriar ou saltar a
+	-- posicao mataria justamente a informacao que ele carrega.
+	local slider = vide.create "Frame" {
+		Name = "Slider",
+		Size = UDim2.new(0.5, -2, 1, -4),
+		Position = UDim2.fromOffset(2, 2),
+		BackgroundColor3 = Theme.Color.Purple,
+		BorderSizePixel = 0,
+	}
+	vide.create "UICorner" { CornerRadius = UDim.new(0, 4), Parent = slider }
+
+	vide.effect(function()
+		local aEsquerda = state.mode() ~= "teams"
+		slider:TweenPosition(
+			UDim2.new(if aEsquerda then 0 else 0.5, 2, 0, 2),
+			Enum.EasingDirection.Out,
+			Enum.EasingStyle.Quad,
+			0.18,
+			true
+		)
+	end)
+
+	local function rotulo(texto, modo, xScale)
+		local botao = vide.create "TextButton" {
+			Name = texto,
+			Size = UDim2.fromScale(0.5, 1),
+			Position = UDim2.fromScale(xScale, 0),
+			BackgroundTransparency = 1,
+			AutoButtonColor = false,
+			Font = Theme.Font.Rounded,
+			TextSize = 13,
+			-- O lado ativo usa ButtonText (mesma leitura do texto sobre
+			-- botao colorido); o inativo cai para Muted e clareia no hover,
+			-- para o alvo de clique ficar obvio sem competir com o ativo.
+			TextColor3 = function()
+				if state.mode() == modo then
+					return Theme.Color.ButtonText
+				end
+				return if hovered() == modo then Theme.Color.SubText else Theme.Color.Muted
+			end,
+			Text = texto,
+
+			MouseEnter = function()
+				hovered(modo)
+			end,
+			MouseLeave = function()
+				if hovered() == modo then
+					hovered("")
+				end
+			end,
+			Activated = function()
+				if state.mode() ~= modo then
+					callbacks.onModeChange(modo)
+				end
+			end,
+		}
+		Theme.applyBold(botao)
+		return botao
+	end
+
+	local trilho = vide.create "Frame" {
+		Name = "Trilho",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Theme.Color.Border,
+		BorderSizePixel = 0,
+
+		slider,
+		rotulo("Individual", "individual", 0),
+		rotulo("Teams", "teams", 0.5),
+	}
+	vide.create "UICorner" { CornerRadius = UDim.new(0, 4), Parent = trilho }
+
+	return vide.create "Frame" {
+		Name = "ModeRow",
+		Size = UDim2.new(1, 0, 0, MODE_ROW_HEIGHT),
+		BackgroundTransparency = 1,
+
+		trilho,
+	}
+end
+
 -- Botão largura-cheia abaixo de ConnectRow, 3 estados visuais em
 -- state.resyncState() ("idle"/"syncing"/"done" — este módulo só LÊ, mesma
 -- disciplina do resto do StatusPanel). SEM lógica de envio de mensagem aqui
@@ -6907,6 +7089,7 @@ local function MainView(state, callbacks)
 		InfoRow(state),
 		PortRow(state, callbacks),
 		ConnectRow(state, callbacks),
+		ModeRow(state, callbacks),
 		ResyncRow(state, callbacks),
 		TableHeader(),
 		SessionsTable(state),

@@ -245,6 +245,62 @@ local function ensureOwnSession()
 	sessionValues = values
 end
 
+-- CORREÇÃO (2026-09-19, docs/DECISIONS.md — "o colaborador saiu" com os dois
+-- Studios abertos e vivos, relatado em teste real com 2 Studios em Team
+-- Create): a própria Sessions/<clientId> pode ser destruída POR OUTRO STUDIO
+-- a qualquer momento, não só por um Ctrl+Z local. `cleanupStaleSessions` é o
+-- caminho normal e esperado: o líder destrói toda sessão com heartbeatAge >=
+-- CLEANUP_AFTER_SECONDS. Basta um falso positivo — Studio em segundo plano
+-- (a Roblox estrangula `task.wait` na janela sem foco, e com 2 Studios na
+-- mesma máquina UM SEMPRE está em segundo plano), ou replicação de Pulse
+-- atrasada pelo Team Create — para o líder concluir que o colega morreu e
+-- apagar a pasta dele.
+--
+-- Antes desta correção isso era PERMANENTE, não transitório: `sessionFolder`
+-- era capturado 1x em `ensureOwnSession()` dentro de `start()` e nunca mais
+-- reavaliado, e o guard do topo de `tick()` (`sessionFolder.Parent == nil`)
+-- fazia early-return silencioso para sempre. O lado apagado seguia
+-- incrementando `Pulse` numa Instance órfã (Parent nil, não replica), sumia
+-- de `Sessions/` dos dois lados, e `getSessionFolder()` passava a devolver
+-- nil — levando junto presença (cursor/seleção, TeamCreatePresence) e leases
+-- (TeamCreateLease). Resultado observado: cada Studio se vê sozinho e cada
+-- um avisa que o colaborador saiu.
+--
+-- O comentário de `checkIntegrity` (2026-07-26) já descrevia exatamente este
+-- estado terminal, mas a recuperação só estava ligada a
+-- ChangeHistoryService.OnUndo/OnRedo — a porta rara. A porta comum é o
+-- cleanup do outro Studio, e ela não passava por lá.
+--
+-- Com a recriação por pulso, um cleanup indevido custa <= PULSE_INTERVAL
+-- (2s) de invisibilidade em vez de a sessão inteira. Por isso
+-- CLEANUP_AFTER_SECONDS continua em 20s: com auto-cura o falso positivo é
+-- barato, e afrouxar o prazo só atrasaria a limpeza de sessão realmente
+-- morta.
+--
+-- `Parent ~= sessionsFolder` (e não `Parent == nil`) de propósito: a
+-- reconciliação de duplicatas do TeamCreateSchema pode deixar a pasta
+-- pendurada numa casca de `Sessions` que perdeu o desempate e ainda não foi
+-- destruída — Parent não-nil, mas invisível para quem lê a canônica. Mesmo
+-- órfão, sintoma idêntico.
+--
+-- Presence/ e LeaseIntents/ NÃO são recriados aqui: ambos se refazem sozinhos
+-- na próxima mensagem do editor (`TeamCreatePresence.updateOwnPresence`,
+-- `TeamCreateLease.ensureIntent`), e recriá-los vazios aqui só publicaria um
+-- estado falso de "sem script ativo / sem intent".
+local function ensureOwnSessionAlive(motivo)
+	if sessionFolder ~= nil and sessionFolder.Parent == sessionsFolder then
+		return false
+	end
+	-- Logger.notify (toast), não Logger.log: perder a própria sessão nunca é
+	-- rotina — é sempre ou um undo destrutivo ou um cleanup indevido do outro
+	-- Studio, e nos dois casos o usuário viu (ou vai ver) um "colaborador
+	-- saiu" errado. Mesmo critério da reconciliação de duplicatas em
+	-- TeamCreateSchema.
+	Logger.notify(("sessão local havia sumido de Sessions/ (%s) — recriada"):format(motivo))
+	ensureOwnSession()
+	return true
+end
+
 -- Lê uma entrada de Sessions/<clientId> já existente (própria ou de outro
 -- Studio, replicada via Team Create). nil se a entrada estiver incompleta
 -- (schema versionado/validação é M3.2/M3.3, fora de escopo desta fatia).
@@ -382,7 +438,7 @@ end
 -- ------------------------------------------------------------------- tick
 
 local function tick()
-	if not enabled or sessionFolder == nil or sessionFolder.Parent == nil then
+	if not enabled then
 		return
 	end
 
@@ -401,6 +457,11 @@ local function tick()
 	local root = TeamCreateSchema.ensureRoot()
 	rootValues = root.values
 	sessionsFolder = TeamCreateSchema.ensureFolder("Sessions")
+
+	-- Ver ensureOwnSessionAlive (2026-09-19): tem de vir DEPOIS do refresh
+	-- acima (precisa da `sessionsFolder` canônica para comparar o Parent) e
+	-- ANTES do Pulse (senão o incremento vai para a Instance órfã e some).
+	ensureOwnSessionAlive("cleanup de outro Studio, ou reconciliação")
 
 	local now = os.clock()
 	sessionValues.Pulse.Value += 1
@@ -634,10 +695,11 @@ function TeamCreateElection.checkIntegrity()
 	rootValues = root.values
 	sessionsFolder = TeamCreateSchema.ensureFolder("Sessions")
 
-	if sessionFolder == nil or sessionFolder.Parent == nil then
-		log("integridade: sessão local ausente (undo/redo?) — recriando")
-		ensureOwnSession()
-	end
+	-- Mesma recuperação que tick() faz a cada pulso desde 2026-09-19 (ver
+	-- ensureOwnSessionAlive): aqui continua valendo a pena chamar na hora,
+	-- sem esperar até PULSE_INTERVAL_SECONDS, porque o undo já aconteceu e
+	-- ChangeHistoryService nos deu o gancho síncrono.
+	ensureOwnSessionAlive("undo/redo")
 end
 
 -- ---------------------------------------------------------- leitura p/ UI (M4.5)
