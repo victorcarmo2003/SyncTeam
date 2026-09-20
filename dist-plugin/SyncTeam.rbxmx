@@ -6288,7 +6288,19 @@ local INFO_ROW_HEIGHT = 44 -- caixa de 34px (era 20px, linha de 30 — desacopla
 -- pedido do usuário ("Connect... em tamanho menor").
 local CONNECT_ROW_HEIGHT = 30
 local MODE_ROW_HEIGHT = 26 -- entre CONNECT (30) e RESYNC (28): e um seletor, nao uma acao
-local MODE_TWEEN = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+-- 2026-09-19, 2ª passada: era `0.18, Quad, Out` e o usuário relatou que o
+-- slider "parece que tá sendo criado" em vez de deslizar. Não era rebuild —
+-- o ModeRow é construído UMA vez (`vide.switch` só reavalia em `state.view`,
+-- nunca em `state.mode`). Era o easing: `Out` tem velocidade MÁXIMA em t=0,
+-- então o bloco cruza metade do trilho no primeiro quarto do tempo. Com
+-- 0,18s e a cor trocando no mesmo tween, o olho lê "sumiu um azul, apareceu
+-- um vermelho" em vez de "o mesmo bloco andou".
+--
+-- `InOut` começa parado: o primeiro quadro mostra o bloco AINDA no lugar
+-- antigo, que é o que amarra a identidade do objeto antes de ele se mover. O
+-- tempo maior existe pelo mesmo motivo — o movimento precisa ser lido, não
+-- só acontecer.
+local MODE_TWEEN = TweenInfo.new(0.26, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
 local RESYNC_ROW_HEIGHT = 28
 local HEADER_HEIGHT = 22
 -- Altura FIXA da tabela de sessões (era flex:1/preenchia o painel inteiro).
