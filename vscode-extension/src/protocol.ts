@@ -214,6 +214,29 @@ export interface PresenceLeftEvent {
 }
 
 /**
+ * Extensão → plugin, espontânea: impressão digital do `wally.toml` local.
+ *
+ * Não é o conteúdo do arquivo e não deve virar um: `Packages/` fica fora do
+ * sync de propósito, e sincronizar o manifesto sem os pacotes só trocaria um
+ * estado inconsistente por outro. O que atravessa é a informação mínima para
+ * o outro lado saber que DIVERGE — ver plugin/src/TeamCreateWally.luau.
+ */
+export interface WallyFingerprintMessage {
+  kind: "wallyFingerprint";
+  value: string;
+}
+
+/**
+ * Plugin → extensão, espontânea: um colaborador está com dependências Wally
+ * diferentes das suas. Quem instala é o dev, nunca o SyncTeam.
+ */
+export interface WallyDriftEvent {
+  kind: "wallyDrift";
+  clientId: string;
+  displayName: string;
+}
+
+/**
  * Extensão → plugin (heartbeat, aditiva — NÃO muda `PROTOCOL_VERSION`, mesmo
  * precedente de `leaseChanged`/`presenceUpdate`): ping periódico de vida,
  * enviado a cada `HEARTBEAT_INTERVAL_MS` pelo `SyncServer`. Espontânea (sem

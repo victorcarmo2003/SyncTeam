@@ -15,6 +15,12 @@ import { SyncTeamService } from "./sync/SyncTeamService.js";
 import { VscodeDiskIO } from "./sync/VscodeDiskIO.js";
 import { attemptPortReclaim } from "./sync/PortOwnership.js";
 import { parseMountPoints, type MountPoint } from "./mapping/projectMapping.js";
+import {
+  findUnbackedSides,
+  parseLayoutDeclaration,
+  type LayoutDeclaration,
+} from "./mapping/layoutFallback.js";
+import { computeWallyFingerprint } from "./mapping/wallyFingerprint.js";
 import { createOutputChannelLogger } from "./util/vscodeLogger.js";
 import type { Logger } from "./util/logger.js";
 import { PresencePublisher } from "./presence/PresencePublisher.js";
@@ -98,6 +104,45 @@ const bufferPulseTimers = new Map<string, ReturnType<typeof setTimeout>>();
 async function findProjectFile(): Promise<vscode.Uri | null> {
   const matches = await vscode.workspace.findFiles("**/default.project.json", "**/node_modules/**", 1);
   return matches.length > 0 ? matches[0] : null;
+}
+
+/**
+ * Le a declaracao de layout de `syncteam.json` na raiz do workspace.
+ *
+ * Arquivo ausente e o caso normal: o projeto simplesmente nao ganha o
+ * fallback de colocacao (ver layoutFallback.ts). Ja um arquivo PRESENTE e
+ * quebrado vira erro visivel, porque silenciar ali devolveria exatamente o
+ * sintoma que o fallback existe para matar — arquivo que nao chega ao disco
+ * sem ninguem avisar.
+ */
+async function readLayoutDeclaration(
+  projectFileUri: vscode.Uri,
+  logger: Logger,
+): Promise<LayoutDeclaration | null> {
+  // Ao lado do project file, nao na raiz do workspace: os dois descrevem o
+  // mesmo projeto, e um workspace pode guardar mais de um.
+  const uri = vscode.Uri.joinPath(projectFileUri, "..", "syncteam.json");
+  let raw: Uint8Array;
+  try {
+    raw = await vscode.workspace.fs.readFile(uri);
+  } catch {
+    return null;
+  }
+  try {
+    const declaration = parseLayoutDeclaration(JSON.parse(Buffer.from(raw).toString("utf8")));
+    if (declaration) {
+      logger.info(
+        `syncteam.json: layout declarado, raiz '${declaration.root}', lados ` +
+          Object.entries(declaration.sides)
+            .map(([side, tree]) => `${side} -> ${tree}`)
+            .join(", "),
+      );
+    }
+    return declaration;
+  } catch (error) {
+    logger.error(`syncteam.json: ${(error as Error).message}`);
+    return null;
+  }
 }
 
 async function readProjectMountPoints(projectFileUri: vscode.Uri, logger: Logger): Promise<MountPoint[] | null> {
@@ -339,6 +384,7 @@ async function startService(
     return { ok: false, reason: "nenhum default.project.json encontrado no workspace" };
   }
 
+  const layoutDeclaration = await readLayoutDeclaration(projectFileUri, logger);
   const mountPoints = await readProjectMountPoints(projectFileUri, logger);
   if (!mountPoints || mountPoints.length === 0) {
     logger.error(
@@ -350,6 +396,22 @@ async function startService(
     };
   }
   logger.info(`pontos de montagem: ${mountPoints.map((m) => `${m.dataModelPath} -> ${m.diskPath}`).join(", ")}`);
+
+  // A declaracao repete uma regra que o gerador do project file ja conhece, e
+  // duas copias divergem. Conferir aqui faz a divergencia aparecer no primeiro
+  // boot, e nao no primeiro arquivo que some — ver layoutFallback.ts.
+  if (layoutDeclaration) {
+    const unbacked = findUnbackedSides(
+      layoutDeclaration,
+      mountPoints.map((mount) => mount.dataModelPath),
+    );
+    if (unbacked.length > 0) {
+      logger.warn(
+        `syncteam.json: o(s) lado(s) ${unbacked.join(", ")} nao correspondem a nenhum ponto de montagem ` +
+          `do projeto. Uma feature nova criada no Studio nesse lado iria para o lugar errado no disco.`,
+      );
+    }
+  }
 
   const dir = vscode.Uri.joinPath(projectFileUri, "..");
   projectDir = dir; // hoisted para módulo — ver comentário na declaração
@@ -394,7 +456,7 @@ async function startService(
         },
       }),
   });
-  service = new SyncTeamService(server, mountPoints, diskIO, logger, multiSync);
+  service = new SyncTeamService(server, mountPoints, diskIO, logger, multiSync, layoutDeclaration);
   presencePublisher = new PresencePublisher(service.getPresenceTransport());
 
   // Estado de conexão (plugin conectou/desconectou) reemitido para a status
@@ -444,6 +506,34 @@ async function startService(
     // visíveis — a lease pode ter mudado para o arquivo que o usuário está
     // olhando agora.
     leaseBorderDecoration?.renderAll();
+  });
+
+  // Impressao digital do wally.toml: publicada na conexao e a cada mudanca do
+  // arquivo. O plugin compara com a do outro Studio e avisa quem divergir —
+  // ver plugin/src/TeamCreateWally.luau. Instalar continua sendo decisao do
+  // dev; isto so quebra o silencio.
+  const wallyUri = vscode.Uri.joinPath(projectFileUri, "..", "wally.toml");
+  const publishWallyFingerprint = async (): Promise<void> => {
+    let text: string;
+    try {
+      text = Buffer.from(await vscode.workspace.fs.readFile(wallyUri)).toString("utf8");
+    } catch {
+      return; // projeto sem wally.toml: nada a comparar
+    }
+    service?.sendWallyFingerprint(computeWallyFingerprint(text));
+  };
+  void publishWallyFingerprint();
+  const wallyWatcher = vscode.workspace.createFileSystemWatcher(wallyUri.fsPath);
+  wallyWatcher.onDidChange(() => void publishWallyFingerprint());
+  wallyWatcher.onDidCreate(() => void publishWallyFingerprint());
+  // Mesma lista dos watchers de mount: stopService() descarta todos juntos.
+  fileWatchers.push(wallyWatcher);
+
+  service.setOnWallyDrift(({ displayName }) => {
+    vscode.window.showWarningMessage(
+      `SyncTeam: ${displayName} está com dependências Wally diferentes das suas. ` +
+        `Rode \`wally install\` para alinhar.`,
+    );
   });
 
   service.setOnWriteRejected(({ diskPath, error }) => {

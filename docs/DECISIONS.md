@@ -1,6 +1,146 @@
 # Decisões registradas
 
-## 2026-09-19 (20ª rodada, mais recente) — Bug real do usuário: sessão própria destruída por outro Studio nunca voltava; cada Studio se via sozinho, cursor/seleção mortos junto
+## 2026-09-20 (21ª rodada, mais recente) — Feature nova criada no Studio não tinha destino no disco, e sumia em silêncio
+
+Pergunta do usuário sobre o modo Teams com o `rogen`: "como fica o syncback?".
+Medido no ModuxTemplate, e a resposta era pior do que parecia.
+
+O `rogen` deriva o `default.project.json` da estrutura de pastas e emite um
+ponto de montagem **por feature e lado** — 23 deles no template, todos no
+formato `ServerScriptService.server.Vital <- src/Vital/server`. **Nenhum cobre
+`ServerScriptService.server` sozinho.**
+
+Consequência: um script criado no Studio dentro de uma feature que já existe
+cai certo (`...server.Vital.NovoService` -> `src/Vital/server/NovoService.luau`),
+mas uma **feature nova** nascida no Studio não casa com prefixo nenhum.
+`resolveMountForDataModelPath` devolve `null`, `computeFullLayout` joga o
+caminho em `ignoredPaths`, e o arquivo **nunca chega ao disco**.
+
+Não é erro — é um `logger.info` no Output da extensão. Na prática isso é
+silêncio: quem está criando pasta no Studio não está lendo o Output do VS
+Code. Vê o script existir no Studio e assume que sincronizou.
+
+E é galinha-e-ovo: o rogen não pode mapear a pasta porque ela não existe no
+disco, e o disco não a ganha porque não há mapeamento.
+
+**A saída descartada**: inferir a convenção do rogen dentro do SyncTeam. Ela
+funciona — o formato é regular — mas acoplaria o SyncTeam a uma regra que vive
+cravada dentro de outra ferramenta e pode mudar sem aviso. O mapeamento por
+project file existe justamente para o SyncTeam não precisar saber disso.
+
+**A saída escolhida** (proposta do usuário): o projeto DECLARA o layout, e o
+SyncTeam lê a declaração em vez de adivinhar. `syncteam.json` ao lado do
+project file:
+
+```json
+{
+  "layout": {
+    "root": "src",
+    "sides": {
+      "client": "StarterPlayer/StarterPlayerScripts/client",
+      "server": "ServerScriptService/server",
+      "shared": "ReplicatedStorage/shared"
+    }
+  }
+}
+```
+
+`ServerScriptService/server/NovaFeature/NovoService` casa o lado `server`,
+sobra `NovaFeature/NovoService`, o primeiro segmento é a feature ->
+`src/NovaFeature/server/NovoService.luau`.
+
+### Fallback, não fonte de verdade
+
+É a decisão que sustenta o resto: a declaração só é consultada quando
+**nenhum** ponto de montagem casa. Existindo montagem, ela ganha sempre — há
+teste para isso.
+
+Sem essa regra o arquivo viraria uma terceira descrição concorrente do mesmo
+layout (o rogen crava a convenção, o project file a materializa, o json a
+declara), e três descrições divergem no primeiro caso estranho. Como último
+recurso, ele só responde a pergunta que hoje ninguém responde: "e quando não
+há nada ainda?". Na segunda vez o mount existe de verdade e a declaração
+deixa de ser consultada para aquele caminho.
+
+### Detalhes que custaram atenção
+
+- **Mount sintético em vez de caminho montado à mão.** A colocação devolve o
+  par `featureDir` + `featureDataModelPath`, que é exatamente a forma de um
+  ponto de montagem. Assim o `computeLayout` é reaproveitado e a regra de
+  `init.luau` para quem tem filhos sai de graça — há teste com dois scripts na
+  mesma feature nova, e o pai vira `init.luau`.
+- **Prefixo de lado mais longo vence.** Com o curto ganhando, uma feature
+  nasceria um nível acima e a passada seguinte do rogen a mapearia no lugar
+  errado.
+- **Pasta de feature sem script dentro não é colocada.** Criar pasta vazia não
+  ajudaria: o rogen só enxerga pasta que já tem `.luau` dentro.
+- **`layoutDeclaration` entra ANTES dos callbacks no construtor do
+  SyncBridge.** Os dois chamadores de teste passam três argumentos; pôr a
+  declaração no fim faria qualquer chamada futura de quatro argumentos ligar
+  em `onWriteRejected` sem o compilador reclamar, porque os dois são
+  opcionais.
+- **Declaração quebrada erra alto; ausente é normal.** Silenciar um
+  `syncteam.json` malformado devolveria o sintoma original, agora com o
+  usuário achando que configurou o fallback.
+- **Guarda de divergência na partida.** `findUnbackedSides` confere cada lado
+  declarado contra os mounts reais. Se alguém mudar a convenção no rogen e
+  esquecer do json, o aviso sai no primeiro boot em vez de no primeiro arquivo
+  perdido.
+- **Colocação por fallback é `warn`, não `info`.** É a primeira vez que aquela
+  feature toca o disco e o rogen só vai mapeá-la na passada seguinte; quem lê
+  o Output precisa poder confirmar que foi para onde queria.
+
+14 testes novos, 294 no total, suíte inteira verde.
+
+### Verificado contra dois Studios reais, e o que a bancada achou no caminho
+
+Rodado com dois Studios na mesma place em Team Create, dois harnesses em
+portas separadas, os dois workspaces com forma de rogen. Três achados, em
+ordem de gravidade:
+
+**1. O SyncTeam não sincronizava projeto Modux nenhum.** O harness subiu e
+imprimiu 3 pontos de montagem onde havia 23. `parseMountPoints` só aceitava
+`$path` como STRING, e o Rojo tem duas formas — a string e
+`{ "optional": "src/..." }`, que não falha quando a pasta ainda não existe. O
+rogen emite TODO mount de código na forma opcional, então num projeto Modux
+sobravam só os `Packages` escritos à mão. Nenhum erro, nenhum aviso: o objeto
+não casava com o `typeof === "string"` e era pulado.
+
+Medido: ModuxTemplate tem 3 `$path` string e 20 objeto; o Hide-or-Hit (V2,
+sem rogen) tem 5 string e 0 objeto — que é exatamente por que isso nunca
+apareceu em uso real até hoje. Corrigido, com três testes.
+
+**2. A impressão digital do Wally era publicada antes de existir plugin.** O
+envio saía 400 ms antes do `conectado em ws://...` e era descartado em
+silêncio, e o log dizia "publicada" do mesmo jeito — log mentiroso. Agora
+`onClientConnected` republica, o que cobre a primeira conexão e toda
+reconexão, e o log do harness diz "registrada".
+
+**3. O fallback de layout funcionou sem eu provocar.** Assim que os plugins
+conectaram, os dois harnesses colocaram sozinhos as features que existiam na
+place e não no disco:
+
+```
+WARN layout: feature nova sem ponto de montagem — colocada em
+             'src/Crono3/server' pela declaração de syncteam.json
+```
+
+`src/Crono1/server/Type.luau` até `Crono5` apareceram nos dois discos, com a
+inversão correta (`ServerScriptService/server/Crono1/Type` ->
+`src/Crono1/server/Type.luau`).
+
+Sobraram 9 caminhos ignorados, e eles são legítimos: são os módulos que ficam
+NO NÍVEL da feature (`ServerScriptService/server/Crono1`, que é ele próprio um
+ModuleScript). `resolveMountForDataModelPath` já recusa script na raiz de um
+ponto de montagem — "o próprio ponto de montagem não é um script
+sincronizável" — então o fallback só é consistente com uma limitação que já
+existia, não introduz uma nova.
+
+**O aviso de Wally atravessou nos dois sentidos**, com o nome certo de cada
+um, uma vez por lado, e parou sozinho quando os dois manifestos voltaram a
+bater.
+
+## 2026-09-19 (20ª rodada) — Bug real do usuário: sessão própria destruída por outro Studio nunca voltava; cada Studio se via sozinho, cursor/seleção mortos junto
 
 Usuário, com dois Studios reais em Team Create: "opa notei um erro, eles
 estão falando que o colaborador saiu, em um studio um está sozinho e em

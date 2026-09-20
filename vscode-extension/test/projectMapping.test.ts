@@ -304,3 +304,45 @@ describe("resolveDataModelPathForDiskChange (disco -> DataModel)", () => {
     }
   });
 });
+
+describe("parseMountPoints — $path na forma opcional do Rojo", () => {
+  // O rogen emite TODO mount de código como `{ optional: ... }`. Antes de
+  // 2026-09-20 isso era pulado em silêncio, e num projeto Modux o SyncTeam
+  // lia 3 mounts de 23 — sincronizava os Packages e nada do src/.
+  test("lê `{ optional }` igual a uma string", () => {
+    const mounts = parseMountPoints({
+      tree: {
+        ServerScriptService: {
+          server: {
+            Vital: { $path: { optional: "src/Vital/server" } },
+            Round: { $path: "src/Round/server" },
+          },
+        },
+      },
+    });
+    expect(mounts).toEqual([
+      { dataModelPath: "ServerScriptService/server/Vital", diskPath: "src/Vital/server" },
+      { dataModelPath: "ServerScriptService/server/Round", diskPath: "src/Round/server" },
+    ]);
+  });
+
+  test("normaliza igual nas duas formas", () => {
+    const mounts = parseMountPoints({
+      tree: { A: { $path: { optional: "src\\a\\" } }, B: { $path: "src\\a\\" } },
+    });
+    expect(mounts[0]?.diskPath).toBe("src/a");
+    expect(mounts[1]?.diskPath).toBe("src/a");
+  });
+
+  test("ignora forma que não traz caminho utilizável", () => {
+    const mounts = parseMountPoints({
+      tree: {
+        Vazio: { $path: { optional: "" } },
+        Errado: { $path: { caminho: "src/x" } },
+        Lista: { $path: ["src/x"] },
+        SoAgrupa: { Filho: { $path: "src/f" } },
+      },
+    });
+    expect(mounts).toEqual([{ dataModelPath: "SoAgrupa/Filho", diskPath: "src/f" }]);
+  });
+});

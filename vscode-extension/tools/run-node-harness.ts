@@ -13,6 +13,8 @@ import { SyncServer } from "../src/sync/SyncServer.js";
 import { SyncTeamService } from "../src/sync/SyncTeamService.js";
 import { NodeDiskIO } from "../src/sync/NodeDiskIO.js";
 import { parseMountPoints } from "../src/mapping/projectMapping.js";
+import { parseLayoutDeclaration } from "../src/mapping/layoutFallback.js";
+import { computeWallyFingerprint } from "../src/mapping/wallyFingerprint.js";
 import { createConsoleLogger, createFileLogger, createTeeLogger } from "../src/util/logger.js";
 
 const DEFAULT_PORT = 34980;
@@ -37,14 +39,48 @@ async function main(): Promise<void> {
   logger.info(`projeto: ${projectFile}`);
   logger.info(`pontos de montagem: ${mountPoints.map((m) => `${m.dataModelPath} -> ${m.diskPath}`).join(", ")}`);
 
+  // Declaracao de layout, se houver: e o que permite uma feature NOVA criada
+  // no Studio cair no disco quando nenhum ponto de montagem a cobre (ver
+  // mapping/layoutFallback.ts). Sem carregar aqui, o harness nao exercitaria
+  // esse caminho — e o harness e justamente o que permite medir sem ninguem
+  // clicando no VS Code.
+  let layoutDeclaration = null;
+  try {
+    const declRaw = await fs.readFile(path.join(projectDir, "syncteam.json"), "utf8");
+    layoutDeclaration = parseLayoutDeclaration(JSON.parse(declRaw));
+    if (layoutDeclaration) {
+      logger.info(`syncteam.json: raiz '${layoutDeclaration.root}', lados ${Object.keys(layoutDeclaration.sides).join(", ")}`);
+    }
+  } catch {
+    // ausente e o caso normal
+  }
+
   const port = Number(process.env.SYNCTEAM_PORT ?? DEFAULT_PORT);
   const diskIO = new NodeDiskIO(projectDir);
   const server = new SyncServer(port, logger);
-  const service = new SyncTeamService(server, mountPoints, diskIO, logger);
+  const service = new SyncTeamService(server, mountPoints, diskIO, logger, false, layoutDeclaration);
 
   const watcher = diskIO.watch((relPath) => service.notifyLocalFileChange(relPath));
 
   await service.start();
+
+  // Mesma publicacao que a extensao faz: sem ela o plugin nunca teria a
+  // impressao digital deste lado para comparar com a do outro Studio.
+  try {
+    const wally = await fs.readFile(path.join(projectDir, "wally.toml"), "utf8");
+    service.sendWallyFingerprint(computeWallyFingerprint(wally));
+    // "registrada", nao "publicada": neste instante quase nunca ha plugin
+    // conectado, e o envio e descartado. Quem entrega de verdade e o
+    // republish de onClientConnected. Dizer "publicada" aqui foi um log
+    // mentiroso que custou uma rodada de teste.
+    logger.info("wally.toml: impressão digital registrada");
+  } catch {
+    // projeto sem wally.toml: nada a comparar
+  }
+  service.setOnWallyDrift(({ displayName }) => {
+    logger.warn(`WALLY DRIFT: ${displayName} está com dependências diferentes — rode \`wally install\``);
+  });
+
   logger.info(`harness rodando. Abra o Studio com o plugin M1 apontado para a porta ${port}.`);
 
   const shutdown = async () => {

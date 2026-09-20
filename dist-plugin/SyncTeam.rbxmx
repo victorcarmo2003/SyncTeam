@@ -64,6 +64,7 @@ local SourceWatcher = require(script.SourceWatcher)
 local TeamCreateElection = require(script.TeamCreateElection)
 local TeamCreateLease = require(script.TeamCreateLease)
 local TeamCreatePresence = require(script.TeamCreatePresence)
+local TeamCreateWally = require(script.TeamCreateWally)
 local TeamCreateUndoGuard = require(script.TeamCreateUndoGuard)
 local PluginUI = require(script.ui.PluginUI)
 -- ReSync (2026-08-02, docs/DECISIONS.md "5ª rodada"): usado só para o toast
@@ -551,6 +552,12 @@ local function handleMessage(raw)
 		else
 			log("watchedRoots: campo 'roots' ausente/inválido, ignorado.")
 		end
+	elseif message.kind == "wallyFingerprint" then
+		-- Espontânea, sem ack, mesmo formato de presenceUpdate: a extensão
+		-- calcula a impressão digital do wally.toml dela e publica na própria
+		-- sessão, para o outro Studio comparar (ver TeamCreateWally.luau).
+		-- Degrada sem erro se a sessão local ainda não existir.
+		TeamCreateWally.setOwnFingerprint(message.value)
 	elseif message.kind == "presenceUpdate" then
 		-- M4: espontânea, sem requestId, sem ack (spec docs/MILESTONES.md) —
 		-- só grava a própria Presence; TeamCreatePresence.updateOwnPresence já
@@ -948,6 +955,7 @@ local function stop(silent)
 	-- que depende antes do que é dependido" já usada neste arquivo.
 	TeamCreateLease.stop()
 	TeamCreatePresence.stop()
+	TeamCreateWally.stop()
 	-- TeamCreateElection.stop() remove a própria entrada de Sessions/ de forma
 	-- SÍNCRONA (M3.1) — mesmo cuidado do fix de WebStreamClient abaixo:
 	-- plugin.Unloading pode não dar chance de uma coroutine assíncrona notar
@@ -1054,6 +1062,10 @@ local function start(pluginObject)
 	-- TeamCreateElection.getSessionFolder()/getClientId() já existirem.
 	TeamCreatePresence.init(sendMessage)
 	TeamCreatePresence.start()
+	-- Depois de TeamCreateElection pelo mesmo motivo dos dois acima: publicar
+	-- e comparar dependem de getSessionFolder()/getClientId().
+	TeamCreateWally.init(sendMessage)
+	TeamCreateWally.start()
 	task.spawn(runConnection, myToken, ports, explicitPort, pluginObject)
 	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
 	-- continua encaminhado por WS, só não polui o Output a cada conexão. O
@@ -5601,11 +5613,228 @@ return TeamCreateUndoGuard
 ]]></string>
       </Properties>
     </Item>
-    <Item class="Folder" referent="10">
+    <Item class="ModuleScript" referent="10">
+      <Properties>
+        <string name="Name">TeamCreateWally</string>
+        <string name="Source"><![CDATA[-- SyncTeam — avisa quando o colega mexeu nas dependências Wally.
+--
+-- O buraco que isto fecha: `Packages/`, `ServerPackages/` e `DevPackages/`
+-- ficam DE FORA do live-edit-sync de propósito (ver
+-- vscode-extension/src/mapping/wallyPackageFolders.ts, decisão de
+-- 2026-07-16) — dois devs podem ter `Packages/` divergentes, e empurrar
+-- Source de pacote vendorizado pelo Team Create mudaria a dependência de
+-- todo mundo em silêncio.
+--
+-- A consequência é que uma dependência NOVA nunca atravessa. O dev A escreve
+-- no `wally.toml`, roda `wally install`, e o código dele chega no Studio do
+-- dev B requerendo `ReplicatedStorage.Packages.NovaLib` — que só existe na
+-- máquina do A. B vê `NovaLib is not a valid member` e não tem como saber
+-- que a causa foi uma linha num arquivo que nem sincroniza.
+--
+-- A saída NÃO é sincronizar o `wally.toml` nem os pacotes: continua valendo
+-- que cada máquina resolve as próprias dependências. O que atravessa é uma
+-- IMPRESSÃO DIGITAL — uma string curta que a extensão calcula do `wally.toml`
+-- e publica na própria sessão. O outro lado compara com a dele e, quando
+-- diferem, avisa. Ninguém instala nada por conta própria; o dev decide.
+--
+-- Mesmo caminho da presença (TeamCreatePresence.luau), e por isso o mesmo
+-- formato: valor na pasta da própria sessão, Team Create replica, o outro
+-- plugin lê e emite para a extensão dele.
+
+local TeamCreateElection = require(script.Parent.TeamCreateElection)
+local TeamCreateSchema = require(script.Parent.TeamCreateSchema)
+local Config = require(script.Parent.Config)
+local Logger = require(script.Parent.Logger)
+
+local TeamCreateWally = {}
+
+-- Nome do valor dentro de Sessions/<clientId>. Fica FORA de
+-- `SESSION_VALUE_CLASSES` do TeamCreateElection de propósito: `readSessionEntry`
+-- devolve nil se QUALQUER valor declarado lá faltar, então acrescentar a chave
+-- naquela tabela faria a sessão de um plugin mais velho sumir inteira do
+-- roster durante uma atualização escalonada. Aqui é lido como opcional.
+local VALUE_NAME = "WallyFingerprint"
+
+local sendMessage = nil
+local ownFingerprint = ""
+-- Lido, não é dono — TeamCreateElection é o dono. Reavaliado a cada uso pelo
+-- mesmo motivo do resto do schema: a reconciliação de duplicatas do Team
+-- Create pode trocar a Instance canônica debaixo de uma referência cacheada.
+local sessionsFolder = nil
+-- clientId -> última impressão digital pela qual já avisamos. Sem isto o
+-- aviso sairia a cada tick enquanto a divergência durasse, e ela dura até
+-- alguém rodar `wally install` — podem ser minutos.
+local warnedByClientId = {}
+local enabled = false
+local currentToken = 0
+
+function TeamCreateWally.init(onMessage)
+	sendMessage = onMessage
+end
+
+local function ensureSessionsFolder()
+	sessionsFolder = TeamCreateSchema.ensureFolder("Sessions")
+	return sessionsFolder
+end
+
+-- Nome de exibição de uma sessão, com o clientId como fallback. Duplicado de
+-- TeamCreatePresence.describeClient pelo mesmo motivo que ele duplica de
+-- TeamCreateLease: são cinco linhas, e cruzar os módulos por elas criaria
+-- dependência entre peças que hoje não se conhecem.
+local function describeClient(folder, clientId)
+	local username = folder:FindFirstChild("Username")
+	if username ~= nil and username:IsA("StringValue") and username.Value ~= "" then
+		return username.Value
+	end
+	return clientId
+end
+
+--- Publica a impressão digital local na própria sessão.
+---
+--- Chamado pela extensão via mensagem espontânea, no boot e sempre que o
+--- `wally.toml` muda. Guarda o valor num módulo local também porque a sessão
+--- pode ser recriada a qualquer momento pela auto-cura de
+--- `TeamCreateElection` — quando isso acontece, o valor precisa voltar, e
+--- quem o reescreve é o próximo `checkDrift`.
+function TeamCreateWally.setOwnFingerprint(fingerprint)
+	if type(fingerprint) ~= "string" then
+		return
+	end
+	ownFingerprint = fingerprint
+	TeamCreateWally.publish()
+end
+
+--- Grava `ownFingerprint` na pasta da própria sessão, criando o valor se
+--- preciso. Silencioso quando não há sessão (eleição parada, ou pasta ainda
+--- sendo recriada) — quem chama trata como melhor esforço, nunca erro.
+function TeamCreateWally.publish()
+	if ownFingerprint == "" then
+		return
+	end
+	local sessionFolder = TeamCreateElection.getSessionFolder()
+	if sessionFolder == nil then
+		return
+	end
+	local value = sessionFolder:FindFirstChild(VALUE_NAME)
+	if value == nil then
+		value = Instance.new("StringValue")
+		value.Name = VALUE_NAME
+		-- Mesma mitigação de undo do resto do schema (ver TeamCreateSchema).
+		value.Archivable = false
+		value.Parent = sessionFolder
+	end
+	if value.Value ~= ownFingerprint then
+		value.Value = ownFingerprint
+	end
+end
+
+--- Compara a impressão digital local com a das outras sessões e avisa quando
+--- alguma diverge. Chamado a cada tick da eleição.
+---
+--- Só avisa uma vez por par (clientId, impressão digital do outro): a
+--- divergência persiste até alguém rodar `wally install`, e repetir o toast a
+--- cada dois segundos seria ruído, não informação.
+function TeamCreateWally.checkDrift()
+	-- Republica antes de comparar: se a sessão foi recriada pela auto-cura, o
+	-- valor não está mais lá, e sem isto o outro lado passaria a ver a NOSSA
+	-- impressão como ausente e nós nunca a reporíamos.
+	TeamCreateWally.publish()
+
+	if ownFingerprint == "" then
+		return
+	end
+
+	local ownClientId = TeamCreateElection.getClientId()
+	local vistos = {}
+	for _, folder in ipairs(ensureSessionsFolder():GetChildren()) do
+		if not folder:IsA("Folder") or folder.Name == ownClientId then
+			continue
+		end
+		local clientId = folder.Name
+		local value = folder:FindFirstChild(VALUE_NAME)
+		-- Ausente não é divergente: o colega pode estar num plugin mais velho,
+		-- ou a sessão dele acabou de nascer e a extensão ainda não publicou.
+		-- Avisar nesse caso seria alarme falso na conexão de todo mundo.
+		if value == nil or not value:IsA("StringValue") or value.Value == "" then
+			continue
+		end
+
+		vistos[clientId] = true
+		if value.Value == ownFingerprint then
+			-- Voltaram a bater: esquecer para que uma divergência FUTURA avise
+			-- de novo.
+			warnedByClientId[clientId] = nil
+			continue
+		end
+		if warnedByClientId[clientId] == value.Value then
+			continue
+		end
+		warnedByClientId[clientId] = value.Value
+
+		local quem = describeClient(folder, clientId)
+		Logger.notify(("%s está com dependências Wally diferentes das suas — rode `wally install`"):format(quem))
+		if sendMessage ~= nil then
+			sendMessage({
+				kind = "wallyDrift",
+				clientId = clientId,
+				displayName = quem,
+			})
+		end
+	end
+
+	-- Sessão que saiu para de ser lembrada, senão o aviso nunca mais sairia
+	-- para aquele clientId se ele voltasse com a mesma divergência.
+	for clientId in warnedByClientId do
+		if not vistos[clientId] then
+			warnedByClientId[clientId] = nil
+		end
+	end
+end
+
+--- Sobe o ciclo que compara as impressões digitais.
+---
+--- Cadência própria em vez de pendurar no tick da eleição: divergência de
+--- dependência muda em escala de minutos (alguém edita o wally.toml e roda
+--- `wally install`), não de segundos, e o ciclo da eleição já carrega pulso,
+--- liderança e limpeza. Mesmo intervalo da presença por simplicidade.
+function TeamCreateWally.start()
+	if enabled then
+		return
+	end
+	enabled = true
+	currentToken += 1
+	local myToken = currentToken
+	warnedByClientId = {}
+
+	task.spawn(function()
+		while enabled and currentToken == myToken do
+			task.wait(Config.POLL_INTERVAL_SECONDS)
+			if enabled and currentToken == myToken then
+				TeamCreateWally.checkDrift()
+			end
+		end
+	end)
+
+	Logger.debug("wally: ciclo de comparação iniciado.")
+end
+
+function TeamCreateWally.stop()
+	enabled = false
+	currentToken += 1
+	ownFingerprint = ""
+	warnedByClientId = {}
+	sessionsFolder = nil
+end
+
+return TeamCreateWally
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="11">
       <Properties>
         <string name="Name">ui</string>
       </Properties>
-      <Item class="ModuleScript" referent="11">
+      <Item class="ModuleScript" referent="12">
         <Properties>
           <string name="Name">PluginUI</string>
           <string name="Source"><![CDATA[-- SyncTeam — Orquestração do painel de status do plugin (M4.5)
@@ -6141,7 +6370,7 @@ return PluginUI
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="12">
+      <Item class="ModuleScript" referent="13">
         <Properties>
           <string name="Name">StatusPanel</string>
           <string name="Source"><![CDATA[-- SyncTeam — Árvore de componentes Vide do painel de status (M4.5)
@@ -7575,7 +7804,7 @@ return StatusPanel
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">Theme</string>
           <string name="Source"><![CDATA[-- SyncTeam — Constantes visuais do painel de status (M4.5)
@@ -7740,7 +7969,7 @@ return Theme
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="15">
         <Properties>
           <string name="Name">Toast</string>
           <string name="Source"><![CDATA[-- SyncTeam — Notificação flutuante (ScreenGui em CoreGui) do plugin (M4.5+)
@@ -8200,26 +8429,26 @@ return Toast
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="15">
+    <Item class="Folder" referent="16">
       <Properties>
         <string name="Name">Packages</string>
       </Properties>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">Vide</string>
           <string name="Source"><![CDATA[return require(script.Parent._Index["centau_vide@0.4.1"]["vide"])
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Folder" referent="17">
+      <Item class="Folder" referent="18">
         <Properties>
           <string name="Name">_Index</string>
         </Properties>
-        <Item class="Folder" referent="18">
+        <Item class="Folder" referent="19">
           <Properties>
             <string name="Name">centau_vide@0.4.1</string>
           </Properties>
-          <Item class="ModuleScript" referent="19">
+          <Item class="ModuleScript" referent="20">
             <Properties>
               <string name="Name">vide</string>
               <string name="Source"><![CDATA[assert(game, "when using vide outside of Roblox, require lib.luau instead")
@@ -8234,7 +8463,7 @@ export type Context<T> = vide.Context<T>
 return vide
 ]]></string>
             </Properties>
-            <Item class="ModuleScript" referent="20">
+            <Item class="ModuleScript" referent="21">
               <Properties>
                 <string name="Name">action</string>
                 <string name="Source"><![CDATA[type Action = {
@@ -8265,7 +8494,7 @@ end
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="21">
+            <Item class="ModuleScript" referent="22">
               <Properties>
                 <string name="Name">apply</string>
                 <string name="Source"><![CDATA[local typeof = game and typeof or require "../test/mock".typeof :: never
@@ -8433,7 +8662,7 @@ return apply
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="22">
+            <Item class="ModuleScript" referent="23">
               <Properties>
                 <string name="Name">batch</string>
                 <string name="Source"><![CDATA[local flags = require "./flags"
@@ -8462,7 +8691,7 @@ return batch
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="23">
+            <Item class="ModuleScript" referent="24">
               <Properties>
                 <string name="Name">branch</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -8508,7 +8737,7 @@ return branch
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="24">
+            <Item class="ModuleScript" referent="25">
               <Properties>
                 <string name="Name">changed</string>
                 <string name="Source"><![CDATA[local action = require "./action"()
@@ -8532,7 +8761,7 @@ return changed
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="25">
+            <Item class="ModuleScript" referent="26">
               <Properties>
                 <string name="Name">cleanup</string>
                 <string name="Source"><![CDATA[local typeof = game and typeof or require "../test/mock".typeof :: never
@@ -8581,7 +8810,7 @@ return cleanup ::
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="26">
+            <Item class="ModuleScript" referent="27">
               <Properties>
                 <string name="Name">context</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -8661,7 +8890,7 @@ return context
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="27">
+            <Item class="ModuleScript" referent="28">
               <Properties>
                 <string name="Name">create</string>
                 <string name="Source"><![CDATA[local typeof = game and typeof or require "../test/mock".typeof :: never
@@ -8774,7 +9003,7 @@ return create :: Create
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="28">
+            <Item class="ModuleScript" referent="29">
               <Properties>
                 <string name="Name">defaults</string>
                 <string name="Source"><![CDATA[local Enum = game and Enum or require "../test/mock".Enum :: never
@@ -8893,7 +9122,7 @@ return {
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="29">
+            <Item class="ModuleScript" referent="30">
               <Properties>
                 <string name="Name">derive</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -8917,7 +9146,7 @@ return derive
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="30">
+            <Item class="ModuleScript" referent="31">
               <Properties>
                 <string name="Name">effect</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -8935,7 +9164,7 @@ return effect :: (<T>(callback: (T) -> T, initial_value: T) -> ()) & ((callback:
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="31">
+            <Item class="ModuleScript" referent="32">
               <Properties>
                 <string name="Name">flags</string>
                 <string name="Source"><![CDATA[local function inline_test(): string
@@ -8953,7 +9182,7 @@ return {
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="32">
+            <Item class="ModuleScript" referent="33">
               <Properties>
                 <string name="Name">graph</string>
                 <string name="Source"><![CDATA[local flags = require "./flags"
@@ -9280,7 +9509,7 @@ return table.freeze {
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="33">
+            <Item class="ModuleScript" referent="34">
               <Properties>
                 <string name="Name">implicit_effect</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -9411,7 +9640,7 @@ return {
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="34">
+            <Item class="ModuleScript" referent="35">
               <Properties>
                 <string name="Name">indexes</string>
                 <string name="Source"><![CDATA[local flags = require "./flags"
@@ -9538,7 +9767,7 @@ return indexes
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="35">
+            <Item class="ModuleScript" referent="36">
               <Properties>
                 <string name="Name">lib</string>
                 <string name="Source"><![CDATA[local version = { major = 0, minor = 4, patch = 1 }
@@ -9664,7 +9893,7 @@ return vide
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="36">
+            <Item class="ModuleScript" referent="37">
               <Properties>
                 <string name="Name">mount</string>
                 <string name="Source"><![CDATA[local root = require "./root"
@@ -9681,7 +9910,7 @@ return mount :: (<T>(component: () -> T, target: Instance) -> () -> ()) & ((comp
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="37">
+            <Item class="ModuleScript" referent="38">
               <Properties>
                 <string name="Name">read</string>
                 <string name="Source"><![CDATA[local function read<T>(value: T | () -> T): T
@@ -9692,7 +9921,7 @@ return read
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="38">
+            <Item class="ModuleScript" referent="39">
               <Properties>
                 <string name="Name">root</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -9733,7 +9962,7 @@ return root :: <T...>(fn: (destroy: () -> ()) -> T...) -> (() -> (), T...)
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="39">
+            <Item class="ModuleScript" referent="40">
               <Properties>
                 <string name="Name">show</string>
                 <string name="Source"><![CDATA[local source = require "./source"
@@ -9775,7 +10004,7 @@ return show
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="40">
+            <Item class="ModuleScript" referent="41">
               <Properties>
                 <string name="Name">source</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -9812,7 +10041,7 @@ return source :: (<T>(initial_value: T) -> Source<T>) & (<T>() -> Source<T>)
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="41">
+            <Item class="ModuleScript" referent="42">
               <Properties>
                 <string name="Name">spring</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -10146,7 +10375,7 @@ end
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="42">
+            <Item class="ModuleScript" referent="43">
               <Properties>
                 <string name="Name">switch</string>
                 <string name="Source"><![CDATA[local branch = require "./branch"
@@ -10266,7 +10495,7 @@ return switch
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="43">
+            <Item class="ModuleScript" referent="44">
               <Properties>
                 <string name="Name">timeout</string>
                 <string name="Source"><![CDATA[local queue = {} :: {
@@ -10299,7 +10528,7 @@ return function() return timeout, update_timeouts end
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="44">
+            <Item class="ModuleScript" referent="45">
               <Properties>
                 <string name="Name">untrack</string>
                 <string name="Source"><![CDATA[local graph = require "./graph"
@@ -10330,7 +10559,7 @@ return untrack :: ( <T>(fn: () -> T) -> T ) & ( (fn: () -> ()) -> () )
 ]]></string>
               </Properties>
             </Item>
-            <Item class="ModuleScript" referent="45">
+            <Item class="ModuleScript" referent="46">
               <Properties>
                 <string name="Name">values</string>
                 <string name="Source"><![CDATA[local flags = require "./flags"

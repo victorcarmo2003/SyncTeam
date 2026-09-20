@@ -9,6 +9,7 @@
 // node:fs puro, conforme a tarefa pediu.
 
 import { computeLayout, parseDiskPath, type LayoutInputEntry } from "./rojoPathMapping.js";
+import { resolveFallbackPlacement, type LayoutDeclaration } from "./layoutFallback.js";
 import type { ScriptClassName } from "../protocol.js";
 
 export interface MountPoint {
@@ -33,6 +34,13 @@ export interface FullLayoutResult {
   layout: FullLayoutEntry[];
   /** Paths que não caem sob nenhum ponto de montagem conhecido — informativo, não erro. */
   ignoredPaths: string[];
+  /**
+   * Pastas de feature que não existem como ponto de montagem e foram
+   * colocadas pela declaração de layout (ver layoutFallback.ts). Quem chama
+   * usa para avisar: é a primeira vez que aquela feature toca o disco, e o
+   * `rogen` só vai mapeá-la na passada seguinte.
+   */
+  placedByFallback: string[];
 }
 
 export interface ResolvedMountForDataModelPath {
@@ -71,6 +79,35 @@ function stripTrailingSlash(value: string): string {
  *   ou não é objeto) — estado de arquivo de projeto inválido, não deve ser
  *   silenciado.
  */
+/**
+ * Le um `$path`, nas DUAS formas que o Rojo aceita: a string simples
+ * (`"$path": "src/server"`) e a forma opcional
+ * (`"$path": { "optional": "src/server" }`), que nao falha quando a pasta
+ * ainda nao existe.
+ *
+ * A segunda forma nao era reconhecida ate 2026-09-20, e o efeito era grave e
+ * silencioso: o `rogen` emite TODO mount de codigo como opcional, entao num
+ * projeto Modux o SyncTeam enxergava apenas os `Packages` escritos a mao e
+ * nao sincronizava fonte nenhuma. Medido no ModuxTemplate — 3 mounts lidos
+ * de 23 reais. Nenhum erro, nenhum aviso: o `$path` objeto simplesmente nao
+ * casava com o `typeof === "string"` e era pulado.
+ *
+ * Devolve `null` quando nao ha caminho utilizavel, que e o caso legitimo de
+ * um no que so agrupa filhos.
+ */
+function readPathValue(rawPath: unknown): string | null {
+  if (typeof rawPath === "string") {
+    return rawPath.length > 0 ? stripTrailingSlash(normalizeSlashes(rawPath)) : null;
+  }
+  if (typeof rawPath === "object" && rawPath !== null && !Array.isArray(rawPath)) {
+    const optional = (rawPath as { optional?: unknown }).optional;
+    if (typeof optional === "string" && optional.length > 0) {
+      return stripTrailingSlash(normalizeSlashes(optional));
+    }
+  }
+  return null;
+}
+
 export function parseMountPoints(projectJson: unknown): MountPoint[] {
   if (typeof projectJson !== "object" || projectJson === null || Array.isArray(projectJson)) {
     throw new Error("parseMountPoints: default.project.json inválido (esperado um objeto)");
@@ -93,11 +130,11 @@ export function parseMountPoints(projectJson: unknown): MountPoint[] {
       }
       const childSegments = [...segments, key];
       const valueObj = value as Record<string, unknown>;
-      const rawPath = valueObj.$path;
-      if (typeof rawPath === "string" && rawPath.length > 0) {
+      const diskPath = readPathValue(valueObj.$path);
+      if (diskPath !== null) {
         mountPoints.push({
           dataModelPath: childSegments.join("/"),
-          diskPath: stripTrailingSlash(normalizeSlashes(rawPath)),
+          diskPath,
         });
       }
       walk(valueObj, childSegments);
@@ -207,12 +244,37 @@ export function computeWatchedRoots(mountPoints: MountPoint[]): string[] {
  *   dentro do mesmo ponto de montagem — estado inconsistente, não deve ser
  *   engolido silenciosamente.
  */
-export function computeFullLayout(entries: DataModelEntry[], mountPoints: MountPoint[]): FullLayoutResult {
+export function computeFullLayout(
+  entries: DataModelEntry[],
+  mountPoints: MountPoint[],
+  layoutDeclaration?: LayoutDeclaration | null,
+): FullLayoutResult {
   const byMount = new Map<MountPoint, LayoutInputEntry[]>();
   const ignoredPaths: string[] = [];
 
+  // Mounts sintéticos, um por pasta de feature que a declaração colocou.
+  // Reusados entre entradas para que dois scripts da mesma feature nova caiam
+  // no mesmo grupo e o `computeLayout` decida init.luau vendo os dois.
+  const synthetic = new Map<string, MountPoint>();
+  const placedByFallback: string[] = [];
+
   for (const entry of entries) {
-    const resolved = resolveMountForDataModelPath(entry.path, mountPoints);
+    let resolved = resolveMountForDataModelPath(entry.path, mountPoints);
+
+    // Nenhuma montagem cobre: última chance antes de ignorar de vez.
+    if (resolved === null && layoutDeclaration) {
+      const placement = resolveFallbackPlacement(entry.path, layoutDeclaration);
+      if (placement !== null) {
+        let mount = synthetic.get(placement.featureDir);
+        if (mount === undefined) {
+          mount = { dataModelPath: placement.featureDataModelPath, diskPath: placement.featureDir };
+          synthetic.set(placement.featureDir, mount);
+          placedByFallback.push(placement.featureDir);
+        }
+        resolved = { mount, relativeInstancePath: placement.relativeInstancePath };
+      }
+    }
+
     if (resolved === null) {
       ignoredPaths.push(entry.path);
       continue;
@@ -239,7 +301,7 @@ export function computeFullLayout(entries: DataModelEntry[], mountPoints: MountP
     }
   }
 
-  return { layout, ignoredPaths };
+  return { layout, ignoredPaths, placedByFallback };
 }
 
 /**

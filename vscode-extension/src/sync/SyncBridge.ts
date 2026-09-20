@@ -15,6 +15,7 @@
 // fake, sem precisar do VS Code nem de um plugin real.
 
 import { computeFullLayout, resolveDataModelPathForDiskChange, type DataModelEntry, type MountPoint } from "../mapping/projectMapping.js";
+import type { LayoutDeclaration } from "../mapping/layoutFallback.js";
 import { isInsideExcludedPackageFolder } from "../mapping/wallyPackageFolders.js";
 import { isValidClassName, type ScriptClassName } from "../protocol.js";
 import { posixDirname, type DiskIO } from "./DiskIO.js";
@@ -70,6 +71,17 @@ export class SyncBridge {
     private readonly mountPoints: MountPoint[],
     private readonly diskIO: DiskIO,
     private readonly logger: Logger,
+    /**
+     * Onde pendurar uma instancia que nenhum ponto de montagem cobre (ver
+     * mapping/layoutFallback.ts). `null` e o normal: sem declaracao, o
+     * comportamento e o de sempre — o caminho vai para `ignoredPaths`.
+     *
+     * Vem ANTES dos callbacks de proposito: os dois chamadores de teste
+     * passam tres argumentos, e por a declaracao no fim faria qualquer
+     * chamada futura de quatro argumentos ligar em `onWriteRejected` sem o
+     * compilador reclamar, porque os dois sao opcionais.
+     */
+    private readonly layoutDeclaration: LayoutDeclaration | null = null,
     private onWriteRejected?: OnWriteRejectedCallback,
     private onSyncConflict?: OnSyncConflictCallback,
   ) {}
@@ -150,13 +162,22 @@ export class SyncBridge {
 
     let result;
     try {
-      result = computeFullLayout(entries, this.mountPoints);
+      result = computeFullLayout(entries, this.mountPoints, this.layoutDeclaration);
     } catch (error) {
       this.logger.error(`layout: erro recomputando layout (${reason}): ${(error as Error).message}`);
       return;
     }
     for (const ignoredPath of result.ignoredPaths) {
       this.logger.info(`layout: '${ignoredPath}' fora de qualquer ponto de montagem configurado — ignorado`);
+    }
+    // `warn`, nao `info`: e a primeira vez que aquela feature toca o disco, e
+    // o gerador do project file so vai mapea-la na passada seguinte. Ate la o
+    // caminho depende da declaracao estar certa, e quem le o Output precisa
+    // poder confirmar que foi para onde queria.
+    for (const featureDir of result.placedByFallback) {
+      this.logger.warn(
+        `layout: feature nova sem ponto de montagem — colocada em '${featureDir}' pela declaração de syncteam.json`,
+      );
     }
     for (const { dataModelPath, diskPath } of result.layout) {
       const uuid = uuidByPath.get(dataModelPath);
@@ -419,7 +440,7 @@ export class SyncBridge {
     const entries: DataModelEntry[] = Array.from(this.scripts.values(), ({ path, className: c }) => ({ path, className: c }));
     let layoutResult;
     try {
-      layoutResult = computeFullLayout(entries, this.mountPoints);
+      layoutResult = computeFullLayout(entries, this.mountPoints, this.layoutDeclaration);
     } catch (error) {
       this.logger.error(`scriptMoved '${uuid}': erro calculando novo layout: ${(error as Error).message}`);
       return;

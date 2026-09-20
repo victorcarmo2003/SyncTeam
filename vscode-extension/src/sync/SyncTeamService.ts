@@ -7,6 +7,7 @@ import { SyncServer } from "./SyncServer.js";
 import { LeaseTracker } from "./LeaseTracker.js";
 import type { DiskIO } from "./DiskIO.js";
 import { computeWatchedRoots, type MountPoint } from "../mapping/projectMapping.js";
+import type { LayoutDeclaration } from "../mapping/layoutFallback.js";
 import type { Logger } from "../util/logger.js";
 import type { RawMessage } from "../protocol.js";
 import type { PresenceTransport, PresenceUpdatePayload } from "../presence/PresencePublisher.js";
@@ -92,6 +93,9 @@ export class SyncTeamService {
   private onConfirmResync: ConfirmResyncCallback | null = null;
   // multiSync: dedupe de espontânea duplicada (ver routeSpontaneous). Fica
   // null/0 até a primeira mensagem processada; só ativo quando `multiSync`.
+  private onWallyDrift?: (event: { clientId: string; displayName: string }) => void;
+  /** Última impressão digital do wally.toml, para republicar a cada conexão. */
+  private wallyFingerprint: string | null = null;
   private lastSpontaneousSignature: string | null = null;
   private lastSpontaneousAt = 0;
 
@@ -191,8 +195,9 @@ export class SyncTeamService {
     diskIO: DiskIO,
     private readonly logger: Logger,
     private readonly multiSync: boolean = false,
+    layoutDeclaration: LayoutDeclaration | null = null,
   ) {
-    this.bridge = new SyncBridge(mountPoints, diskIO, logger);
+    this.bridge = new SyncBridge(mountPoints, diskIO, logger, layoutDeclaration);
     this.transport = { request: (message) => this.server.request(message) };
     this.presenceTransport = { sendPresenceUpdate: (payload) => this.sendPresenceUpdate(payload) };
 
@@ -206,6 +211,15 @@ export class SyncTeamService {
         // M4: canal novo (ou reconectado) — todo estado de presença remota
         // observado antes desta conexão não é mais confiável.
         this.onPresenceReset?.();
+
+        // A impressão digital do wally.toml vive na sessão do plugin, e uma
+        // sessão nova nasce sem ela. Sem republicar aqui, o outro Studio
+        // nunca teria o que comparar depois de uma reconexão — e nem na
+        // PRIMEIRA conexão, porque quem publica o faz no boot, antes de
+        // existir plugin.
+        if (this.wallyFingerprint !== null) {
+          this.server.sendSpontaneous({ kind: "wallyFingerprint", value: this.wallyFingerprint });
+        }
 
         // watchedRoots (2026-07-29, ver protocol.ts): manda a lista de
         // serviços de topo referenciados pelos mount points do
@@ -266,6 +280,31 @@ export class SyncTeamService {
    */
   setOnWriteRejected(callback: OnWriteRejectedCallback): void {
     this.bridge.setOnWriteRejected(callback);
+  }
+
+  /**
+   * Avisa que um colaborador está com dependências Wally diferentes das
+   * suas. Mesmo padrão de `setOnWriteRejected`: quem mostra ao usuário é
+   * extension.ts, porque este módulo também roda no harness Node e não
+   * importa `vscode`.
+   */
+  setOnWallyDrift(callback: (event: { clientId: string; displayName: string }) => void): void {
+    this.onWallyDrift = callback;
+  }
+
+  /**
+   * Publica no plugin a impressão digital do `wally.toml` local, para o outro
+   * Studio comparar com a dele.
+   *
+   * Guarda o valor porque quem chama publica no boot, e no boot normalmente
+   * ainda NÃO há plugin conectado — medido contra Studio real: a mensagem saiu
+   * 400 ms antes do `conectado em ws://...` e foi descartada em silêncio, e o
+   * lado de lá nunca teve o que comparar. Agora `onClientConnected`
+   * republica, então uma conexão ou reconexão sempre recupera.
+   */
+  sendWallyFingerprint(value: string): void {
+    this.wallyFingerprint = value;
+    this.server.sendSpontaneous({ kind: "wallyFingerprint", value });
   }
 
   /**
@@ -513,6 +552,12 @@ export class SyncTeamService {
         break;
       case "presenceLeft":
         this.handlePresenceLeft(message);
+        break;
+      case "wallyDrift":
+        this.onWallyDrift?.({
+          clientId: String(message.clientId),
+          displayName: String(message.displayName),
+        });
         break;
       case "log":
         this.handleLog(message);

@@ -59,6 +59,7 @@ local SourceWatcher = require(script.SourceWatcher)
 local TeamCreateElection = require(script.TeamCreateElection)
 local TeamCreateLease = require(script.TeamCreateLease)
 local TeamCreatePresence = require(script.TeamCreatePresence)
+local TeamCreateWally = require(script.TeamCreateWally)
 local TeamCreateUndoGuard = require(script.TeamCreateUndoGuard)
 local PluginUI = require(script.ui.PluginUI)
 -- ReSync (2026-08-02, docs/DECISIONS.md "5ª rodada"): usado só para o toast
@@ -546,6 +547,12 @@ local function handleMessage(raw)
 		else
 			log("watchedRoots: campo 'roots' ausente/inválido, ignorado.")
 		end
+	elseif message.kind == "wallyFingerprint" then
+		-- Espontânea, sem ack, mesmo formato de presenceUpdate: a extensão
+		-- calcula a impressão digital do wally.toml dela e publica na própria
+		-- sessão, para o outro Studio comparar (ver TeamCreateWally.luau).
+		-- Degrada sem erro se a sessão local ainda não existir.
+		TeamCreateWally.setOwnFingerprint(message.value)
 	elseif message.kind == "presenceUpdate" then
 		-- M4: espontânea, sem requestId, sem ack (spec docs/MILESTONES.md) —
 		-- só grava a própria Presence; TeamCreatePresence.updateOwnPresence já
@@ -943,6 +950,7 @@ local function stop(silent)
 	-- que depende antes do que é dependido" já usada neste arquivo.
 	TeamCreateLease.stop()
 	TeamCreatePresence.stop()
+	TeamCreateWally.stop()
 	-- TeamCreateElection.stop() remove a própria entrada de Sessions/ de forma
 	-- SÍNCRONA (M3.1) — mesmo cuidado do fix de WebStreamClient abaixo:
 	-- plugin.Unloading pode não dar chance de uma coroutine assíncrona notar
@@ -1049,6 +1057,10 @@ local function start(pluginObject)
 	-- TeamCreateElection.getSessionFolder()/getClientId() já existirem.
 	TeamCreatePresence.init(sendMessage)
 	TeamCreatePresence.start()
+	-- Depois de TeamCreateElection pelo mesmo motivo dos dois acima: publicar
+	-- e comparar dependem de getSessionFolder()/getClientId().
+	TeamCreateWally.init(sendMessage)
+	TeamCreateWally.start()
 	task.spawn(runConnection, myToken, ports, explicitPort, pluginObject)
 	-- 2026-07-16: Logger.debug (ruído rotineiro de boot, ver Logger.luau) —
 	-- continua encaminhado por WS, só não polui o Output a cada conexão. O
