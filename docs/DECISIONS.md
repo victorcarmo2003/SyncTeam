@@ -96,6 +96,50 @@ erro — o deploy parece ter dado certo. Corrigido com pausa entre as duas
 operações e um `cp` extra no fim (o último evento passa a ser sempre
 add/change).
 
+### Mesmo dia, segundo achado: o seletor Individual/Teams derrubava o painel inteiro, em silêncio total
+
+Depois do deploy o usuário reportou "vc atualizou o plugin e ele perdeu a
+interface". Não era o fix de sessão: era o `ModeRow` (seletor
+`[Individual | Teams]`, commit `e0c7bef`), que nunca tinha sido BUILDADO antes
+— foi escrito, commitado e só rodou de verdade agora.
+
+```
+Can only tween objects in the workspace
+  ...ui.StatusPanel:625 function ModeRow
+  ...ui.StatusPanel:990 function MainView
+  ...ui.PluginUI:292   function init
+```
+
+`GuiObject:TweenPosition` é a API legada e exige um GuiObject já renderizado;
+`vide.effect` roda a primeira avaliação DURANTE a construção, com o slider
+ainda sem pai. Trocado por `TweenService:Create`, que anima qualquer Instance
+com ou sem pai, mais um flag de primeira avaliação (posiciona direto, sem
+animar de lugar nenhum).
+
+**O que custou caro não foi o bug, foi o silêncio.** O erro subia pelo
+`vide.mount` e caía no `pcall` de `PluginUI.init`, cujo tratamento era só
+`log(...)`. Desde 2026-08-02 NENHUMA das três funções do Logger imprime no
+Output — todas alimentam a linha INFO do painel e encaminham por WebSocket. E
+para esta falha específica os dois canais estão mortos por definição: o
+painel não existe (foi ele que falhou) e o WS ainda não foi conectado
+(`Logger.init` roda dentro de `start()`, depois daqui). Resultado: plugin
+carrega sem erro nenhum, sem UI, e sem uma palavra em lugar nenhum. O log do
+Studio confirmava `Running plugin user_SyncTeam.rbxm took 25 msec` sem
+exceção alguma.
+
+Duas hipóteses foram levantadas e DESCARTADAS por leitura do código do Vide
+antes de chegar à verdadeira — vale registrar para não refazer o caminho:
+`Parent` dentro de `vide.create` é tratado corretamente (`apply.luau:76`,
+adiado para o fim), e `vide.switch` empurra escopo ESTÁVEL
+(`branch.luau`: `create_node(parent, false, false)`), então `vide.effect`
+dentro de um switch é legal. Nenhuma das duas era o problema. Só instrumentar
+resolveu.
+
+Fix estrutural junto: `PluginUI.init` agora faz `warn` além do `log` nos dois
+caminhos de falha de UI (painel e overlay de toast). Falha de UI antes de
+existir painel ou WebSocket só tem o Output como canal — ali o `warn` é
+obrigatório, não opcional.
+
 ## 2026-08-04 (19ª rodada) — Bug real do usuário: fila FIFO sem coalescência para pulses de buffer — backlog sem limite causava trava total de LSP escalando com tamanho do backlog (regressão do fix da 18ª rodada)
 
 Usuário testou de novo depois de reiniciar o PC (com o fix da 18ª rodada —

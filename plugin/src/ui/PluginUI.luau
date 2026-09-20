@@ -437,6 +437,21 @@ function PluginUI.init(pluginObject, callbacks)
 
 	if not ok then
 		log("painel: falha ao inicializar UI (toolbar/widget):", tostring(err))
+		-- `warn` ALEM do log (2026-09-19): desde 2026-08-02 nenhuma das tres
+		-- funcoes do Logger imprime no Output — todas so alimentam a linha INFO
+		-- do painel e encaminham por WebSocket. Para ESTA falha especifica os
+		-- dois canais estao mortos por definicao: o painel nao existe (foi o que
+		-- falhou) e o WS ainda nao foi conectado (Logger.init roda dentro de
+		-- start(), depois daqui). O resultado era um plugin que carrega sem erro
+		-- nenhum, sem painel e sem uma palavra em lugar nenhum — custou uma
+		-- investigacao inteira achar que a UI tinha morrido dentro deste pcall.
+		-- O Output e o unico canal que sobra, entao ele e obrigatorio aqui.
+		warn(
+			("[SyncTeam %s] painel: falha ao inicializar UI (toolbar/widget): %s"):format(
+				os.date("%H:%M:%S"),
+				tostring(err)
+			)
+		)
 		return
 	end
 
@@ -449,6 +464,13 @@ function PluginUI.init(pluginObject, callbacks)
 	end)
 	if not okToast then
 		log("painel: falha ao criar overlay de notificação (CoreGui):", tostring(errToast))
+		-- Mesmo motivo do `warn` acima: falha de UI antes de existir painel ou WS.
+		warn(
+			("[SyncTeam %s] painel: falha ao criar overlay de notificação (CoreGui): %s"):format(
+				os.date("%H:%M:%S"),
+				tostring(errToast)
+			)
+		)
 	end
 
 	running = true

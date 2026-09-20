@@ -6025,6 +6025,21 @@ function PluginUI.init(pluginObject, callbacks)
 
 	if not ok then
 		log("painel: falha ao inicializar UI (toolbar/widget):", tostring(err))
+		-- `warn` ALEM do log (2026-09-19): desde 2026-08-02 nenhuma das tres
+		-- funcoes do Logger imprime no Output — todas so alimentam a linha INFO
+		-- do painel e encaminham por WebSocket. Para ESTA falha especifica os
+		-- dois canais estao mortos por definicao: o painel nao existe (foi o que
+		-- falhou) e o WS ainda nao foi conectado (Logger.init roda dentro de
+		-- start(), depois daqui). O resultado era um plugin que carrega sem erro
+		-- nenhum, sem painel e sem uma palavra em lugar nenhum — custou uma
+		-- investigacao inteira achar que a UI tinha morrido dentro deste pcall.
+		-- O Output e o unico canal que sobra, entao ele e obrigatorio aqui.
+		warn(
+			("[SyncTeam %s] painel: falha ao inicializar UI (toolbar/widget): %s"):format(
+				os.date("%H:%M:%S"),
+				tostring(err)
+			)
+		)
 		return
 	end
 
@@ -6037,6 +6052,13 @@ function PluginUI.init(pluginObject, callbacks)
 	end)
 	if not okToast then
 		log("painel: falha ao criar overlay de notificação (CoreGui):", tostring(errToast))
+		-- Mesmo motivo do `warn` acima: falha de UI antes de existir painel ou WS.
+		warn(
+			("[SyncTeam %s] painel: falha ao criar overlay de notificação (CoreGui): %s"):format(
+				os.date("%H:%M:%S"),
+				tostring(errToast)
+			)
+		)
 	end
 
 	running = true
@@ -6220,6 +6242,8 @@ return PluginUI
 -- Decisões de layout (pixels/cores) não especificadas 100% pelo mockup do
 -- usuário: documentadas em detalhe em .claude/agent-memory/ui-dev.md.
 
+local TweenService = game:GetService("TweenService")
+
 local vide = require(script.Parent.Parent.Packages.Vide)
 local Theme = require(script.Parent.Theme)
 
@@ -6242,6 +6266,7 @@ local INFO_ROW_HEIGHT = 44 -- caixa de 34px (era 20px, linha de 30 — desacopla
 -- pedido do usuário ("Connect... em tamanho menor").
 local CONNECT_ROW_HEIGHT = 30
 local MODE_ROW_HEIGHT = 26 -- entre CONNECT (30) e RESYNC (28): e um seletor, nao uma acao
+local MODE_TWEEN = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local RESYNC_ROW_HEIGHT = 28
 local HEADER_HEIGHT = 22
 -- Altura FIXA da tabela de sessões (era flex:1/preenchia o painel inteiro).
@@ -6724,15 +6749,38 @@ local function ModeRow(state, callbacks)
 	}
 	vide.create "UICorner" { CornerRadius = UDim.new(0, 4), Parent = slider }
 
+	-- CORREÇÃO (2026-09-19): a primeira versao usava `slider:TweenPosition(...)`
+	-- e derrubava O PAINEL INTEIRO. O `TweenPosition` legado exige um GuiObject
+	-- ja renderizado e lanca `Can only tween objects in the workspace` — e
+	-- `vide.effect` roda a primeira avaliacao DURANTE a construcao, com o
+	-- slider ainda sem pai. O erro subia pelo `vide.mount`, caia no `pcall` de
+	-- `PluginUI.init` e sumia: desde 2026-08-02 nenhuma funcao do Logger
+	-- imprime no Output, e nesse ponto nao ha nem painel nem WebSocket para
+	-- receber o aviso. Plugin carregava limpo, sem UI e sem uma palavra.
+	-- (`PluginUI.init` agora tambem faz `warn` nesse caminho, ver la.)
+	--
+	-- `TweenService:Create` nao tem essa restricao: anima qualquer Instance,
+	-- com pai ou sem.
+	local tweenAtual = nil
+	local primeiraAvaliacao = true
 	vide.effect(function()
 		local aEsquerda = state.mode() ~= "teams"
-		slider:TweenPosition(
-			UDim2.new(if aEsquerda then 0 else 0.5, 2, 0, 2),
-			Enum.EasingDirection.Out,
-			Enum.EasingStyle.Quad,
-			0.18,
-			true
-		)
+		local destino = UDim2.new(if aEsquerda then 0 else 0.5, 2, 0, 2)
+
+		-- A avaliacao de construcao nao anima: nao ha de onde deslizar, e o
+		-- destino ja e a posicao inicial. Animar so a partir da PRIMEIRA troca
+		-- de modo de verdade e o que preserva o significado do movimento.
+		if primeiraAvaliacao then
+			primeiraAvaliacao = false
+			slider.Position = destino
+			return
+		end
+
+		if tweenAtual ~= nil then
+			tweenAtual:Cancel()
+		end
+		tweenAtual = TweenService:Create(slider, MODE_TWEEN, { Position = destino })
+		tweenAtual:Play()
 	end)
 
 	local function rotulo(texto, modo, xScale)
