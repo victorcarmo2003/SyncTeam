@@ -75,6 +75,16 @@ Theme.Color = {
 	-- e não usados em nenhum botão desta fatia — mantidos como tokens
 	-- disponíveis, mesma decisão do CSS de origem.
 	Blue = Color3.fromRGB(130, 170, 230),
+	-- ÚNICA exceção à nota acima, aberta em 2026-09-19 para o seletor
+	-- Individual/Teams (StatusPanel.ModeRow): o trilho é fundo CHEIO com
+	-- texto branco, então precisa de um par `*Strong` como todo botão
+	-- colorido do painel (princípio 3) — `Blue` puro é claro demais para
+	-- carregar `ButtonText` em cima. Sem origem no CSS do mockup (que nunca
+	-- usou azul como fundo), então derivado para casar de PESO com os Strong
+	-- que já existem: luminância perceptual (0.299R + 0.587G + 0.114B) de
+	-- 86,5 contra 88 do RedStrong e 95 do GreenStrong — as duas metades do
+	-- seletor ficam com o mesmo peso visual, que é o ponto.
+	BlueStrong = Color3.fromRGB(40, 92, 180),
 	Purple = Color3.fromRGB(124, 77, 200), -- --mc-purple: fundo do RESYNC "idle" (2026-08-02 — era Border/cinza)
 	PurpleHover = Color3.fromRGB(143, 89, 230), -- aproximação de brightness(1.15), mesma técnica de BorderHover/GreenStrongHover
 

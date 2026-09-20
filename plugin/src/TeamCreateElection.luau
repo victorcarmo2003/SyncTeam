@@ -177,6 +177,17 @@ local clientId = nil
 local userId = 0
 local sessionFolder = nil -- TestService.SyncTeam.Sessions.<clientId>
 local sessionValues = nil -- {ClientId, UserId, Username, JoinSequence, Pulse, ObservedRole}
+-- Ultimo Username REALMENTE publicado nesta sessao de eleicao (nome do
+-- Roblox resolvido por Players:GetNameFromUserIdAsync, ou o nome customizado
+-- do dev). Existe por causa da auto-cura de 2026-09-19: quando
+-- `ensureOwnSessionAlive` recria a pasta, os valores nascem zerados e o
+-- Username NAO se republica sozinho — a resolucao acontece uma vez em
+-- start(), num task.spawn que ja terminou ha muito. Sem este cache o colega
+-- passa a ver a sessao recuperada com nome VAZIO (medido: "dev_Hakor" virou
+-- "db8dc80c" depois da primeira recriacao). Nunca guarda string vazia, entao
+-- a primeira chamada de ensureOwnSession (dentro de start(), antes de
+-- qualquer resolucao) e no-op.
+local publishedUsername = ""
 
 local pulseObservations = {} -- clientId -> {pulse, observedAt}
 local candidateObservation = nil -- {candidate, observations, leader}
@@ -239,6 +250,12 @@ local function ensureOwnSession()
 	values.UserId.Value = userId
 	if values.ObservedRole.Value == "" then
 		values.ObservedRole.Value = "follower"
+	end
+	-- Ver `publishedUsername`: republica o nome numa pasta recriada pela
+	-- auto-cura. No boot ainda esta vazio (a resolucao vem depois, em
+	-- start()), entao aqui e no-op na primeira passada.
+	if publishedUsername ~= "" then
+		values.Username.Value = publishedUsername
 	end
 
 	sessionFolder = folder
@@ -518,6 +535,7 @@ local function resolveAndPublishRobloxUsername(myToken)
 		end
 		if enabled and currentToken == myToken and sessionValues ~= nil then
 			sessionValues.Username.Value = username
+			publishedUsername = username
 		end
 	end)
 end
@@ -547,6 +565,7 @@ function TeamCreateElection.start(userIdParam, pluginObject)
 	-- síncrona, então não há acúmulo de lixo por reload normal.
 	clientId = HttpService:GenerateGUID(false)
 	userId = userIdParam or 0
+	publishedUsername = ""
 	pulseObservations = {}
 	candidateObservation = nil
 	announcedLeader = nil
@@ -576,6 +595,7 @@ function TeamCreateElection.start(userIdParam, pluginObject)
 	local customDisplayName = Config.resolveCustomDisplayName(pluginObject)
 	if customDisplayName ~= "" then
 		sessionValues.Username.Value = customDisplayName
+		publishedUsername = customDisplayName
 	else
 		-- Username via Players:GetNameFromUserIdAsync (yield), então roda em
 		-- task.spawn separado — decisão 2 do cabeçalho.
@@ -613,6 +633,7 @@ function TeamCreateElection.stop()
 
 	sessionFolder = nil
 	sessionValues = nil
+	publishedUsername = ""
 	clientId = nil
 	candidateObservation = nil
 	announcedLeader = nil
@@ -642,6 +663,7 @@ function TeamCreateElection.setLocalUsername(customName)
 	end
 	if type(customName) == "string" and customName ~= "" then
 		sessionValues.Username.Value = customName
+		publishedUsername = customName
 		return
 	end
 	resolveAndPublishRobloxUsername(currentToken)

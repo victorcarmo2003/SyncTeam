@@ -620,7 +620,7 @@ local function ModeRow(state, callbacks)
 		Name = "Slider",
 		Size = UDim2.new(0.5, -2, 1, -4),
 		Position = UDim2.fromOffset(2, 2),
-		BackgroundColor3 = Theme.Color.Purple,
+		BackgroundColor3 = Theme.Color.BlueStrong, -- "individual" e o default; ver o efeito abaixo
 		BorderSizePixel = 0,
 	}
 	vide.create "UICorner" { CornerRadius = UDim.new(0, 4), Parent = slider }
@@ -642,6 +642,12 @@ local function ModeRow(state, callbacks)
 	vide.effect(function()
 		local aEsquerda = state.mode() ~= "teams"
 		local destino = UDim2.new(if aEsquerda then 0 else 0.5, 2, 0, 2)
+		-- Cor junto do movimento, no MESMO tween (2026-09-19, pedido do
+		-- usuario): azul em "individual", vermelho em "teams". Sao os dois
+		-- unicos estados, entao a cor nao esta repetindo o que a posicao ja
+		-- diz — ela diz a mesma coisa por um canal que sobrevive a um olhar
+		-- de relance, sem esperar o slide terminar.
+		local cor = if aEsquerda then Theme.Color.BlueStrong else Theme.Color.RedStrong
 
 		-- A avaliacao de construcao nao anima: nao ha de onde deslizar, e o
 		-- destino ja e a posicao inicial. Animar so a partir da PRIMEIRA troca
@@ -649,13 +655,14 @@ local function ModeRow(state, callbacks)
 		if primeiraAvaliacao then
 			primeiraAvaliacao = false
 			slider.Position = destino
+			slider.BackgroundColor3 = cor
 			return
 		end
 
 		if tweenAtual ~= nil then
 			tweenAtual:Cancel()
 		end
-		tweenAtual = TweenService:Create(slider, MODE_TWEEN, { Position = destino })
+		tweenAtual = TweenService:Create(slider, MODE_TWEEN, { Position = destino, BackgroundColor3 = cor })
 		tweenAtual:Play()
 	end)
 

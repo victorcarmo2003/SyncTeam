@@ -3332,6 +3332,17 @@ local clientId = nil
 local userId = 0
 local sessionFolder = nil -- TestService.SyncTeam.Sessions.<clientId>
 local sessionValues = nil -- {ClientId, UserId, Username, JoinSequence, Pulse, ObservedRole}
+-- Ultimo Username REALMENTE publicado nesta sessao de eleicao (nome do
+-- Roblox resolvido por Players:GetNameFromUserIdAsync, ou o nome customizado
+-- do dev). Existe por causa da auto-cura de 2026-09-19: quando
+-- `ensureOwnSessionAlive` recria a pasta, os valores nascem zerados e o
+-- Username NAO se republica sozinho — a resolucao acontece uma vez em
+-- start(), num task.spawn que ja terminou ha muito. Sem este cache o colega
+-- passa a ver a sessao recuperada com nome VAZIO (medido: "dev_Hakor" virou
+-- "db8dc80c" depois da primeira recriacao). Nunca guarda string vazia, entao
+-- a primeira chamada de ensureOwnSession (dentro de start(), antes de
+-- qualquer resolucao) e no-op.
+local publishedUsername = ""
 
 local pulseObservations = {} -- clientId -> {pulse, observedAt}
 local candidateObservation = nil -- {candidate, observations, leader}
@@ -3394,6 +3405,12 @@ local function ensureOwnSession()
 	values.UserId.Value = userId
 	if values.ObservedRole.Value == "" then
 		values.ObservedRole.Value = "follower"
+	end
+	-- Ver `publishedUsername`: republica o nome numa pasta recriada pela
+	-- auto-cura. No boot ainda esta vazio (a resolucao vem depois, em
+	-- start()), entao aqui e no-op na primeira passada.
+	if publishedUsername ~= "" then
+		values.Username.Value = publishedUsername
 	end
 
 	sessionFolder = folder
@@ -3673,6 +3690,7 @@ local function resolveAndPublishRobloxUsername(myToken)
 		end
 		if enabled and currentToken == myToken and sessionValues ~= nil then
 			sessionValues.Username.Value = username
+			publishedUsername = username
 		end
 	end)
 end
@@ -3702,6 +3720,7 @@ function TeamCreateElection.start(userIdParam, pluginObject)
 	-- síncrona, então não há acúmulo de lixo por reload normal.
 	clientId = HttpService:GenerateGUID(false)
 	userId = userIdParam or 0
+	publishedUsername = ""
 	pulseObservations = {}
 	candidateObservation = nil
 	announcedLeader = nil
@@ -3731,6 +3750,7 @@ function TeamCreateElection.start(userIdParam, pluginObject)
 	local customDisplayName = Config.resolveCustomDisplayName(pluginObject)
 	if customDisplayName ~= "" then
 		sessionValues.Username.Value = customDisplayName
+		publishedUsername = customDisplayName
 	else
 		-- Username via Players:GetNameFromUserIdAsync (yield), então roda em
 		-- task.spawn separado — decisão 2 do cabeçalho.
@@ -3768,6 +3788,7 @@ function TeamCreateElection.stop()
 
 	sessionFolder = nil
 	sessionValues = nil
+	publishedUsername = ""
 	clientId = nil
 	candidateObservation = nil
 	announcedLeader = nil
@@ -3797,6 +3818,7 @@ function TeamCreateElection.setLocalUsername(customName)
 	end
 	if type(customName) == "string" and customName ~= "" then
 		sessionValues.Username.Value = customName
+		publishedUsername = customName
 		return
 	end
 	resolveAndPublishRobloxUsername(currentToken)
@@ -6744,7 +6766,7 @@ local function ModeRow(state, callbacks)
 		Name = "Slider",
 		Size = UDim2.new(0.5, -2, 1, -4),
 		Position = UDim2.fromOffset(2, 2),
-		BackgroundColor3 = Theme.Color.Purple,
+		BackgroundColor3 = Theme.Color.BlueStrong, -- "individual" e o default; ver o efeito abaixo
 		BorderSizePixel = 0,
 	}
 	vide.create "UICorner" { CornerRadius = UDim.new(0, 4), Parent = slider }
@@ -6766,6 +6788,12 @@ local function ModeRow(state, callbacks)
 	vide.effect(function()
 		local aEsquerda = state.mode() ~= "teams"
 		local destino = UDim2.new(if aEsquerda then 0 else 0.5, 2, 0, 2)
+		-- Cor junto do movimento, no MESMO tween (2026-09-19, pedido do
+		-- usuario): azul em "individual", vermelho em "teams". Sao os dois
+		-- unicos estados, entao a cor nao esta repetindo o que a posicao ja
+		-- diz — ela diz a mesma coisa por um canal que sobrevive a um olhar
+		-- de relance, sem esperar o slide terminar.
+		local cor = if aEsquerda then Theme.Color.BlueStrong else Theme.Color.RedStrong
 
 		-- A avaliacao de construcao nao anima: nao ha de onde deslizar, e o
 		-- destino ja e a posicao inicial. Animar so a partir da PRIMEIRA troca
@@ -6773,13 +6801,14 @@ local function ModeRow(state, callbacks)
 		if primeiraAvaliacao then
 			primeiraAvaliacao = false
 			slider.Position = destino
+			slider.BackgroundColor3 = cor
 			return
 		end
 
 		if tweenAtual ~= nil then
 			tweenAtual:Cancel()
 		end
-		tweenAtual = TweenService:Create(slider, MODE_TWEEN, { Position = destino })
+		tweenAtual = TweenService:Create(slider, MODE_TWEEN, { Position = destino, BackgroundColor3 = cor })
 		tweenAtual:Play()
 	end)
 
@@ -7614,6 +7643,16 @@ Theme.Color = {
 	-- e não usados em nenhum botão desta fatia — mantidos como tokens
 	-- disponíveis, mesma decisão do CSS de origem.
 	Blue = Color3.fromRGB(130, 170, 230),
+	-- ÚNICA exceção à nota acima, aberta em 2026-09-19 para o seletor
+	-- Individual/Teams (StatusPanel.ModeRow): o trilho é fundo CHEIO com
+	-- texto branco, então precisa de um par `*Strong` como todo botão
+	-- colorido do painel (princípio 3) — `Blue` puro é claro demais para
+	-- carregar `ButtonText` em cima. Sem origem no CSS do mockup (que nunca
+	-- usou azul como fundo), então derivado para casar de PESO com os Strong
+	-- que já existem: luminância perceptual (0.299R + 0.587G + 0.114B) de
+	-- 86,5 contra 88 do RedStrong e 95 do GreenStrong — as duas metades do
+	-- seletor ficam com o mesmo peso visual, que é o ponto.
+	BlueStrong = Color3.fromRGB(40, 92, 180),
 	Purple = Color3.fromRGB(124, 77, 200), -- --mc-purple: fundo do RESYNC "idle" (2026-08-02 — era Border/cinza)
 	PurpleHover = Color3.fromRGB(143, 89, 230), -- aproximação de brightness(1.15), mesma técnica de BorderHover/GreenStrongHover
 
